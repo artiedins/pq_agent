@@ -1,0 +1,22 @@
+# node
+node_modules/
+package-lock.json
+
+# python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+
+# agent outputs - these belong in project dirs, not the agent repo
+*.md
+!README.md
+
+# env / secrets - use shell exports instead
+.env
+
+# editor
+.vscode/
+.idea/
+*.swp
+*~

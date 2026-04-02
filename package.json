@@ -1,0 +1,18 @@
+{
+  "name": "agent",
+  "version": "1.0.0",
+  "description": "",
+  "main": "mcp_server.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "playwright": "^1.59.0",
+    "turndown": "^7.2.2",
+    "zod": "^4.3.6"
+  }
+}
