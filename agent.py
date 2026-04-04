@@ -2,13 +2,13 @@ import os
 import sys
 import json
 import zlib
+import select
 import subprocess
 import requests
 import time
 from pathlib import Path
 import random
 import tiktoken
-import math
 import re
 
 # Code style:
@@ -22,14 +22,11 @@ import re
 # - Yes inline comments for showing intent without ceremony
 # - Yes if __name__ == "__main__": main()
 
-# Todo
-# - use timeout with playwright mcp
 
 # Config
 
 SLOW_MODE = True
 USE_SYSTEM_PROMPT = True  # use system role otherwise user role for first msg
-
 
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
 if not OPENROUTER_API_KEY:
@@ -50,11 +47,6 @@ WORKSPACE = Path.cwd().resolve()
 # cl100k_base is a good approximation for most modern models
 # loaded once; tiktoken caches the vocab file on disk after first download
 _enc = tiktoken.get_encoding("cl100k_base")
-
-# last confirmed post-call token count from openrouter
-# used as the base for the next pre-call estimate
-# estimates are more accurate if not started at zero
-_last_post_tokens = 949
 
 
 def shorten_content_with_notice(m):
@@ -106,9 +98,7 @@ def filter_msgs_and_est_tokens(messages):
     return tokens
 
 
-def chat(messages, tools, new_messages):
-    global _last_post_tokens
-
+def chat(messages, tools, new_messages, state):
     MAX_CONTEXT_LENGTH = 128000
 
     # pre = last known accurate count + estimated tokens for the newest message only
@@ -117,14 +107,10 @@ def chat(messages, tools, new_messages):
 
     new_prompt_tokens = filter_msgs_and_est_tokens(new_messages)
     new_prompt_tokens = int(round(0.2221 * (new_prompt_tokens**1.1866)))
-    pre_prompt_total_context = _last_post_tokens + new_prompt_tokens
+    pre_prompt_total_context = state["last_post_tokens"] + new_prompt_tokens
 
     if pre_prompt_total_context > MAX_CONTEXT_LENGTH:
         print("PERFORM COMPACTION", flush=True)
-        # IMPLEMENT COMPACTION
-        # DUMP new_messages
-        # Replace with compaction prompt
-        # After response, re-populate new_messages and clear messages
         raise Exception("need compaction mechanization")
     else:
         print("Sending CONTEXT", pre_prompt_total_context, "which is {:.1f}% of max context".format(100 * pre_prompt_total_context / MAX_CONTEXT_LENGTH))
@@ -147,7 +133,13 @@ def chat(messages, tools, new_messages):
             delay = random.uniform(2**p, 2 ** (p + 1))
             time.sleep(delay)
 
-        resp = requests.post(OPENROUTER_URL, headers=HEADERS, json=payload)
+        try:
+            resp = requests.post(OPENROUTER_URL, headers=HEADERS, json=payload, timeout=60)
+        except requests.exceptions.Timeout:
+            if attempt < 8:
+                print(f"  [error] request timed out, retrying (attempt {attempt + 1}/8)...")
+                continue
+            raise
 
         # if rate limited, loop around to try again
         if resp.status_code == 429 and attempt < 8:
@@ -165,48 +157,33 @@ def chat(messages, tools, new_messages):
 
     data = resp.json()
 
-    post_prompt_total_context = data.get("usage", {}).get("prompt_tokens", 0)
-    _last_post_tokens = int(post_prompt_total_context)
+    state["last_post_tokens"] = int(data.get("usage", {}).get("prompt_tokens", 0))
 
     return data
 
 
-# MCP server
-mcp_proc = subprocess.Popen(
-    ["node", os.path.join(AGENT_DIR, "mcp_server.js")],
-    stdin=subprocess.PIPE,
-    stdout=subprocess.PIPE,
-    stderr=sys.stderr,
-    text=True,
-    bufsize=1,
-)
-
-time.sleep(1)
-if mcp_proc.poll() is not None:
-    sys.exit(f"MCP server exited immediately with code {mcp_proc.returncode}")
-
-print("MCP server alive, handshaking...")
-
-_mcp_id = 0
+# mcp helpers
 
 
-def mcp_send(method, params, notify=False):
-    global _mcp_id
+def mcp_send(mcp, method, params, notify=False):
     if notify:
         msg = {"jsonrpc": "2.0", "method": method, "params": params}
-        mcp_proc.stdin.write(json.dumps(msg) + "\n")
-        mcp_proc.stdin.flush()
+        mcp["proc"].stdin.write(json.dumps(msg) + "\n")
+        mcp["proc"].stdin.flush()
         return None
-    _mcp_id += 1
-    msg = {"jsonrpc": "2.0", "id": _mcp_id, "method": method, "params": params}
-    mcp_proc.stdin.write(json.dumps(msg) + "\n")
-    mcp_proc.stdin.flush()
-    return _mcp_id
+    mcp["id"] += 1
+    msg = {"jsonrpc": "2.0", "id": mcp["id"], "method": method, "params": params}
+    mcp["proc"].stdin.write(json.dumps(msg) + "\n")
+    mcp["proc"].stdin.flush()
+    return mcp["id"]
 
 
-def mcp_recv(expected_id):
+def mcp_recv(mcp, expected_id):
     while True:
-        line = mcp_proc.stdout.readline()
+        ready, _, _ = select.select([mcp["proc"].stdout], [], [], 60)
+        if not ready:
+            raise TimeoutError("MCP recv timed out after 60s")
+        line = mcp["proc"].stdout.readline()
         if not line:
             raise RuntimeError("MCP server closed unexpectedly")
         msg = json.loads(line)
@@ -216,20 +193,57 @@ def mcp_recv(expected_id):
             return msg["result"]
 
 
-def mcp_call(method, params):
-    return mcp_recv(mcp_send(method, params))
+def mcp_call(mcp, method, params):
+    return mcp_recv(mcp, mcp_send(mcp, method, params))
 
 
-mcp_call(
-    "initialize",
-    {
-        "protocolVersion": "2024-11-05",
-        "capabilities": {},
-        "clientInfo": {"name": "agent", "version": "0.1"},
-    },
-)
-mcp_send("notifications/initialized", {}, notify=True)
-print("MCP handshake complete.\n")
+def _mcp_handshake(mcp):
+    mcp_call(
+        mcp,
+        "initialize",
+        {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": {"name": "agent", "version": "0.1"},
+        },
+    )
+    mcp_send(mcp, "notifications/initialized", {}, notify=True)
+
+
+def start_mcp():
+    proc = subprocess.Popen(
+        ["node", os.path.join(AGENT_DIR, "mcp_server.js")],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=sys.stderr,
+        text=True,
+        bufsize=1,
+    )
+    time.sleep(1)
+    if proc.poll() is not None:
+        sys.exit(f"MCP server exited immediately with code {proc.returncode}")
+    mcp = {"proc": proc, "id": 0}
+    _mcp_handshake(mcp)
+    return mcp
+
+
+def restart_mcp(mcp):
+    mcp["proc"].terminate()
+    time.sleep(1)
+    proc = subprocess.Popen(
+        ["node", os.path.join(AGENT_DIR, "mcp_server.js")],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=sys.stderr,
+        text=True,
+        bufsize=1,
+    )
+    time.sleep(1)
+    if proc.poll() is not None:
+        raise RuntimeError(f"MCP server failed to restart, exit code {proc.returncode}")
+    mcp["proc"] = proc
+    mcp["id"] = 0
+    _mcp_handshake(mcp)
 
 
 # hashline helpers
@@ -309,122 +323,29 @@ def tool_edit_file(filename, start_anchor, end_anchor, new_text):
     return render_hashlines(lines)
 
 
-# tool definitions
-
-tools = [
-    {
-        "type": "function",
-        "function": {
-            "name": "playwright_navigate",
-            "description": ("Navigate the browser to a URL and return the page title. " "Use DDG plain HTML (https://html.duckduckgo.com/html/?q=...) for searches."),
-            "parameters": {
-                "type": "object",
-                "properties": {"url": {"type": "string"}},
-                "required": ["url"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "playwright_extract_content",
-            "description": "Extract the current browser page as clean markdown.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "selector": {
-                        "type": "string",
-                        "description": "Optional CSS selector to scope extraction e.g. 'main'",
-                    }
-                },
-                "required": [],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "write_file",
-            "description": (
-                "Create or overwrite a file with the given content. " "Use a relative path e.g. 'inflation.md'. " "You MUST use this tool to create files - do not write file content in your reply."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "filename": {"type": "string"},
-                    "content": {"type": "string"},
-                },
-                "required": ["filename", "content"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "read_file",
-            "description": (
-                "Read a file. Returns each line prefixed with a hashline anchor "
-                "in the format LINENUM:HASH|content e.g. '3:a4|some text here'. "
-                "You MUST call read_file before calling edit_file to get valid anchors."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {"filename": {"type": "string"}},
-                "required": ["filename"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "edit_file",
-            "description": (
-                "Edit a file using hashline anchors from a previous read_file call. "
-                "Replaces the lines from start_anchor to end_anchor (inclusive) with new_text. "
-                "Anchors are LINENUM:HASH strings e.g. '5:a3' - copy them exactly from read_file output. "
-                "To insert after a line: set both anchors to that line and include it in new_text followed by the new content. "
-                "Returns the updated file content with new hashline anchors. "
-                "You MUST use this tool to edit files - do not output edited file content in your reply."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "filename": {"type": "string"},
-                    "start_anchor": {
-                        "type": "string",
-                        "description": "LINENUM:HASH of the first line to replace e.g. '5:a3'",
-                    },
-                    "end_anchor": {
-                        "type": "string",
-                        "description": "LINENUM:HASH of the last line to replace e.g. '7:f1'",
-                    },
-                    "new_text": {
-                        "type": "string",
-                        "description": "Replacement text. Use newlines for multiple lines.",
-                    },
-                },
-                "required": ["filename", "start_anchor", "end_anchor", "new_text"],
-            },
-        },
-    },
-]
-
-
 # tool dispatcher
 
 
-def dispatch_tool(name, arguments):
-    if name == "playwright_navigate":
-        result = mcp_call("tools/call", {"name": name, "arguments": arguments})
-        text = "\n".join(b["text"] for b in result.get("content", []) if b.get("type") == "text")
-        print(f"  playwright_navigate: {arguments.get('url', '')[:80]}")
-        return text
-
-    if name == "playwright_extract_content":
-        result = mcp_call("tools/call", {"name": name, "arguments": arguments})
-        text = "\n".join(b["text"] for b in result.get("content", []) if b.get("type") == "text")
-        print(f"  playwright_extract_content: {len(text)} chars")
-        return text
+def dispatch_tool(mcp, name, arguments):
+    if name in ("playwright_navigate", "playwright_extract_content"):
+        for attempt in range(9):
+            if attempt > 0:
+                delay = random.uniform(2 ** (attempt - 1), 2**attempt)
+                print(f"  [mcp retry {attempt}/8] waiting {delay:.1f}s then restarting mcp...")
+                time.sleep(delay)
+                restart_mcp(mcp)
+            try:
+                result = mcp_call(mcp, "tools/call", {"name": name, "arguments": arguments})
+                text = "\n".join(b["text"] for b in result.get("content", []) if b.get("type") == "text")
+                if name == "playwright_navigate":
+                    print(f"  playwright_navigate: {arguments.get('url', '')[:80]}")
+                else:
+                    print(f"  playwright_extract_content: {len(text)} chars")
+                return text
+            except TimeoutError as e:
+                if attempt == 8:
+                    raise
+                print(f"  [mcp timeout] attempt {attempt + 1}/9: {e}")
 
     if name == "write_file":
         return tool_write_file(arguments["filename"], arguments["content"])
@@ -443,78 +364,187 @@ def dispatch_tool(name, arguments):
     return f"Unknown tool: {name}"
 
 
-# system prompt
+def main():
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "playwright_navigate",
+                "description": ("Navigate the browser to a URL and return the page title. " "Use DDG plain HTML (https://html.duckduckgo.com/html/?q=...) for searches."),
+                "parameters": {
+                    "type": "object",
+                    "properties": {"url": {"type": "string"}},
+                    "required": ["url"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "playwright_extract_content",
+                "description": "Extract the current browser page as clean markdown.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "selector": {
+                            "type": "string",
+                            "description": "Optional CSS selector to scope extraction e.g. 'main'",
+                        }
+                    },
+                    "required": [],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "write_file",
+                "description": (
+                    "Create or overwrite a file with the given content. "
+                    "Use a relative path e.g. 'inflation.md'. "
+                    "You MUST use this tool to create files - do not write file content in your reply."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "filename": {"type": "string"},
+                        "content": {"type": "string"},
+                    },
+                    "required": ["filename", "content"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": (
+                    "Read a file. Returns each line prefixed with a hashline anchor "
+                    "in the format LINENUM:HASH|content e.g. '3:a4|some text here'. "
+                    "You MUST call read_file before calling edit_file to get valid anchors."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {"filename": {"type": "string"}},
+                    "required": ["filename"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "edit_file",
+                "description": (
+                    "Edit a file using hashline anchors from a previous read_file call. "
+                    "Replaces the lines from start_anchor to end_anchor (inclusive) with new_text. "
+                    "Anchors are LINENUM:HASH strings e.g. '5:a3' - copy them exactly from read_file output. "
+                    "To insert after a line: set both anchors to that line and include it in new_text followed by the new content. "
+                    "Returns the updated file content with new hashline anchors. "
+                    "You MUST use this tool to edit files - do not output edited file content in your reply."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "filename": {"type": "string"},
+                        "start_anchor": {
+                            "type": "string",
+                            "description": "LINENUM:HASH of the first line to replace e.g. '5:a3'",
+                        },
+                        "end_anchor": {
+                            "type": "string",
+                            "description": "LINENUM:HASH of the last line to replace e.g. '7:f1'",
+                        },
+                        "new_text": {
+                            "type": "string",
+                            "description": "Replacement text. Use newlines for multiple lines.",
+                        },
+                    },
+                    "required": ["filename", "start_anchor", "end_anchor", "new_text"],
+                },
+            },
+        },
+    ]
 
-system_prompt = (
-    "You are a research assistant with browser access and file tools.\n\n"
-    "IMPORTANT: You MUST use tools for ALL file operations. "
-    "Never output file contents or table data directly in your reply text. "
-    "Always use write_file, read_file, or edit_file instead.\n\n"
-    "Hashline editing rules:\n"
-    "1. Always call read_file before edit_file to get current line anchors.\n"
-    "2. Anchors are LINENUM:HASH strings - copy them exactly from read_file output.\n"
-    "3. edit_file returns updated hashline content - use it for chained edits.\n\n"
-    "Browsing rules:\n"
-    "1. Use DuckDuckGo plain HTML for searches: "
-    "https://html.duckduckgo.com/html/?q=<query>\n"
-    "2. After finding what you need, stop browsing and proceed with the task.\n\n"
-    "When fully done, reply with one short confirmation sentence only."
-)
+    system_prompt = (
+        "You are a research assistant with browser access and file tools.\n\n"
+        "IMPORTANT: You MUST use tools for ALL file operations. "
+        "Never output file contents or table data directly in your reply text. "
+        "Always use write_file, read_file, or edit_file instead.\n\n"
+        "Hashline editing rules:\n"
+        "1. Always call read_file before edit_file to get current line anchors.\n"
+        "2. Anchors are LINENUM:HASH strings - copy them exactly from read_file output.\n"
+        "3. edit_file returns updated hashline content - use it for chained edits.\n\n"
+        "Browsing rules:\n"
+        "1. Use DuckDuckGo plain HTML for searches: "
+        "https://html.duckduckgo.com/html/?q=<query>\n"
+        "2. After finding what you need, stop browsing and proceed with the task.\n\n"
+        "When fully done, reply with one short confirmation sentence only."
+    )
 
-initial_prompt = (
-    "Do the following steps in order using your tools:\n"
-    "1. Read inflation.md to see what years are already in the table.\n"
-    "2. Identify the earliest year currently in the file.\n"
-    "3. Search the web for the US annual inflation rate for the year "
-    "   immediately before that earliest year.\n"
-    "4. Use edit_file to insert a new row for that year into the table. "
-    "   The table must be in chronological order oldest-to-newest "
-    "   (earliest year at the top of the data rows, most recent at the bottom).\n"
-    "   If the current table is in the wrong order, reorder it with edit_file first.\n"
-    "5. Reply with one short confirmation sentence naming the year you added."
-)
+    initial_prompt = (
+        "Do the following steps in order using your tools:\n"
+        "1. Read inflation.md to see what years are already in the table.\n"
+        "2. Identify the earliest year currently in the file.\n"
+        "3. Search the web for the US annual inflation rate for the year "
+        "   immediately before that earliest year.\n"
+        "4. Use edit_file to insert a new row for that year into the table. "
+        "   The table must be in chronological order oldest-to-newest "
+        "   (earliest year at the top of the data rows, most recent at the bottom).\n"
+        "   If the current table is in the wrong order, reorder it with edit_file first.\n"
+        "5. Reply with one short confirmation sentence naming the year you added."
+    )
+
+    # last confirmed post-call token count from openrouter
+    # used as the base for the next pre-call estimate
+    # estimates are more accurate if not started at zero
+    state = {"last_post_tokens": 949}
+
+    # ONLY add to messages inside chat() because we want to filter first
+    messages = []
+    new_messages = []
+
+    if system_prompt:
+        if USE_SYSTEM_PROMPT:
+            new_messages.append({"role": "system", "content": system_prompt})
+        else:
+            new_messages.append({"role": "user", "content": system_prompt})
+
+    if initial_prompt:
+        new_messages.append({"role": "user", "content": initial_prompt})
+
+    print("MCP server alive, handshaking...")
+    mcp = start_mcp()
+    print("MCP handshake complete.\n")
+
+    print("Starting agent loop...\n")
+
+    while True:
+        response = chat(messages, tools, new_messages, state)
+        choice = response["choices"][0]
+        msg = choice["message"]
+        finish = choice["finish_reason"]
+        new_messages.append(msg)
+
+        if finish == "tool_calls":
+            for tc in msg["tool_calls"]:
+                fn_name = tc["function"]["name"]
+                fn_args = json.loads(tc["function"]["arguments"])
+                print(f"[tool call] {fn_name}")
+                tool_result = dispatch_tool(mcp, fn_name, fn_args)
+                new_messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tc["id"],
+                        "content": tool_result,
+                    }
+                )
+        else:
+            print(f"\n[done] {msg['content']}")
+            break
+
+    mcp["proc"].stdin.close()
+    mcp["proc"].terminate()
 
 
-# ONLY add to messages inside chat() function becase we want to filter first
-messages = []
-new_messages = []
-
-if system_prompt is not None and system_prompt != "":
-    if USE_SYSTEM_PROMPT:
-        new_messages.append({"role": "system", "content": system_prompt})
-    else:
-        new_messages.append({"role": "user", "content": system_prompt})
-
-
-if initial_prompt is not None and initial_prompt != "":
-    new_messages.append({"role": "user", "content": initial_prompt})
-
-
-print("Starting agent loop...\n")
-
-while True:
-    response = chat(messages, tools, new_messages)
-    choice = response["choices"][0]
-    msg = choice["message"]
-    finish = choice["finish_reason"]
-    new_messages.append(msg)
-
-    if finish == "tool_calls":
-        for tc in msg["tool_calls"]:
-            fn_name = tc["function"]["name"]
-            fn_args = json.loads(tc["function"]["arguments"])
-            print(f"[tool call] {fn_name}")
-            tool_result = dispatch_tool(fn_name, fn_args)
-            new_messages.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": tc["id"],
-                    "content": tool_result,
-                }
-            )
-    else:
-        print(f"\n[done] {msg['content']}")
-        break
-
-mcp_proc.stdin.close()
-mcp_proc.terminate()
+if __name__ == "__main__":
+    main()
