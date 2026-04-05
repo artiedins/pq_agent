@@ -24,11 +24,9 @@ import re
 
 # Config
 
-
 SLOW_MODE = False
 USE_SYSTEM_PROMPT = True  # use system role otherwise user role for first msg
 BUMP_OVER_LIMIT_MSGS = False
-
 
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
 if not OPENROUTER_API_KEY:
@@ -36,12 +34,7 @@ if not OPENROUTER_API_KEY:
 
 AGENT_DIR = os.environ.get("AGENT_DIR", str(Path(__file__).parent.resolve()))
 
-# | 2017 | 2.1% | google/gemini-3.1-flash-lite-preview | Yes | - good 0.25 / 1.5 failed with hash line
-# | 2018 | 2.49% | nvidia/nemotron-3-super-120b-a12b:free | yes | - good 0 / 0 good again
-# | 2020 | 1.23% | qwen/qwen3.6-plus:free | yes | - good 0 / 0
-
 MODEL = "google/gemini-3.1-flash-lite-preview"
-
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
@@ -146,17 +139,26 @@ def post_compaction(payload):
         raise
 
 
+def extract_compaction_summary(raw_msg):
+    # some models (e.g. qwen3.6 with reasoning on) return content in the
+    # reasoning field instead of content when asked to summarize
+    summary = raw_msg.get("content")
+    if not summary or not isinstance(summary, str) or summary.strip().lower() in ("", "none", "yes"):
+        summary = raw_msg.get("reasoning") or raw_msg.get("reasoning_content")
+    if summary:
+        summary = summary.strip()
+    return summary or None
+
+
 def chat(messages, tools, new_messages, state, session_messages):
     MAX_CONTEXT_LENGTH = 131000
 
     # pre = last known accurate count + estimated tokens for the newest message only
     # (the newest message is the only one openrouter has not yet seen)
     # We use a correction factor to make tiktoken token count more accurate - DO NOT CHANGE THIS
-
     new_prompt_tokens = filter_msgs_and_est_tokens(new_messages)
     new_prompt_tokens = int(round(0.2221 * (new_prompt_tokens**1.1866)))
     pre_prompt_total_context = state["last_post_tokens"] + new_prompt_tokens
-    # print("NEW MESSAGE TOKENS", new_prompt_tokens, "for new total", pre_prompt_total_context)
 
     if pre_prompt_total_context > MAX_CONTEXT_LENGTH:
         print("PERFORM COMPACTION", flush=True)
@@ -176,7 +178,6 @@ def chat(messages, tools, new_messages, state, session_messages):
                 "Be terse. If this summary exceeds 9000 tokens it will be clipped.\n"
                 "Minimize thinking and output summary content.\n"
             )
-
             compaction_payload = {
                 "model": MODEL,
                 "messages": messages + [{"role": "user", "content": compaction_prompt}],
@@ -190,7 +191,7 @@ def chat(messages, tools, new_messages, state, session_messages):
                 "1. What actions were taken and whether they succeeded or failed.\n"
                 "2. Current state of any modified files (exact filenames, key content or structure).\n"
                 "3. Any discovered facts relevant to completing the task (e.g. specific data values found).\n"
-                "4. Immediate next step. \n"
+                "4. Immediate next step.\n"
                 "Include any prior compaction summaries in condensed form.\n"
                 "Do NOT summarize the system prompt or initial task instructions - those are provided fresh.\n"
                 "Be terse. If this summary exceeds 9000 tokens it will be clipped.\n"
@@ -205,30 +206,24 @@ def chat(messages, tools, new_messages, state, session_messages):
 
         resp_json = post_compaction(compaction_payload).json()
         raw_msg = resp_json["choices"][0]["message"]
-        summary = raw_msg.get("content")
+        summary = extract_compaction_summary(raw_msg)
 
         print()
         print("-" * 80)
-
-        if summary is None or not isinstance(summary, str):
-            print(raw_msg)
+        if summary:
+            print(summary)
         else:
-            summary = summary.strip()
-            if summary.lower() == "none" or summary == "" or summary.lower() == "yes":
-                print(raw_msg)
-            else:
-                print(summary)
-
+            print(raw_msg)
         print("-" * 80)
         print()
 
-        if summary is None or summary.lower() == "none" or summary == "" or summary.lower() == "yes":
-            raise Exception()
+        if not summary:
+            raise Exception("compaction returned no usable summary")
 
         summary_msg = {"role": "user", "content": f"[context compacted] Session summary:\n{summary}"}
 
         new_session = list(session_messages) + [summary_msg]
-        filter_msgs_and_est_tokens(new_session)  # no need to track tokens now, let's just pick up the real number from usage below
+        filter_msgs_and_est_tokens(new_session)
         messages.clear()
         messages += new_session
 
@@ -366,6 +361,12 @@ def safe_path(filename):
 
 
 def tool_write_file(filename, content):
+    # guard against the model accidentally writing raw hashline output
+    hashline_re = re.compile(r"^\d+:[0-9a-f]{2}\|")
+    bad_lines = [l for l in content.splitlines() if hashline_re.match(l)]
+    if bad_lines:
+        sample = bad_lines[0]
+        return f"Error: content looks like raw read_file output (e.g. '{sample}'). " "Strip the 'LINENUM:HASH|' prefixes from each line before writing."
     target = safe_path(filename)
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(content, encoding="utf-8")
@@ -409,9 +410,28 @@ def tool_edit_file(filename, start_anchor, end_anchor, new_text):
     lines[start_line - 1 : end_line] = new_lines
     target.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
-    print(f"  edit_file: {target.relative_to(WORKSPACE)} " f"replaced lines {start_line}-{end_line} with {len(new_lines)} lines")
+    print(f"  edit_file: {target.relative_to(WORKSPACE)} replaced lines {start_line}-{end_line} with {len(new_lines)} lines")
 
     return render_hashlines(lines)
+
+
+def tool_run_command(command):
+    try:
+        result = subprocess.run(
+            command,
+            shell=True,
+            cwd=WORKSPACE,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        output = result.stdout + result.stderr
+    except subprocess.TimeoutExpired:
+        return "[error: command timed out after 30s]"
+    if len(output) > 8000:
+        output = output[:8000] + "\n[output truncated]"
+    print(f"  run_command: {command[:80]} -> exit {result.returncode}")
+    return output + f"\n[exit code: {result.returncode}]"
 
 
 # tool dispatcher
@@ -452,48 +472,29 @@ def dispatch_tool(mcp, name, arguments):
             arguments["new_text"],
         )
 
+    if name == "run_command":
+        return tool_run_command(arguments["command"])
+
     return f"Unknown tool: {name}"
 
 
-def main():
-    tools = [
-        {
-            "type": "function",
-            "function": {
-                "name": "playwright_navigate",
-                "description": ("Navigate the browser to a URL and return the page title. " "Use DDG plain HTML (https://html.duckduckgo.com/html/?q=...) for searches."),
-                "parameters": {
-                    "type": "object",
-                    "properties": {"url": {"type": "string"}},
-                    "required": ["url"],
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "playwright_extract_content",
-                "description": "Extract the current browser page as clean markdown.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "selector": {
-                            "type": "string",
-                            "description": "Optional CSS selector to scope extraction e.g. 'main'",
-                        }
-                    },
-                    "required": [],
-                },
-            },
-        },
+def get_env_snapshot():
+    cmd = "echo '=PWD=' && pwd && " "echo '=LS=' && ls -1 && " "echo '=PY=' && python3 --version 2>&1"
+    try:
+        r = subprocess.run(cmd, shell=True, cwd=WORKSPACE, capture_output=True, text=True, timeout=5)
+        return "[workspace snapshot]\n" + r.stdout.strip()
+    except Exception:
+        return ""
+
+
+def make_coding_tools():
+    return [
         {
             "type": "function",
             "function": {
                 "name": "write_file",
                 "description": (
-                    "Create or overwrite a file with the given content. "
-                    "Use a relative path e.g. 'inflation.md'. "
-                    "You MUST use this tool to create files - do not write file content in your reply."
+                    "Create or overwrite a file with the given content. " "Use a relative path e.g. 'solution.py'. " "You MUST use this tool to create files - do not write file content in your reply."
                 ),
                 "parameters": {
                     "type": "object",
@@ -554,61 +555,74 @@ def main():
                 },
             },
         },
+        {
+            "type": "function",
+            "function": {
+                "name": "run_command",
+                "description": (
+                    "Run a shell command in the workspace and return its output. "
+                    "Use this to run Python scripts, check results, or inspect the environment. "
+                    "Working directory is /workspace. Timeout is 30 seconds."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": {
+                            "type": "string",
+                            "description": "Shell command to run e.g. 'python3 solution.py'",
+                        }
+                    },
+                    "required": ["command"],
+                },
+            },
+        },
     ]
 
+
+def main():
+    tools = make_coding_tools()
+
     system_prompt = (
-        "You are a research assistant with browser access and file tools.\n\n"
-        "IMPORTANT: You MUST use tools for ALL file operations. "
-        "Never output file contents or table data directly in your reply text. "
-        "Always use write_file, read_file, or edit_file instead.\n\n"
-        "Hashline editing rules:\n"
-        "1. Always call read_file before edit_file to get current line anchors.\n"
-        "2. Anchors are LINENUM:HASH strings - copy them exactly from read_file output.\n"
-        "3. edit_file returns updated hashline content - use it for chained edits.\n\n"
-        "Browsing rules:\n"
-        "1. Use DuckDuckGo plain HTML for searches: "
-        "https://html.duckduckgo.com/html/?q=<query>\n"
-        "2. After finding what you need, stop browsing and proceed with the task.\n\n"
+        "You are a coding assistant. Use your tools for all file and execution operations.\n\n"
+        "File rules:\n"
+        "1. Always use write_file, read_file, edit_file, and run_command - never output file contents in your reply.\n"
+        "2. Always call read_file before edit_file to get current line anchors.\n"
+        "3. Anchors are LINENUM:HASH strings - copy them exactly from read_file output.\n\n"
         "When fully done, reply with one short confirmation sentence only."
     )
 
     initial_prompt = (
-        "Do the following steps in order using your tools:\n"
-        "1. Read inflation.md to see what years are already in the table.\n"
-        "2. Identify the earliest year currently in the file.\n"
-        "3. Search the web for the US annual inflation rate for the year "
-        "   immediately before that earliest year.\n"
-        "4. Use edit_file to insert a new row for that year into the table. "
-        "   The table must be in chronological order oldest-to-newest "
-        "   (earliest year at the top of the data rows, most recent at the bottom).\n"
-        "   If the current table is in the wrong order, reorder it with edit_file first.\n"
-        "   If you have a sense of what model you are, including version, add a good name for yourself to any rows you add.\n"
-        "   If you receive a compaction summarization request at any point in the session, put down Yes, otherwise No\n"
-        "5. Reply with one short confirmation sentence naming the year you added."
+        "Implement the following Python function in solution.py:\n\n"
+        "    def run_length_encode(s):\n"
+        "        # Takes a string s.\n"
+        "        # Returns a list of (char, count) tuples representing the run-length encoding.\n"
+        "        # Example: run_length_encode('aaabbc') == [('a', 3), ('b', 2), ('c', 1)]\n"
+        "        # Example: run_length_encode('') == []\n\n"
+        "A test file test_solution.py already exists in the workspace.\n"
+        "Run it with: python3 test_solution.py\n"
+        "Fix any failures until all tests pass, then confirm with one sentence."
     )
 
+    snapshot = get_env_snapshot()
+    if snapshot:
+        initial_prompt = initial_prompt + "\n\n" + snapshot
+
     # last confirmed post-call token count from openrouter
-    # used as the base for the next pre-call estimate
-    # estimates are more accurate if not started at zero
     state = {"last_post_tokens": 949}
 
     # session_messages is never modified - used to rebuild context after compaction
     session_messages = []
-    if system_prompt:
-        if USE_SYSTEM_PROMPT:
-            session_messages.append({"role": "system", "content": system_prompt})
-        else:
-            session_messages.append({"role": "user", "content": system_prompt})
-    if initial_prompt:
-        session_messages.append({"role": "user", "content": initial_prompt})
+    if USE_SYSTEM_PROMPT:
+        session_messages.append({"role": "system", "content": system_prompt})
+    else:
+        session_messages.append({"role": "user", "content": system_prompt})
+    session_messages.append({"role": "user", "content": initial_prompt})
 
-    # ONLY add to messages inside chat() because we want to filter first
     messages = []
-    new_messages = list(session_messages)  # seed first call
+    new_messages = list(session_messages)
 
-    print("MCP server alive, handshaking...")
-    mcp = start_mcp()
-    print("MCP handshake complete.\n")
+    # mcp only needed for playwright tools; skip for coding task
+    mcp = None
 
     print("Starting agent loop...\n")
 
@@ -636,8 +650,9 @@ def main():
             print(f"\n[done] {msg['content']}")
             break
 
-    mcp["proc"].stdin.close()
-    mcp["proc"].terminate()
+    if mcp:
+        mcp["proc"].stdin.close()
+        mcp["proc"].terminate()
 
 
 if __name__ == "__main__":
