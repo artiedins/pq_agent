@@ -22,11 +22,13 @@ import re
 # - Yes inline comments for showing intent without ceremony
 # - Yes if __name__ == "__main__": main()
 
-
 # Config
 
-SLOW_MODE = True
+
+SLOW_MODE = False
 USE_SYSTEM_PROMPT = True  # use system role otherwise user role for first msg
+BUMP_OVER_LIMIT_MSGS = False
+
 
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
 if not OPENROUTER_API_KEY:
@@ -34,7 +36,13 @@ if not OPENROUTER_API_KEY:
 
 AGENT_DIR = os.environ.get("AGENT_DIR", str(Path(__file__).parent.resolve()))
 
-MODEL = "qwen/qwen3.6-plus:free"
+# | 2017 | 2.1% | google/gemini-3.1-flash-lite-preview | Yes | - good 0.25 / 1.5 failed with hash line
+# | 2018 | 2.49% | nvidia/nemotron-3-super-120b-a12b:free | yes | - good 0 / 0 good again
+# | 2020 | 1.23% | qwen/qwen3.6-plus:free | yes | - good 0 / 0
+
+MODEL = "google/gemini-3.1-flash-lite-preview"
+
+
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 HEADERS = {
@@ -98,8 +106,48 @@ def filter_msgs_and_est_tokens(messages):
     return tokens
 
 
-def chat(messages, tools, new_messages, state):
-    MAX_CONTEXT_LENGTH = 128000
+def post_with_retry(payload):
+    for attempt in range(9):
+        if attempt > 0 or SLOW_MODE:
+            p = attempt if SLOW_MODE else attempt - 1
+            delay = random.uniform(2**p, 2 ** (p + 1))
+            time.sleep(delay)
+        try:
+            resp = requests.post(OPENROUTER_URL, headers=HEADERS, json=payload, timeout=60)
+        except requests.exceptions.Timeout:
+            if attempt < 8:
+                print(f"  [error] request timed out, retrying (attempt {attempt + 1}/8)...")
+                continue
+            raise
+        if resp.status_code == 429 and attempt < 8:
+            print(f"  [error] 429 rate limit, retrying (attempt {attempt + 1}/8)...")
+            continue
+        if not resp.ok:
+            print(f"\n[error] status={resp.status_code}")
+            for key, val in resp.headers.items():
+                print(f"  {key}: {val}")
+        resp.raise_for_status()
+        break
+    return resp
+
+
+def post_compaction(payload):
+    try:
+        resp = post_with_retry(payload)
+        resp.raise_for_status()
+        return resp
+    except requests.exceptions.HTTPError as e:
+        if e.response.status_code == 400 and "reasoning" in payload:
+            print("  [warn] reasoning param rejected, retrying without it...")
+            payload = {k: v for k, v in payload.items() if k != "reasoning"}
+            resp = post_with_retry(payload)
+            resp.raise_for_status()
+            return resp
+        raise
+
+
+def chat(messages, tools, new_messages, state, session_messages):
+    MAX_CONTEXT_LENGTH = 131000
 
     # pre = last known accurate count + estimated tokens for the newest message only
     # (the newest message is the only one openrouter has not yet seen)
@@ -108,10 +156,82 @@ def chat(messages, tools, new_messages, state):
     new_prompt_tokens = filter_msgs_and_est_tokens(new_messages)
     new_prompt_tokens = int(round(0.2221 * (new_prompt_tokens**1.1866)))
     pre_prompt_total_context = state["last_post_tokens"] + new_prompt_tokens
+    # print("NEW MESSAGE TOKENS", new_prompt_tokens, "for new total", pre_prompt_total_context)
 
     if pre_prompt_total_context > MAX_CONTEXT_LENGTH:
         print("PERFORM COMPACTION", flush=True)
-        raise Exception("need compaction mechanization")
+
+        if BUMP_OVER_LIMIT_MSGS:
+            compaction_prompt = (
+                "The agent context limit was reached and this session is being compacted. "
+                "The conversation above is the full committed session history. "
+                "Write a compact plain-text summary covering:\n"
+                "1. What actions were taken and whether they succeeded or failed.\n"
+                "2. Current state of any modified files (exact filenames, key content or structure).\n"
+                "3. Any discovered facts relevant to completing the task (e.g. specific data values found).\n"
+                "4. What tool was running at the moment of compaction, "
+                "and that its result (or further prompts, or nothing) will follow immediately after this summary.\n"
+                "Include any prior compaction summaries in condensed form.\n"
+                "Do NOT summarize the system prompt or initial task instructions - those are provided fresh.\n"
+                "Be terse. If this summary exceeds 9000 tokens it will be clipped.\n"
+                "Minimize thinking and output summary content.\n"
+            )
+
+            compaction_payload = {
+                "model": MODEL,
+                "messages": messages + [{"role": "user", "content": compaction_prompt}],
+                # "reasoning": {"effort": "none"},
+            }
+        else:
+            compaction_prompt = (
+                "The agent context limit was reached and this session is being compacted. "
+                "The conversation above is the full committed session history. "
+                "Write a compact plain-text summary covering:\n"
+                "1. What actions were taken and whether they succeeded or failed.\n"
+                "2. Current state of any modified files (exact filenames, key content or structure).\n"
+                "3. Any discovered facts relevant to completing the task (e.g. specific data values found).\n"
+                "4. Immediate next step. \n"
+                "Include any prior compaction summaries in condensed form.\n"
+                "Do NOT summarize the system prompt or initial task instructions - those are provided fresh.\n"
+                "Be terse. If this summary exceeds 9000 tokens it will be clipped.\n"
+                "Minimize thinking and output summary content.\n"
+            )
+            compaction_payload = {
+                "model": MODEL,
+                "messages": messages + new_messages + [{"role": "user", "content": compaction_prompt}],
+                # "reasoning": {"effort": "none"},
+            }
+            new_messages.clear()
+
+        resp_json = post_compaction(compaction_payload).json()
+        raw_msg = resp_json["choices"][0]["message"]
+        summary = raw_msg.get("content")
+
+        print()
+        print("-" * 80)
+
+        if summary is None or not isinstance(summary, str):
+            print(raw_msg)
+        else:
+            summary = summary.strip()
+            if summary.lower() == "none" or summary == "" or summary.lower() == "yes":
+                print(raw_msg)
+            else:
+                print(summary)
+
+        print("-" * 80)
+        print()
+
+        if summary is None or summary.lower() == "none" or summary == "" or summary.lower() == "yes":
+            raise Exception()
+
+        summary_msg = {"role": "user", "content": f"[context compacted] Session summary:\n{summary}"}
+
+        new_session = list(session_messages) + [summary_msg]
+        filter_msgs_and_est_tokens(new_session)  # no need to track tokens now, let's just pick up the real number from usage below
+        messages.clear()
+        messages += new_session
+
     else:
         print("Sending CONTEXT", pre_prompt_total_context, "which is {:.1f}% of max context".format(100 * pre_prompt_total_context / MAX_CONTEXT_LENGTH))
 
@@ -125,39 +245,10 @@ def chat(messages, tools, new_messages, state):
         "messages": messages,
     }
 
-    # 0 is the initial request, 1-8 are the retries
-    for attempt in range(9):
-        # determine if we need to sleep before this request
-        if attempt > 0 or SLOW_MODE:
-            p = attempt if SLOW_MODE else attempt - 1
-            delay = random.uniform(2**p, 2 ** (p + 1))
-            time.sleep(delay)
-
-        try:
-            resp = requests.post(OPENROUTER_URL, headers=HEADERS, json=payload, timeout=60)
-        except requests.exceptions.Timeout:
-            if attempt < 8:
-                print(f"  [error] request timed out, retrying (attempt {attempt + 1}/8)...")
-                continue
-            raise
-
-        # if rate limited, loop around to try again
-        if resp.status_code == 429 and attempt < 8:
-            print(f"  [error] 429 rate limit, retrying (attempt {attempt + 1}/8)...")
-            continue
-
-        # on any other failure or if we exhaust our retries, dump headers
-        if not resp.ok:
-            print(f"\n[error] status={resp.status_code}")
-            for key, val in resp.headers.items():
-                print(f"  {key}: {val}")
-
-        resp.raise_for_status()
-        break
-
-    data = resp.json()
+    data = post_with_retry(payload).json()
 
     state["last_post_tokens"] = int(data.get("usage", {}).get("prompt_tokens", 0))
+    print("------ MSGS", len(messages), "-------- CONTEXT", state["last_post_tokens"])
 
     return data
 
@@ -491,6 +582,8 @@ def main():
         "   The table must be in chronological order oldest-to-newest "
         "   (earliest year at the top of the data rows, most recent at the bottom).\n"
         "   If the current table is in the wrong order, reorder it with edit_file first.\n"
+        "   If you have a sense of what model you are, including version, add a good name for yourself to any rows you add.\n"
+        "   If you receive a compaction summarization request at any point in the session, put down Yes, otherwise No\n"
         "5. Reply with one short confirmation sentence naming the year you added."
     )
 
@@ -499,18 +592,19 @@ def main():
     # estimates are more accurate if not started at zero
     state = {"last_post_tokens": 949}
 
-    # ONLY add to messages inside chat() because we want to filter first
-    messages = []
-    new_messages = []
-
+    # session_messages is never modified - used to rebuild context after compaction
+    session_messages = []
     if system_prompt:
         if USE_SYSTEM_PROMPT:
-            new_messages.append({"role": "system", "content": system_prompt})
+            session_messages.append({"role": "system", "content": system_prompt})
         else:
-            new_messages.append({"role": "user", "content": system_prompt})
-
+            session_messages.append({"role": "user", "content": system_prompt})
     if initial_prompt:
-        new_messages.append({"role": "user", "content": initial_prompt})
+        session_messages.append({"role": "user", "content": initial_prompt})
+
+    # ONLY add to messages inside chat() because we want to filter first
+    messages = []
+    new_messages = list(session_messages)  # seed first call
 
     print("MCP server alive, handshaking...")
     mcp = start_mcp()
@@ -519,7 +613,7 @@ def main():
     print("Starting agent loop...\n")
 
     while True:
-        response = chat(messages, tools, new_messages, state)
+        response = chat(messages, tools, new_messages, state, session_messages)
         choice = response["choices"][0]
         msg = choice["message"]
         finish = choice["finish_reason"]
