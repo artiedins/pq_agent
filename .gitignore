@@ -8,10 +8,6 @@ __pycache__/
 *.pyo
 .venv/
 
-# agent outputs - these belong in project dirs, not the agent repo
-*.md
-!README.md
-
 # env / secrets - use shell exports instead
 .env
 
