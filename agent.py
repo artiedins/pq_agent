@@ -487,8 +487,45 @@ def get_env_snapshot():
         return ""
 
 
-def make_coding_tools():
+def read_p():
+    # p.md is the task prompt - lives in the project directory
+    p_path = WORKSPACE / "p.md"
+    if not p_path.exists():
+        sys.exit(f"Error: no p.md found in {WORKSPACE}")
+    return p_path.read_text(encoding="utf-8").strip()
+
+
+def make_tools():
     return [
+        {
+            "type": "function",
+            "function": {
+                "name": "playwright_navigate",
+                "description": ("Navigate the browser to a URL and return the page title. " "Use DDG plain HTML (https://html.duckduckgo.com/html/?q=...) for searches."),
+                "parameters": {
+                    "type": "object",
+                    "properties": {"url": {"type": "string"}},
+                    "required": ["url"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "playwright_extract_content",
+                "description": "Extract the current browser page as clean markdown.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "selector": {
+                            "type": "string",
+                            "description": "Optional CSS selector to scope extraction e.g. 'main'",
+                        }
+                    },
+                    "required": [],
+                },
+            },
+        },
         {
             "type": "function",
             "function": {
@@ -559,17 +596,13 @@ def make_coding_tools():
             "type": "function",
             "function": {
                 "name": "run_command",
-                "description": (
-                    "Run a shell command in the workspace and return its output. "
-                    "Use this to run Python scripts, check results, or inspect the environment. "
-                    "Working directory is /workspace. Timeout is 30 seconds."
-                ),
+                "description": ("Run a shell command in the workspace and return its output. " "Timeout is 30 seconds."),
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "command": {
                             "type": "string",
-                            "description": "Shell command to run e.g. 'python3 solution.py'",
+                            "description": "Shell command to run e.g. 'python3 q.py'",
                         }
                     },
                     "required": ["command"],
@@ -580,27 +613,18 @@ def make_coding_tools():
 
 
 def main():
-    tools = make_coding_tools()
+    tools = make_tools()
+    initial_prompt = read_p()
 
     system_prompt = (
-        "You are a coding assistant. Use your tools for all file and execution operations.\n\n"
-        "File rules:\n"
-        "1. Always use write_file, read_file, edit_file, and run_command - never output file contents in your reply.\n"
+        "You are an autonomous agent with browser, shell, and file tools.\n\n"
+        "Tool rules:\n"
+        "1. Always use tools for file operations and commands - never output file contents in your reply.\n"
         "2. Always call read_file before edit_file to get current line anchors.\n"
-        "3. Anchors are LINENUM:HASH strings - copy them exactly from read_file output.\n\n"
-        "When fully done, reply with one short confirmation sentence only."
-    )
-
-    initial_prompt = (
-        "Implement the following Python function in solution.py:\n\n"
-        "    def run_length_encode(s):\n"
-        "        # Takes a string s.\n"
-        "        # Returns a list of (char, count) tuples representing the run-length encoding.\n"
-        "        # Example: run_length_encode('aaabbc') == [('a', 3), ('b', 2), ('c', 1)]\n"
-        "        # Example: run_length_encode('') == []\n\n"
-        "A test file test_solution.py already exists in the workspace.\n"
-        "Run it with: python3 test_solution.py\n"
-        "Fix any failures until all tests pass, then confirm with one sentence."
+        "3. Anchors are LINENUM:HASH strings - copy them exactly from read_file output.\n"
+        "4. For web searches use DuckDuckGo plain HTML: https://html.duckduckgo.com/html/?q=<query>\n\n"
+        "Verification: when you believe the task is complete, run python3 q.py. "
+        "Fix any failures. When q.py prints OK, reply with one short confirmation sentence."
     )
 
     snapshot = get_env_snapshot()
@@ -621,8 +645,9 @@ def main():
     messages = []
     new_messages = list(session_messages)
 
-    # mcp only needed for playwright tools; skip for coding task
-    mcp = None
+    print("MCP server starting...")
+    mcp = start_mcp()
+    print("MCP ready.\n")
 
     print("Starting agent loop...\n")
 
@@ -650,9 +675,8 @@ def main():
             print(f"\n[done] {msg['content']}")
             break
 
-    if mcp:
-        mcp["proc"].stdin.close()
-        mcp["proc"].terminate()
+    mcp["proc"].stdin.close()
+    mcp["proc"].terminate()
 
 
 if __name__ == "__main__":
