@@ -439,8 +439,6 @@ def tool_run_command(command):
         output = result.stdout + result.stderr
     except subprocess.TimeoutExpired:
         return "[error: command timed out after 30s]"
-    if len(output) > 8000:
-        output = output[:8000] + "\n[output truncated]"
     print(f"  run_command: {command[:80]} -> exit {result.returncode}")
     return output + f"\n[exit code: {result.returncode}]"
 
