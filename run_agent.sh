@@ -20,7 +20,8 @@ fi
 AGENT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$1" && pwd)"
 
-: "${OPENROUTER_API_KEY:?OPENROUTER_API_KEY must be set in the environment}"
+#: "${OPENROUTER_API_KEY:?OPENROUTER_API_KEY must be set in the environment}"
+: "${GOOGLE_API_KEY:?GOOGLE_API_KEY must be set in the environment}"
 
 PW_CACHE="${HOME}/.cache/ms-playwright"
 
@@ -62,7 +63,7 @@ exec bwrap \
   --setenv PATH /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
   --setenv HOME /tmp \
   --setenv TMPDIR /tmp \
-  --setenv OPENROUTER_API_KEY "$OPENROUTER_API_KEY" \
+  --setenv GOOGLE_API_KEY "$GOOGLE_API_KEY" \
   --setenv PLAYWRIGHT_BROWSERS_PATH /pw-cache \
   --setenv AGENT_DIR /agent \
   --chdir /workspace \

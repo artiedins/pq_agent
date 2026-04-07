@@ -28,20 +28,31 @@ SLOW_MODE = False
 USE_SYSTEM_PROMPT = True  # use system role otherwise user role for first msg
 BUMP_OVER_LIMIT_MSGS = False
 
-OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
-if not OPENROUTER_API_KEY:
-    sys.exit("Error: OPENROUTER_API_KEY environment variable is not set.")
+# OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
+# if not OPENROUTER_API_KEY:
+#    sys.exit("Error: OPENROUTER_API_KEY environment variable is not set.")
+
+GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
+if not GOOGLE_API_KEY:
+    sys.exit("Error: GOOGLE_API_KEY environment variable is not set.")
 
 AGENT_DIR = os.environ.get("AGENT_DIR", str(Path(__file__).parent.resolve()))
 
-MODEL = "google/gemini-3.1-flash-lite-preview"
+# MODEL = "google/gemini-3.1-flash-lite-preview"
+MODEL = "gemini-3.1-flash-lite-preview"
 
-OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+# OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+# HEADERS = {
+#    "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+#    "Content-Type": "application/json",
+# }
 
+OPENROUTER_URL = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
 HEADERS = {
-    "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+    "Authorization": f"Bearer {GOOGLE_API_KEY}",
     "Content-Type": "application/json",
 }
+
 
 WORKSPACE = Path.cwd().resolve()
 
@@ -451,7 +462,11 @@ def dispatch_tool(mcp, name, arguments):
                 if name == "playwright_navigate":
                     print(f"  playwright_navigate: {arguments.get('url', '')[:80]}")
                 else:
+                    # debug: print length and first 300 chars so we can see if
+                    # the MCP is returning markdown or raw HTML
+                    preview = text[:300].replace("\n", " ").strip()
                     print(f"  playwright_extract_content: {len(text)} chars")
+                    print(f"  [debug preview] {preview}")
                 return text
             except TimeoutError as e:
                 if attempt == 8:

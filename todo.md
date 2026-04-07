@@ -1,3 +1,13 @@
+
+- installing python libs
+- high performanc c code?
+
+- drone project
+- health projects
+- home automation
+- microphone project
+
+
 # pq_agent harness development plan
 
 Design philosophy: provide the minimal set of harness features that all frontier models
