@@ -6,7 +6,6 @@ import select
 import subprocess
 import requests
 import time
-from pathlib import Path
 import random
 import tiktoken
 import re
@@ -21,8 +20,6 @@ import re
 # - No global variables unless making them local increases complexity
 # - Yes strategic inline comments enhancing rapid code comprehension by real humans
 # - Yes if __name__ == "__main__": main()
-
-# Config
 
 SLOW_MODE = False
 BUMP_OVER_LIMIT_MSGS = False
@@ -53,12 +50,12 @@ def shorten_content_with_notice(m):
 
 
 def filter_msgs_and_est_tokens(messages):
-    tokens = 3  # reply priming
+    tokens = 3  # reply priming overhead
 
     MAX_MSG_TOKENS = 9000
 
     for i, msg in enumerate(messages):
-        tokens += 3
+        tokens += 3  # per-message framing
 
         shorten_loops = 0
         msg_tokens = MAX_MSG_TOKENS + 100
@@ -349,11 +346,20 @@ def safe_path(filename):
 
 
 def tool_write_file(filename, content):
+    # guard against the model accidentally writing raw hashline output
     hashline_re = re.compile(r"^\d+:[0-9a-f]{2}\|")
     bad_lines = [l for l in content.splitlines() if hashline_re.match(l)]
     if bad_lines:
         sample = bad_lines[0]
-        return "Error: content looks like raw read_file output (e.g. '" + sample + "'). Strip the 'LINENUM:HASH|' prefixes from each line before writing."
+        return "Error: content looks like raw read_file output (e.g. '" + sample + "'). Strip the 'LINENUM:HASH|' prefixes before writing."
+
+    # enforce task_report/ restrictions: if writing into task_report/, only md/jpg/png allowed
+    norm = filename.replace("\\", "/")
+    if norm.startswith("task_report/") or norm.startswith("./task_report/"):
+        ext = os.path.splitext(filename)[1].lower()
+        if ext not in (".md", ".jpg", ".jpeg", ".png"):
+            return "Error: task_report/ only accepts .md, .jpg, and .png files. Got: " + ext
+
     target = safe_path(filename)
     parent = os.path.dirname(target)
     if parent:
@@ -407,7 +413,6 @@ def tool_edit_file(filename, start_anchor, end_anchor, new_text):
 
     rel = os.path.relpath(target, WORKSPACE)
     print("  edit_file: " + rel + " replaced lines " + str(start_line) + "-" + str(end_line) + " with " + str(len(new_lines)) + " lines")
-
     return render_hashlines(lines)
 
 
@@ -456,10 +461,8 @@ def dispatch_tool(mcp, name, arguments):
 
     if name == "write_file":
         return tool_write_file(arguments["filename"], arguments["content"])
-
     if name == "read_file":
         return tool_read_file(arguments["filename"])
-
     if name == "edit_file":
         return tool_edit_file(
             arguments["filename"],
@@ -467,7 +470,6 @@ def dispatch_tool(mcp, name, arguments):
             arguments["end_anchor"],
             arguments["new_text"],
         )
-
     if name == "run_command":
         return tool_run_command(arguments["command"])
 
@@ -492,7 +494,7 @@ def read_p():
 
 
 def read_project():
-    # project.md is optional at agent level - pq_minder validates it exists before staging
+    # project.md is optional at agent level; pq_minder validates it exists before staging
     project_path = os.path.join(WORKSPACE, "project.md")
     if not os.path.exists(project_path):
         return ""
@@ -562,23 +564,14 @@ def make_tools():
             "type": "function",
             "function": {
                 "name": "edit_file",
-                "description": "Edit a file using hashline anchors from a previous read_file call. Replaces the lines from start_anchor to end_anchor (inclusive) with new_text. Anchors are LINENUM:HASH strings e.g. '5:a3' - copy them exactly from read_file output. To insert after a line: set both anchors to that line and include it in new_text followed by the new content. Returns the updated file content with new hashline anchors. You MUST use this tool to edit files - do not output edited file content in your reply.",
+                "description": "Edit a file using hashline anchors from a previous read_file call. Replaces the lines from start_anchor to end_anchor (inclusive) with new_text. Returns the updated file with new anchors. You MUST use this tool to edit files.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "filename": {"type": "string"},
-                        "start_anchor": {
-                            "type": "string",
-                            "description": "LINENUM:HASH of the first line to replace e.g. '5:a3'",
-                        },
-                        "end_anchor": {
-                            "type": "string",
-                            "description": "LINENUM:HASH of the last line to replace e.g. '7:f1'",
-                        },
-                        "new_text": {
-                            "type": "string",
-                            "description": "Replacement text. Use newlines for multiple lines.",
-                        },
+                        "start_anchor": {"type": "string", "description": "LINENUM:HASH of the first line to replace e.g. '5:a3'"},
+                        "end_anchor": {"type": "string", "description": "LINENUM:HASH of the last line to replace e.g. '7:f1'"},
+                        "new_text": {"type": "string", "description": "Replacement text. Use newlines for multiple lines."},
                     },
                     "required": ["filename", "start_anchor", "end_anchor", "new_text"],
                 },
@@ -592,10 +585,7 @@ def make_tools():
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "command": {
-                            "type": "string",
-                            "description": "Shell command to run e.g. 'python3 q.py'",
-                        }
+                        "command": {"type": "string", "description": "Shell command to run e.g. 'python3 solution.py'"},
                     },
                     "required": ["command"],
                 },
@@ -605,7 +595,7 @@ def make_tools():
 
 
 def make_system_prompt():
-    # three concerns: tool rules, image output constraints, and the finishing protocol
+    # three concerns: tool rules, output constraints, and finishing protocol
     return (
         "You are an autonomous agent with browser, shell, and file tools.\n\n"
         "Tool rules:\n"
@@ -613,27 +603,24 @@ def make_system_prompt():
         "2. Always call read_file before edit_file to get current line anchors.\n"
         "3. Anchors are LINENUM:HASH strings - copy them exactly from read_file output.\n"
         "4. For web searches use DuckDuckGo plain HTML: https://html.duckduckgo.com/html/?q=<query>\n\n"
-        "Image output rules (when necessary for task completion):\n"
-        "- Only produce image files with .jpg or .png extension. No other formats are accepted.\n"
-        "- Images must be no larger than 1200 pixels on the longest side.\n\n"
-        "Finishing:\n"
-        "When the task is complete, use write_file to create report.md containing:\n"
+        "When the task is complete, use write_file to create task_report/report.md containing:\n"
         "1. A step-by-step summary of what you did.\n"
         "2. Key decisions and why you made them.\n"
         "3. Anything you are uncertain about.\n"
         "4. Your assessment of whether the task succeeded.\n"
-        "After writing report.md, reply with one short sentence confirming completion."
+        "5. You may create or copy images (.jpg or .png, and no larger than 1200 pixels please) to task_report/ if the task requires those for evaluation.\n"
+        "5. Markdown or images in task_report/ are only for evaluation and will be deleted after your work is evaluated.\n"
+        "After writing task_report/report.md, reply with one short sentence confirming completion.\n"
     )
 
 
 def main():
     tools = make_tools()
 
-    # three-part context: (1) system rules, (2) project context, (3) task
+    # three-part session context: (1) system rules, (2) project context, (3) this task
     # project.md and p.md are staged into workspace root by pq_minder before this runs
     task_prompt = read_p()
     project_text = read_project()
-
     system_prompt = make_system_prompt()
     snapshot = get_env_snapshot()
 
