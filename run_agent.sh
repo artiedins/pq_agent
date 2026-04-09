@@ -8,6 +8,7 @@
 # the project dir is where the agent reads and writes (read-write at /workspace)
 #
 # protects: $HOME entirely invisible, only project dir is writable
+# .pq is shadowed with an empty tmpfs so the agent cannot see harness files
 # allows: full network (playwright needs it), playwright browser cache read-only
 
 set -euo pipefail
@@ -20,7 +21,6 @@ fi
 AGENT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$1" && pwd)"
 
-#: "${OPENROUTER_API_KEY:?OPENROUTER_API_KEY must be set in the environment}"
 : "${GOOGLE_API_KEY:?GOOGLE_API_KEY must be set in the environment}"
 
 PW_CACHE="${HOME}/.cache/ms-playwright"
@@ -30,7 +30,7 @@ if ! command -v bwrap &>/dev/null; then
     exit 1
 fi
 
-echo "agent dir : $AGENT_DIR"
+echo "agent dir  : $AGENT_DIR"
 echo "project dir: $PROJECT_DIR"
 echo ""
 
@@ -53,6 +53,8 @@ exec bwrap \
   --ro-bind "$AGENT_DIR" /agent \
   `# project dir is the only writable location` \
   --bind "$PROJECT_DIR" /workspace \
+  `# shadow .pq with empty tmpfs so agent cannot read harness files` \
+  --tmpfs /workspace/.pq \
   --ro-bind-try "$PW_CACHE" /pw-cache \
   --unshare-pid \
   --unshare-ipc \

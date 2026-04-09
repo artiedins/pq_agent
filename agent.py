@@ -15,49 +15,34 @@ import re
 # - No type hinting
 # - No doc strings
 # - No triple quoted multi-line strings
-# - No comments with repeated characters for visual page breaks
+# - No comments with repeated characters for visual page breaks like # ---
 # - No non-ascii characters
 # - No command line argument processing
 # - No global variables unless making them local increases complexity
-# - Yes inline comments for showing intent without ceremony
+# - Yes strategic inline comments enhancing rapid code comprehension by real humans
 # - Yes if __name__ == "__main__": main()
 
 # Config
 
 SLOW_MODE = False
-USE_SYSTEM_PROMPT = True  # use system role otherwise user role for first msg
 BUMP_OVER_LIMIT_MSGS = False
-
-# OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
-# if not OPENROUTER_API_KEY:
-#    sys.exit("Error: OPENROUTER_API_KEY environment variable is not set.")
 
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
 if not GOOGLE_API_KEY:
     sys.exit("Error: GOOGLE_API_KEY environment variable is not set.")
 
-AGENT_DIR = os.environ.get("AGENT_DIR", str(Path(__file__).parent.resolve()))
+AGENT_DIR = os.environ.get("AGENT_DIR", os.path.dirname(os.path.abspath(__file__)))
 
-# MODEL = "google/gemini-3.1-flash-lite-preview"
 MODEL = "gemini-3.1-flash-lite-preview"
-
-# OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-# HEADERS = {
-#    "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-#    "Content-Type": "application/json",
-# }
 
 OPENROUTER_URL = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
 HEADERS = {
-    "Authorization": f"Bearer {GOOGLE_API_KEY}",
+    "Authorization": "Bearer " + GOOGLE_API_KEY,
     "Content-Type": "application/json",
 }
 
+WORKSPACE = os.path.abspath(os.getcwd())
 
-WORKSPACE = Path.cwd().resolve()
-
-# cl100k_base is a good approximation for most modern models
-# loaded once; tiktoken caches the vocab file on disk after first download
 _enc = tiktoken.get_encoding("cl100k_base")
 
 
@@ -68,13 +53,12 @@ def shorten_content_with_notice(m):
 
 
 def filter_msgs_and_est_tokens(messages):
-    # 3 tokens overhead per message (role framing), 3 for reply priming
     tokens = 3  # reply priming
 
     MAX_MSG_TOKENS = 9000
 
     for i, msg in enumerate(messages):
-        tokens += 3  # per-message overhead
+        tokens += 3
 
         shorten_loops = 0
         msg_tokens = MAX_MSG_TOKENS + 100
@@ -120,16 +104,16 @@ def post_with_retry(payload):
             resp = requests.post(OPENROUTER_URL, headers=HEADERS, json=payload, timeout=60)
         except requests.exceptions.Timeout:
             if attempt < 8:
-                print(f"  [error] request timed out, retrying (attempt {attempt + 1}/8)...")
+                print("  [error] request timed out, retrying (attempt " + str(attempt + 1) + "/8)...")
                 continue
             raise
         if resp.status_code == 429 and attempt < 8:
-            print(f"  [error] 429 rate limit, retrying (attempt {attempt + 1}/8)...")
+            print("  [error] 429 rate limit, retrying (attempt " + str(attempt + 1) + "/8)...")
             continue
         if not resp.ok:
-            print(f"\n[error] status={resp.status_code}")
+            print("\n[error] status=" + str(resp.status_code))
             for key, val in resp.headers.items():
-                print(f"  {key}: {val}")
+                print("  " + key + ": " + val)
         resp.raise_for_status()
         break
     return resp
@@ -151,8 +135,6 @@ def post_compaction(payload):
 
 
 def extract_compaction_summary(raw_msg):
-    # some models (e.g. qwen3.6 with reasoning on) return content in the
-    # reasoning field instead of content when asked to summarize
     summary = raw_msg.get("content")
     if not summary or not isinstance(summary, str) or summary.strip().lower() in ("", "none", "yes"):
         summary = raw_msg.get("reasoning") or raw_msg.get("reasoning_content")
@@ -162,11 +144,8 @@ def extract_compaction_summary(raw_msg):
 
 
 def chat(messages, tools, new_messages, state, session_messages):
-    MAX_CONTEXT_LENGTH = 131000
+    MAX_CONTEXT_LENGTH = 130000
 
-    # pre = last known accurate count + estimated tokens for the newest message only
-    # (the newest message is the only one openrouter has not yet seen)
-    # We use a correction factor to make tiktoken token count more accurate - DO NOT CHANGE THIS
     new_prompt_tokens = filter_msgs_and_est_tokens(new_messages)
     new_prompt_tokens = int(round(0.2221 * (new_prompt_tokens**1.1866)))
     pre_prompt_total_context = state["last_post_tokens"] + new_prompt_tokens
@@ -192,7 +171,6 @@ def chat(messages, tools, new_messages, state, session_messages):
             compaction_payload = {
                 "model": MODEL,
                 "messages": messages + [{"role": "user", "content": compaction_prompt}],
-                # "reasoning": {"effort": "none"},
             }
         else:
             compaction_prompt = (
@@ -211,7 +189,6 @@ def chat(messages, tools, new_messages, state, session_messages):
             compaction_payload = {
                 "model": MODEL,
                 "messages": messages + new_messages + [{"role": "user", "content": compaction_prompt}],
-                # "reasoning": {"effort": "none"},
             }
             new_messages.clear()
 
@@ -231,7 +208,7 @@ def chat(messages, tools, new_messages, state, session_messages):
         if not summary:
             raise Exception("compaction returned no usable summary")
 
-        summary_msg = {"role": "user", "content": f"[context compacted] Session summary:\n{summary}"}
+        summary_msg = {"role": "user", "content": "[context compacted] Session summary:\n" + summary}
 
         new_session = list(session_messages) + [summary_msg]
         filter_msgs_and_est_tokens(new_session)
@@ -286,7 +263,7 @@ def mcp_recv(mcp, expected_id):
         msg = json.loads(line)
         if msg.get("id") == expected_id:
             if "error" in msg:
-                raise RuntimeError(f"MCP error: {msg['error']}")
+                raise RuntimeError("MCP error: " + str(msg["error"]))
             return msg["result"]
 
 
@@ -318,7 +295,7 @@ def start_mcp():
     )
     time.sleep(1)
     if proc.poll() is not None:
-        sys.exit(f"MCP server exited immediately with code {proc.returncode}")
+        sys.exit("MCP server exited immediately with code " + str(proc.returncode))
     mcp = {"proc": proc, "id": 0}
     _mcp_handshake(mcp)
     return mcp
@@ -337,7 +314,7 @@ def restart_mcp(mcp):
     )
     time.sleep(1)
     if proc.poll() is not None:
-        raise RuntimeError(f"MCP server failed to restart, exit code {proc.returncode}")
+        raise RuntimeError("MCP server failed to restart, exit code " + str(proc.returncode))
     mcp["proc"] = proc
     mcp["id"] = 0
     _mcp_handshake(mcp)
@@ -347,24 +324,24 @@ def restart_mcp(mcp):
 
 
 def line_hash(line):
-    return f"{zlib.crc32(line.rstrip().encode('utf-8')) % 256:02x}"
+    return "{:02x}".format(zlib.crc32(line.rstrip().encode("utf-8")) % 256)
 
 
 def render_hashlines(lines):
-    return "\n".join(f"{i}:{line_hash(l)}|{l.rstrip()}" for i, l in enumerate(lines, 1))
+    return "\n".join(str(i) + ":" + line_hash(l) + "|" + l.rstrip() for i, l in enumerate(lines, 1))
 
 
 def parse_anchor(anchor):
     parts = anchor.split(":")
     if len(parts) != 2:
-        raise ValueError(f"bad anchor format: {anchor!r} - expected LINENUM:HASH e.g. '5:a3'")
+        raise ValueError("bad anchor format: " + repr(anchor) + " - expected LINENUM:HASH e.g. '5:a3'")
     return int(parts[0]), parts[1]
 
 
 def safe_path(filename):
-    target = (WORKSPACE / filename).resolve()
-    if not str(target).startswith(str(WORKSPACE)):
-        raise ValueError(f"path '{filename}' resolves outside workspace")
+    target = os.path.abspath(os.path.join(WORKSPACE, filename))
+    if not target.startswith(WORKSPACE):
+        raise ValueError("path '" + filename + "' resolves outside workspace")
     return target
 
 
@@ -372,56 +349,64 @@ def safe_path(filename):
 
 
 def tool_write_file(filename, content):
-    # guard against the model accidentally writing raw hashline output
     hashline_re = re.compile(r"^\d+:[0-9a-f]{2}\|")
     bad_lines = [l for l in content.splitlines() if hashline_re.match(l)]
     if bad_lines:
         sample = bad_lines[0]
-        return f"Error: content looks like raw read_file output (e.g. '{sample}'). " "Strip the 'LINENUM:HASH|' prefixes from each line before writing."
+        return "Error: content looks like raw read_file output (e.g. '" + sample + "'). Strip the 'LINENUM:HASH|' prefixes from each line before writing."
     target = safe_path(filename)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(content, encoding="utf-8")
+    parent = os.path.dirname(target)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(target, "w", encoding="utf-8") as f:
+        f.write(content)
     lines = content.splitlines()
-    print(f"  write_file: {target.relative_to(WORKSPACE)} ({len(lines)} lines)")
-    return f"Written {target.stat().st_size} bytes to {target.relative_to(WORKSPACE)}"
+    rel = os.path.relpath(target, WORKSPACE)
+    print("  write_file: " + rel + " (" + str(len(lines)) + " lines)")
+    return "Written " + str(os.stat(target).st_size) + " bytes to " + rel
 
 
 def tool_read_file(filename):
     target = safe_path(filename)
-    if not target.exists():
-        return f"Error: file not found: {filename}"
-    lines = target.read_text(encoding="utf-8").splitlines()
-    print(f"  read_file: {target.relative_to(WORKSPACE)} ({len(lines)} lines)")
+    if not os.path.exists(target):
+        return "Error: file not found: " + filename
+    with open(target, "r", encoding="utf-8") as f:
+        lines = f.read().splitlines()
+    rel = os.path.relpath(target, WORKSPACE)
+    print("  read_file: " + rel + " (" + str(len(lines)) + " lines)")
     return render_hashlines(lines)
 
 
 def tool_edit_file(filename, start_anchor, end_anchor, new_text):
     target = safe_path(filename)
-    if not target.exists():
-        return f"Error: file not found: {filename} - use write_file to create it first"
-    lines = target.read_text(encoding="utf-8").splitlines()
+    if not os.path.exists(target):
+        return "Error: file not found: " + filename + " - use write_file to create it first"
+    with open(target, "r", encoding="utf-8") as f:
+        lines = f.read().splitlines()
 
     start_line, start_hash = parse_anchor(start_anchor)
     end_line, end_hash = parse_anchor(end_anchor)
 
     if start_line < 1 or start_line > len(lines):
-        return f"Error: start_anchor line {start_line} out of range (file has {len(lines)} lines)"
+        return "Error: start_anchor line " + str(start_line) + " out of range (file has " + str(len(lines)) + " lines)"
     if end_line < start_line or end_line > len(lines):
-        return f"Error: end_anchor line {end_line} out of range"
+        return "Error: end_anchor line " + str(end_line) + " out of range"
 
     actual_start = line_hash(lines[start_line - 1])
     if actual_start != start_hash:
-        return f"Error: start_anchor hash mismatch at line {start_line}: " f"expected {start_hash}, got {actual_start} - re-read the file first"
+        return "Error: start_anchor hash mismatch at line " + str(start_line) + ": expected " + start_hash + ", got " + actual_start + " - re-read the file first"
 
     actual_end = line_hash(lines[end_line - 1])
     if actual_end != end_hash:
-        return f"Error: end_anchor hash mismatch at line {end_line}: " f"expected {end_hash}, got {actual_end} - re-read the file first"
+        return "Error: end_anchor hash mismatch at line " + str(end_line) + ": expected " + end_hash + ", got " + actual_end + " - re-read the file first"
 
     new_lines = new_text.splitlines()
     lines[start_line - 1 : end_line] = new_lines
-    target.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    with open(target, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
 
-    print(f"  edit_file: {target.relative_to(WORKSPACE)} replaced lines {start_line}-{end_line} with {len(new_lines)} lines")
+    rel = os.path.relpath(target, WORKSPACE)
+    print("  edit_file: " + rel + " replaced lines " + str(start_line) + "-" + str(end_line) + " with " + str(len(new_lines)) + " lines")
 
     return render_hashlines(lines)
 
@@ -439,8 +424,8 @@ def tool_run_command(command):
         output = result.stdout + result.stderr
     except subprocess.TimeoutExpired:
         return "[error: command timed out after 30s]"
-    print(f"  run_command: {command[:80]} -> exit {result.returncode}")
-    return output + f"\n[exit code: {result.returncode}]"
+    print("  run_command: " + command[:80] + " -> exit " + str(result.returncode))
+    return output + "\n[exit code: " + str(result.returncode) + "]"
 
 
 # tool dispatcher
@@ -451,25 +436,23 @@ def dispatch_tool(mcp, name, arguments):
         for attempt in range(9):
             if attempt > 0:
                 delay = random.uniform(2 ** (attempt - 1), 2**attempt)
-                print(f"  [mcp retry {attempt}/8] waiting {delay:.1f}s then restarting mcp...")
+                print("  [mcp retry " + str(attempt) + "/8] waiting " + "{:.1f}".format(delay) + "s then restarting mcp...")
                 time.sleep(delay)
                 restart_mcp(mcp)
             try:
                 result = mcp_call(mcp, "tools/call", {"name": name, "arguments": arguments})
                 text = "\n".join(b["text"] for b in result.get("content", []) if b.get("type") == "text")
                 if name == "playwright_navigate":
-                    print(f"  playwright_navigate: {arguments.get('url', '')[:80]}")
+                    print("  playwright_navigate: " + arguments.get("url", "")[:80])
                 else:
-                    # debug: print length and first 300 chars so we can see if
-                    # the MCP is returning markdown or raw HTML
                     preview = text[:300].replace("\n", " ").strip()
-                    print(f"  playwright_extract_content: {len(text)} chars")
-                    print(f"  [debug preview] {preview}")
+                    print("  playwright_extract_content: " + str(len(text)) + " chars")
+                    print("  [debug preview] " + preview)
                 return text
             except TimeoutError as e:
                 if attempt == 8:
                     raise
-                print(f"  [mcp timeout] attempt {attempt + 1}/9: {e}")
+                print("  [mcp timeout] attempt " + str(attempt + 1) + "/9: " + str(e))
 
     if name == "write_file":
         return tool_write_file(arguments["filename"], arguments["content"])
@@ -488,11 +471,11 @@ def dispatch_tool(mcp, name, arguments):
     if name == "run_command":
         return tool_run_command(arguments["command"])
 
-    return f"Unknown tool: {name}"
+    return "Unknown tool: " + name
 
 
 def get_env_snapshot():
-    cmd = "echo '=PWD=' && pwd && " "echo '=LS=' && ls -1 && " "echo '=PY=' && python3 --version 2>&1"
+    cmd = "echo '=PWD=' && pwd && echo '=LS=' && ls -1 && echo '=PY=' && python3 --version 2>&1"
     try:
         r = subprocess.run(cmd, shell=True, cwd=WORKSPACE, capture_output=True, text=True, timeout=5)
         return "[workspace snapshot]\n" + r.stdout.strip()
@@ -501,11 +484,20 @@ def get_env_snapshot():
 
 
 def read_p():
-    # p.md is the task prompt - lives in the project directory
-    p_path = WORKSPACE / "p.md"
-    if not p_path.exists():
-        sys.exit(f"Error: no p.md found in {WORKSPACE}")
-    return p_path.read_text(encoding="utf-8").strip()
+    p_path = os.path.join(WORKSPACE, "p.md")
+    if not os.path.exists(p_path):
+        sys.exit("Error: no p.md found in " + WORKSPACE)
+    with open(p_path, "r", encoding="utf-8") as f:
+        return f.read().strip()
+
+
+def read_project():
+    # project.md is optional at agent level - pq_minder validates it exists before staging
+    project_path = os.path.join(WORKSPACE, "project.md")
+    if not os.path.exists(project_path):
+        return ""
+    with open(project_path, "r", encoding="utf-8") as f:
+        return f.read().strip()
 
 
 def make_tools():
@@ -514,7 +506,7 @@ def make_tools():
             "type": "function",
             "function": {
                 "name": "playwright_navigate",
-                "description": ("Navigate the browser to a URL and return the page title. " "Use DDG plain HTML (https://html.duckduckgo.com/html/?q=...) for searches."),
+                "description": "Navigate the browser to a URL and return the page title. Use DDG plain HTML (https://html.duckduckgo.com/html/?q=...) for searches.",
                 "parameters": {
                     "type": "object",
                     "properties": {"url": {"type": "string"}},
@@ -543,9 +535,7 @@ def make_tools():
             "type": "function",
             "function": {
                 "name": "write_file",
-                "description": (
-                    "Create or overwrite a file with the given content. " "Use a relative path e.g. 'solution.py'. " "You MUST use this tool to create files - do not write file content in your reply."
-                ),
+                "description": "Create or overwrite a file with the given content. Use a relative path e.g. 'solution.py'. You MUST use this tool to create files - do not write file content in your reply.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -560,11 +550,7 @@ def make_tools():
             "type": "function",
             "function": {
                 "name": "read_file",
-                "description": (
-                    "Read a file. Returns each line prefixed with a hashline anchor "
-                    "in the format LINENUM:HASH|content e.g. '3:a4|some text here'. "
-                    "You MUST call read_file before calling edit_file to get valid anchors."
-                ),
+                "description": "Read a file. Returns each line prefixed with a hashline anchor in the format LINENUM:HASH|content e.g. '3:a4|some text here'. You MUST call read_file before calling edit_file to get valid anchors.",
                 "parameters": {
                     "type": "object",
                     "properties": {"filename": {"type": "string"}},
@@ -576,14 +562,7 @@ def make_tools():
             "type": "function",
             "function": {
                 "name": "edit_file",
-                "description": (
-                    "Edit a file using hashline anchors from a previous read_file call. "
-                    "Replaces the lines from start_anchor to end_anchor (inclusive) with new_text. "
-                    "Anchors are LINENUM:HASH strings e.g. '5:a3' - copy them exactly from read_file output. "
-                    "To insert after a line: set both anchors to that line and include it in new_text followed by the new content. "
-                    "Returns the updated file content with new hashline anchors. "
-                    "You MUST use this tool to edit files - do not output edited file content in your reply."
-                ),
+                "description": "Edit a file using hashline anchors from a previous read_file call. Replaces the lines from start_anchor to end_anchor (inclusive) with new_text. Anchors are LINENUM:HASH strings e.g. '5:a3' - copy them exactly from read_file output. To insert after a line: set both anchors to that line and include it in new_text followed by the new content. Returns the updated file content with new hashline anchors. You MUST use this tool to edit files - do not output edited file content in your reply.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -609,7 +588,7 @@ def make_tools():
             "type": "function",
             "function": {
                 "name": "run_command",
-                "description": ("Run a shell command in the workspace and return its output. " "Timeout is 30 seconds."),
+                "description": "Run a shell command in the workspace and return its output. Timeout is 30 seconds.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -625,35 +604,53 @@ def make_tools():
     ]
 
 
-def main():
-    tools = make_tools()
-    initial_prompt = read_p()
-
-    system_prompt = (
+def make_system_prompt():
+    # three concerns: tool rules, image output constraints, and the finishing protocol
+    return (
         "You are an autonomous agent with browser, shell, and file tools.\n\n"
         "Tool rules:\n"
         "1. Always use tools for file operations and commands - never output file contents in your reply.\n"
         "2. Always call read_file before edit_file to get current line anchors.\n"
         "3. Anchors are LINENUM:HASH strings - copy them exactly from read_file output.\n"
         "4. For web searches use DuckDuckGo plain HTML: https://html.duckduckgo.com/html/?q=<query>\n\n"
-        "Verification: when you believe the task is complete, run python3 q.py. "
-        "Fix any failures. When q.py prints OK, reply with one short confirmation sentence."
+        "Image output rules (when necessary for task completion):\n"
+        "- Only produce image files with .jpg or .png extension. No other formats are accepted.\n"
+        "- Images must be no larger than 1200 pixels on the longest side.\n\n"
+        "Finishing:\n"
+        "When the task is complete, use write_file to create report.md containing:\n"
+        "1. A step-by-step summary of what you did.\n"
+        "2. Key decisions and why you made them.\n"
+        "3. Anything you are uncertain about.\n"
+        "4. Your assessment of whether the task succeeded.\n"
+        "After writing report.md, reply with one short sentence confirming completion."
     )
 
-    snapshot = get_env_snapshot()
-    if snapshot:
-        initial_prompt = initial_prompt + "\n\n" + snapshot
 
-    # last confirmed post-call token count from openrouter
+def main():
+    tools = make_tools()
+
+    # three-part context: (1) system rules, (2) project context, (3) task
+    # project.md and p.md are staged into workspace root by pq_minder before this runs
+    task_prompt = read_p()
+    project_text = read_project()
+
+    system_prompt = make_system_prompt()
+    snapshot = get_env_snapshot()
+
+    # combine project context and task into one user message, clearly labeled
+    initial_content = ""
+    if project_text:
+        initial_content += "## Project Context\n\n" + project_text + "\n\n"
+    initial_content += "## Task\n\n" + task_prompt
+    if snapshot:
+        initial_content += "\n\n" + snapshot
+
     state = {"last_post_tokens": 949}
 
-    # session_messages is never modified - used to rebuild context after compaction
-    session_messages = []
-    if USE_SYSTEM_PROMPT:
-        session_messages.append({"role": "system", "content": system_prompt})
-    else:
-        session_messages.append({"role": "user", "content": system_prompt})
-    session_messages.append({"role": "user", "content": initial_prompt})
+    session_messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": initial_content},
+    ]
 
     messages = []
     new_messages = list(session_messages)
@@ -675,7 +672,7 @@ def main():
             for tc in msg["tool_calls"]:
                 fn_name = tc["function"]["name"]
                 fn_args = json.loads(tc["function"]["arguments"])
-                print(f"[tool call] {fn_name}")
+                print("[tool call] " + fn_name)
                 tool_result = dispatch_tool(mcp, fn_name, fn_args)
                 new_messages.append(
                     {
@@ -685,7 +682,7 @@ def main():
                     }
                 )
         else:
-            print(f"\n[done] {msg['content']}")
+            print("\n[done] " + str(msg["content"]))
             break
 
     mcp["proc"].stdin.close()
