@@ -1,6 +1,7 @@
 #!/usr/bin/python3
 
 import os
+import sys
 import json
 import base64
 import shutil
@@ -8,6 +9,7 @@ import subprocess
 import time
 import io
 import random
+import signal
 import tiktoken
 from PIL import Image
 import anthropic
@@ -40,6 +42,24 @@ import anthropic
 #   task_report/                    agent writes ALL output here (md, jpg, png only)
 #     *.md                          agent's self-report(s); all are concatenated for judge
 #     *.jpg / *.png                 images produced by agent, downsampled before sending
+
+# task.json status state machine:
+#
+#   open        not yet attempted; queue will run it
+#   passed      agent succeeded and judge accepted; queue proceeds to next task
+#   escalated   judge passed but flagged for human review; queue stops and waits;
+#               in pq_web.py the task is highlighted and the user must inspect
+#               artifacts and click OK (which sets status back to "passed") before
+#               the queue can continue - analogous to Claude Code's human approval
+#               step but post-hoc rather than pre-emptive
+#   failed      agent failed; retries remain (attempts < MAX_ATTEMPTS) or exhausted;
+#               when exhausted in pq_web.py this signals that (p,q) needs rethinking
+#               since the current formulation of the task is not achievable
+#   blocked     downstream of an escalated or failed task; never ran this attempt;
+#               reset to open automatically at the start of the next queue run so
+#               fixing an upstream task naturally unblocks its dependents
+#   interrupted ctrl-C mid-run; attempt count incremented; re-run proceeds to
+#               next attempt normally without needing manual intervention
 
 # fail immediately if required api keys are absent
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
@@ -142,11 +162,44 @@ def validate_task_inputs(harness_dir, task_dir):
         raise RuntimeError("q.md not found: " + q_md)
 
 
-def stage_workspace(harness_dir, task_dir, workspace_dir):
+def get_prior_feedback(task_dir, current_attempt):
+    # collect feedback and issues from all prior verdict.json files in attempt order;
+    # returned as a formatted string to prepend to p.md on retry runs
+    feedback_lines = []
+    for n in range(1, current_attempt):
+        verdict_path = os.path.join(task_dir, "runs", "run_" + str(n), "verdict.json")
+        verdict = load_json(verdict_path, {})
+        feedback = verdict.get("feedback", "").strip()
+        issues = verdict.get("issues", [])
+        if feedback or issues:
+            feedback_lines.append("Attempt " + str(n) + ":")
+            for issue in issues:
+                feedback_lines.append("  - " + issue)
+            if feedback:
+                feedback_lines.append("  " + feedback)
+    return "\n".join(feedback_lines)
+
+
+def stage_workspace(harness_dir, task_dir, workspace_dir, attempt):
     # copy p.md and project.md into workspace root so agent can find them;
     # deleted by unstage_workspace after every run regardless of outcome
     shutil.copyfile(os.path.join(harness_dir, "project.md"), os.path.join(workspace_dir, "project.md"))
-    shutil.copyfile(os.path.join(task_dir, "p.md"), os.path.join(workspace_dir, "p.md"))
+
+    # on retry attempts, prepend prior verdict feedback to p.md so the agent
+    # knows what went wrong and can approach the task differently
+    p_src = os.path.join(task_dir, "p.md")
+    p_dst = os.path.join(workspace_dir, "p.md")
+    if attempt > 1:
+        prior_feedback = get_prior_feedback(task_dir, attempt)
+        if prior_feedback:
+            prior_note = "**NOTE: This is attempt " + str(attempt) + " of this task. " "Prior attempts failed. Feedback from prior attempts:**\n\n" + prior_feedback + "\n\n---\n\n"
+            write_text(p_dst, prior_note + read_text(p_src))
+            print("  staged p.md with feedback from " + str(attempt - 1) + " prior attempt(s)")
+        else:
+            shutil.copyfile(p_src, p_dst)
+    else:
+        shutil.copyfile(p_src, p_dst)
+
     # ensure task_report/ exists and is clean before the agent starts
     task_report_dir = os.path.join(workspace_dir, "task_report")
     safe_rmtree(task_report_dir)
@@ -247,7 +300,7 @@ def build_judge_prompt(rubric, log_tail, report_text):
         "- The rubric is the sole criterion for pass/fail.\n\n"
         "<rubric>\n" + rubric + "\n</rubric>\n\n"
     ]
-    if report_text:  # agent may not have written anything to task_report/ if it crashed
+    if report_text:
         parts.append("<agent_report>\n" + report_text + "\n</agent_report>\n\n")
     parts.append("<agent_log_excerpt>\n" + log_tail + "\n</agent_log_excerpt>")
     return "".join(parts)
@@ -325,7 +378,6 @@ def call_claude_judge(prompt_text, image_paths):
         elif block.type == "thinking":
             print("  (thinking block, " + str(len(block.thinking)) + " chars)")
     print("USAGE: input_tokens=" + str(response.usage.input_tokens) + " output_tokens=" + str(response.usage.output_tokens))
-    # cache fields present when prompt caching is active; guard with getattr
     cache_created = getattr(response.usage, "cache_creation_input_tokens", None)
     cache_read = getattr(response.usage, "cache_read_input_tokens", None)
     if cache_created is not None or cache_read is not None:
@@ -382,7 +434,22 @@ def run_q_md_judge(task_dir, run_dir, workspace_dir):
     return call_claude_judge(prompt_text, image_paths)
 
 
-def run_task(harness_dir, workspace_dir, task_id):
+def mark_downstream_blocked(harness_dir, queue, stopped_task_id):
+    # write "blocked" to all tasks after stopped_task_id so they don't look
+    # fresh on re-run; only overwrites tasks that are still open/unstarted
+    idx = queue.index(stopped_task_id) if stopped_task_id in queue else -1
+    if idx < 0:
+        return
+    for task_id in queue[idx + 1 :]:
+        task_json = os.path.join(harness_dir, "tasks", task_id, "task.json")
+        meta = load_json(task_json, {"status": "open", "attempts": 0})
+        if meta.get("status") in ("open", "blocked", None):
+            meta["status"] = "blocked"
+            write_json(task_json, meta)
+            print("  marked " + task_id + " as blocked")
+
+
+def run_task(harness_dir, workspace_dir, task_id, queue):
     task_dir = os.path.join(harness_dir, "tasks", task_id)
     if not os.path.exists(task_dir):
         raise RuntimeError("task directory not found: " + task_dir)
@@ -392,14 +459,30 @@ def run_task(harness_dir, workspace_dir, task_id):
     task_json = os.path.join(task_dir, "task.json")
     meta = load_json(task_json, {"status": "open", "attempts": 0})
 
-    if meta.get("status") == "passed":
+    status = meta.get("status")
+
+    if status == "passed":
         print("Skip " + task_id + " (already passed)")
         return "passed"
+
+    # escalated means a prior run produced work the judge flagged for human review;
+    # the queue stops here until a human inspects task_report/ and manually sets
+    # status back to "passed" in task.json (pq_web.py will do this via an OK button)
+    if status == "escalated":
+        print("\n[ESCALATE] " + task_id + " is awaiting human review.")
+        print("[ESCALATE] Inspect task_report/ and set status to 'passed' in task.json to continue.")
+        mark_downstream_blocked(harness_dir, queue, task_id)
+        sys.exit(2)
+
+    # blocked means a prior queue run stopped upstream; reset so this run can try it
+    if status == "blocked":
+        print("Task " + task_id + " was blocked by a prior run - resetting to open")
+        meta["status"] = "open"
 
     attempts = int(meta.get("attempts") or 0)
     if attempts >= MAX_ATTEMPTS:
         print("Skip " + task_id + " (max attempts reached)")
-        return meta.get("status", "blocked")
+        return meta.get("status", "failed")
 
     attempt = attempts + 1
     run_dir = os.path.join(task_dir, "runs", "run_" + str(attempt))
@@ -407,14 +490,30 @@ def run_task(harness_dir, workspace_dir, task_id):
 
     print("\nTask " + task_id + " attempt " + str(attempt), flush=True)
 
-    stage_workspace(harness_dir, task_dir, workspace_dir)
+    # install a SIGINT handler for the duration of the agent run so ctrl-C writes
+    # partial state to task.json instead of leaving it stale; stored in a list so
+    # the nested closure can rebind it on restore
+    original_sigint = [signal.getsignal(signal.SIGINT)]
+
+    def handle_sigint(sig, frame):
+        print("\n[pq_minder] interrupted - writing partial state for " + task_id)
+        meta["attempts"] = attempt
+        meta["status"] = "interrupted"
+        write_json(task_json, meta)
+        signal.signal(signal.SIGINT, original_sigint[0])
+        sys.exit(1)
+
+    signal.signal(signal.SIGINT, handle_sigint)
+
+    stage_workspace(harness_dir, task_dir, workspace_dir, attempt)
 
     agent_rc = 0
     agent_timed_out = False
     try:
         agent_rc, agent_timed_out = run_agent(workspace_dir, run_dir)
     finally:
-        unstage_workspace(workspace_dir)  # always clean up staged files even on exception
+        unstage_workspace(workspace_dir)
+        signal.signal(signal.SIGINT, original_sigint[0])  # restore before judge API call
 
     if agent_timed_out:
         verdict = {"status": "failed", "feedback": "agent timed out after " + str(AGENT_TIMEOUT_S) + "s"}
@@ -428,6 +527,20 @@ def run_task(harness_dir, workspace_dir, task_id):
 
     write_json(os.path.join(run_dir, "verdict.json"), verdict)
     meta["attempts"] = attempt
+
+    if verdict.get("next_step") == "escalate":
+        # escalated is distinct from passed: the judge accepted the work but a human
+        # must review before the queue continues; task_report/ artifacts are preserved
+        # for inspection; pq_web.py surfaces this as a highlighted card requiring an
+        # OK click, which sets status back to "passed" to unblock the queue
+        meta["status"] = "escalated"
+        write_json(task_json, meta)
+        print("Verdict: " + str(verdict.get("status")) + " (escalated for human review)", flush=True)
+        print("\n[ESCALATE] " + task_id + " requires human review before continuing.")
+        print("[ESCALATE] " + str(verdict.get("feedback", "")))
+        mark_downstream_blocked(harness_dir, queue, task_id)
+        sys.exit(2)
+
     meta["status"] = verdict.get("status")
     write_json(task_json, meta)
 
@@ -453,9 +566,10 @@ def main():
     print("timeout   : " + str(AGENT_TIMEOUT_S) + "s")
 
     for task_id in queue:
-        status = run_task(harness_dir, workspace_dir, task_id)
+        status = run_task(harness_dir, workspace_dir, task_id, queue)
         if status != "passed":
             print("\nTask " + task_id + " did not pass (status=" + str(status) + "). Stopping queue.")
+            mark_downstream_blocked(harness_dir, queue, task_id)
             break
 
 
