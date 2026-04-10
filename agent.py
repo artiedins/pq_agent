@@ -104,8 +104,8 @@ def post_with_retry(payload):
                 print("  [error] request timed out, retrying (attempt " + str(attempt + 1) + "/8)...")
                 continue
             raise
-        if resp.status_code == 429 and attempt < 8:
-            print("  [error] 429 rate limit, retrying (attempt " + str(attempt + 1) + "/8)...")
+        if resp.status_code in (429, 503) and attempt < 8:
+            print("  [error] " + str(resp.status_code) + " transient error, retrying (attempt " + str(attempt + 1) + "/8)...")
             continue
         if not resp.ok:
             print("\n[error] status=" + str(resp.status_code))

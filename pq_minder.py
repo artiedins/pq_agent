@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import time
 import io
+import random
 import tiktoken
 from PIL import Image
 import anthropic
@@ -252,6 +253,36 @@ def build_judge_prompt(rubric, log_tail, report_text):
     return "".join(parts)
 
 
+def call_anthropic_with_retry(client, **kwargs):
+    # mirrors post_with_retry in agent.py: exponential backoff, 9 attempts max
+    # handles rate limits and transient connection errors from the Anthropic SDK
+    for attempt in range(9):
+        if attempt > 0:
+            p = attempt - 1
+            delay = random.uniform(2**p, 2 ** (p + 1))
+            print("  [anthropic retry " + str(attempt) + "/8] waiting " + "{:.1f}".format(delay) + "s...")
+            time.sleep(delay)
+        try:
+            return client.messages.create(**kwargs)
+        except anthropic.RateLimitError:
+            if attempt < 8:
+                print("  [error] anthropic 429 rate limit, retrying (attempt " + str(attempt + 1) + "/8)...")
+                continue
+            raise
+        except anthropic.APIConnectionError as e:
+            if attempt < 8:
+                print("  [error] anthropic connection error, retrying (attempt " + str(attempt + 1) + "/8): " + str(e))
+                continue
+            raise
+        except anthropic.APIStatusError as e:
+            # only retry on server-side 5xx; 4xx errors (bad request, auth) are not retryable
+            if e.status_code >= 500 and attempt < 8:
+                print("  [error] anthropic " + str(e.status_code) + " server error, retrying (attempt " + str(attempt + 1) + "/8)...")
+                continue
+            raise
+    raise RuntimeError("call_anthropic_with_retry: exhausted retries without returning or raising")
+
+
 def call_claude_judge(prompt_text, image_paths):
     # estimate tokens before sending; tiktoken/cl100k_base is not anthropic's tokenizer
     # but gives a reasonable ballpark for awareness
@@ -276,7 +307,8 @@ def call_claude_judge(prompt_text, image_paths):
         )
     content.append({"type": "text", "text": prompt_text})
 
-    response = client.messages.create(
+    response = call_anthropic_with_retry(
+        client,
         model=JUDGE_MODEL,
         max_tokens=1024,
         thinking={"type": "adaptive"},
@@ -316,9 +348,23 @@ def run_q_md_judge(task_dir, run_dir, workspace_dir):
     if not os.path.exists(q_md_path):
         return {"status": "blocked", "feedback": "no q.md found for task"}
 
+    report_text, image_paths = collect_task_report(workspace_dir)
+
+    # agent is required to write task_report/ with at least a .md or image file;
+    # if nothing is there the agent did not complete - fail immediately without
+    # burning an API call on a judge that has nothing to evaluate
+    if not report_text and not image_paths:
+        print("  judge: task_report/ empty or missing - auto-fail")
+        return {
+            "status": "failed",
+            "confidence": 1.0,
+            "issues": ["task_report/ is empty or missing"],
+            "feedback": "The agent did not write any output to task_report/. Ensure the agent completes its work and writes report.md before finishing.",
+            "next_step": "rerun",
+        }
+
     rubric = read_text(q_md_path)
     log_tail = tail_file(os.path.join(run_dir, "stdout.log"), LOG_TAIL_LINES)
-    report_text, image_paths = collect_task_report(workspace_dir)
 
     if not report_text:
         print("  judge: no markdown found in task_report/")
