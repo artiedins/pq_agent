@@ -43,6 +43,10 @@ WORKSPACE = os.path.abspath(os.getcwd())
 _enc = tiktoken.get_encoding("cl100k_base")
 
 
+def ts():
+    return time.strftime("[%H:%M:%S] ")
+
+
 def shorten_content_with_notice(m):
     m = m[:-2000]
     m += "\n**USER AGENT HARNESS NOTICE:** This content has been trimmed due to excessive length. Please use this if you can, otherwise find another way to achieve your goal.\n"
@@ -84,7 +88,7 @@ def filter_msgs_and_est_tokens(messages):
                     raise Exception("fix this")
 
         if shorten_loops > 1:
-            print("SHORTENED:", len(messages[i]["content"]), re.sub(r"\s+", " ", messages[i]["content"][:180]), flush=True)
+            print(ts() + "SHORTENED:", len(messages[i]["content"]), re.sub(r"\s+", " ", messages[i]["content"][:180]), flush=True)
 
         tokens += msg_tokens
 
@@ -101,16 +105,19 @@ def post_with_retry(payload):
             resp = requests.post(OPENROUTER_URL, headers=HEADERS, json=payload, timeout=60)
         except requests.exceptions.Timeout:
             if attempt < 8:
-                print("  [error] request timed out, retrying (attempt " + str(attempt + 1) + "/8)...")
+                print(ts() + "  [error] request timed out, retrying (attempt " + str(attempt + 1) + "/8)...")
                 continue
             raise
         if resp.status_code in (429, 503) and attempt < 8:
-            print("  [error] " + str(resp.status_code) + " transient error, retrying (attempt " + str(attempt + 1) + "/8)...")
+            print(ts() + "  [error] " + str(resp.status_code) + " transient error, retrying (attempt " + str(attempt + 1) + "/8)...")
             continue
         if not resp.ok:
-            print("\n[error] status=" + str(resp.status_code))
+            print(ts() + "\n[error] status=" + str(resp.status_code))
             for key, val in resp.headers.items():
                 print("  " + key + ": " + val)
+            body_preview = resp.text[:300].replace("\n", " ").strip()
+            if body_preview:
+                print("  body: " + body_preview)
         resp.raise_for_status()
         break
     return resp
@@ -123,7 +130,7 @@ def post_compaction(payload):
         return resp
     except requests.exceptions.HTTPError as e:
         if e.response.status_code == 400 and "reasoning" in payload:
-            print("  [warn] reasoning param rejected, retrying without it...")
+            print(ts() + "  [warn] reasoning param rejected, retrying without it...")
             payload = {k: v for k, v in payload.items() if k != "reasoning"}
             resp = post_with_retry(payload)
             resp.raise_for_status()
@@ -148,7 +155,7 @@ def chat(messages, tools, new_messages, state, session_messages):
     pre_prompt_total_context = state["last_post_tokens"] + new_prompt_tokens
 
     if pre_prompt_total_context > MAX_CONTEXT_LENGTH:
-        print("PERFORM COMPACTION", flush=True)
+        print(ts() + "PERFORM COMPACTION", flush=True)
 
         if BUMP_OVER_LIMIT_MSGS:
             compaction_prompt = (
@@ -213,7 +220,9 @@ def chat(messages, tools, new_messages, state, session_messages):
         messages += new_session
 
     else:
-        print("Sending CONTEXT", pre_prompt_total_context, "which is {:.1f}% of max context".format(100 * pre_prompt_total_context / MAX_CONTEXT_LENGTH))
+        pct = 100 * pre_prompt_total_context / MAX_CONTEXT_LENGTH
+        warn = " [!]" if pct > 80 else ""
+        print(ts() + "ctx={} ({:.1f}%){}".format(pre_prompt_total_context, pct, warn), flush=True)
 
     messages += new_messages
     new_messages.clear()
@@ -228,7 +237,6 @@ def chat(messages, tools, new_messages, state, session_messages):
     data = post_with_retry(payload).json()
 
     state["last_post_tokens"] = int(data.get("usage", {}).get("prompt_tokens", 0))
-    print("------ MSGS", len(messages), "-------- CONTEXT", state["last_post_tokens"])
 
     return data
 
@@ -368,7 +376,7 @@ def tool_write_file(filename, content):
         f.write(content)
     lines = content.splitlines()
     rel = os.path.relpath(target, WORKSPACE)
-    print("  write_file: " + rel + " (" + str(len(lines)) + " lines)")
+    print(ts() + "  write_file: " + rel + " (" + str(len(lines)) + " lines)")
     return "Written " + str(os.stat(target).st_size) + " bytes to " + rel
 
 
@@ -379,7 +387,7 @@ def tool_read_file(filename):
     with open(target, "r", encoding="utf-8") as f:
         lines = f.read().splitlines()
     rel = os.path.relpath(target, WORKSPACE)
-    print("  read_file: " + rel + " (" + str(len(lines)) + " lines)")
+    print(ts() + "  read_file: " + rel + " (" + str(len(lines)) + " lines)")
     return render_hashlines(lines)
 
 
@@ -412,7 +420,7 @@ def tool_edit_file(filename, start_anchor, end_anchor, new_text):
         f.write("\n".join(lines) + "\n")
 
     rel = os.path.relpath(target, WORKSPACE)
-    print("  edit_file: " + rel + " replaced lines " + str(start_line) + "-" + str(end_line) + " with " + str(len(new_lines)) + " lines")
+    print(ts() + "  edit_file: " + rel + " replaced lines " + str(start_line) + "-" + str(end_line) + " with " + str(len(new_lines)) + " lines")
     return render_hashlines(lines)
 
 
@@ -428,8 +436,12 @@ def tool_run_command(command):
         )
         output = result.stdout + result.stderr
     except subprocess.TimeoutExpired:
+        print(ts() + "  run_command: " + command[:80] + " -> TIMED OUT after 30s")
         return "[error: command timed out after 30s]"
-    print("  run_command: " + command[:80] + " -> exit " + str(result.returncode))
+    # show first non-empty output line inline so failures are visible without opening the log
+    nonempty = [l for l in output.strip().splitlines() if l.strip()]
+    preview = (" | " + nonempty[0][:120]) if nonempty else ""
+    print(ts() + "  run_command: " + command[:80] + " -> exit " + str(result.returncode) + preview)
     return output + "\n[exit code: " + str(result.returncode) + "]"
 
 
@@ -441,23 +453,25 @@ def dispatch_tool(mcp, name, arguments):
         for attempt in range(9):
             if attempt > 0:
                 delay = random.uniform(2 ** (attempt - 1), 2**attempt)
-                print("  [mcp retry " + str(attempt) + "/8] waiting " + "{:.1f}".format(delay) + "s then restarting mcp...")
+                print(ts() + "  [mcp retry " + str(attempt) + "/8] waiting " + "{:.1f}".format(delay) + "s then restarting mcp...")
                 time.sleep(delay)
                 restart_mcp(mcp)
             try:
                 result = mcp_call(mcp, "tools/call", {"name": name, "arguments": arguments})
                 text = "\n".join(b["text"] for b in result.get("content", []) if b.get("type") == "text")
                 if name == "playwright_navigate":
-                    print("  playwright_navigate: " + arguments.get("url", "")[:80])
+                    print(ts() + "  playwright_navigate: " + arguments.get("url", "")[:80])
                 else:
                     preview = text[:300].replace("\n", " ").strip()
-                    print("  playwright_extract_content: " + str(len(text)) + " chars")
-                    print("  [debug preview] " + preview)
+                    print(ts() + "  playwright_extract_content: " + str(len(text)) + " chars")
+                    print("  [preview] " + preview)
                 return text
             except TimeoutError as e:
                 if attempt == 8:
                     raise
-                print("  [mcp timeout] attempt " + str(attempt + 1) + "/9: " + str(e))
+                # include URL/tool context so the hung request is identifiable in the log
+                ctx = arguments.get("url", name)
+                print(ts() + "  [mcp timeout] attempt " + str(attempt + 1) + "/9 on " + ctx[:80] + ": " + str(e))
 
     if name == "write_file":
         return tool_write_file(arguments["filename"], arguments["content"])
@@ -642,11 +656,11 @@ def main():
     messages = []
     new_messages = list(session_messages)
 
-    print("MCP server starting...")
+    print(ts() + "MCP server starting...")
     mcp = start_mcp()
-    print("MCP ready.\n")
+    print(ts() + "MCP ready.\n")
 
-    print("Starting agent loop...\n")
+    print(ts() + "Starting agent loop...\n")
 
     while True:
         response = chat(messages, tools, new_messages, state, session_messages)
@@ -659,7 +673,7 @@ def main():
             for tc in msg["tool_calls"]:
                 fn_name = tc["function"]["name"]
                 fn_args = json.loads(tc["function"]["arguments"])
-                print("[tool call] " + fn_name)
+                print(ts() + "[tool call] " + fn_name)
                 tool_result = dispatch_tool(mcp, fn_name, fn_args)
                 new_messages.append(
                     {
@@ -669,7 +683,7 @@ def main():
                     }
                 )
         else:
-            print("\n[done] " + str(msg["content"]))
+            print(ts() + "\n[done] " + str(msg["content"]))
             break
 
     mcp["proc"].stdin.close()

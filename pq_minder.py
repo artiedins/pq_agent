@@ -6,6 +6,7 @@ import json
 import base64
 import shutil
 import subprocess
+import threading
 import time
 import io
 import random
@@ -220,31 +221,55 @@ def run_agent(workspace_dir, run_dir):
     log_path = os.path.join(run_dir, "stdout.log")
     print("Starting agent...", flush=True)
 
+    run_start = time.time()
     timed_out = False
     rc = None
-    run_start_time = time.time()
+
     with open(log_path, "w", encoding="utf-8") as f:
         f.write("[pq_minder] workspace=" + workspace_dir + "\n")
         f.write("[pq_minder] started=" + time.strftime("%Y-%m-%d %H:%M:%S") + "\n")
         f.flush()
-        try:
-            p = subprocess.run(
-                ["bash", agent_script, workspace_dir],
-                cwd=script_dir,
-                stdout=f,
-                stderr=subprocess.STDOUT,
-                text=True,
-                timeout=AGENT_TIMEOUT_S,
-            )
-            rc = p.returncode
-        except subprocess.TimeoutExpired:
+
+        proc = subprocess.Popen(
+            ["bash", agent_script, workspace_dir],
+            cwd=script_dir,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+
+        # tee: each line written to log file and streamed to terminal in real time;
+        # daemon=True ensures thread dies with the process on SIGINT/SystemExit
+        def _tee():
+            for line in proc.stdout:
+                sys.stdout.write(line)
+                sys.stdout.flush()
+                f.write(line)
+                f.flush()
+
+        reader = threading.Thread(target=_tee, daemon=True)
+        reader.start()
+        reader.join(timeout=AGENT_TIMEOUT_S)
+
+        if reader.is_alive():
+            # timeout: kill proc so the pipe closes, thread unblocks and exits
+            proc.kill()
+            reader.join()
             timed_out = True
             rc = 124
-            f.write("[pq_minder] agent timed out after " + str(AGENT_TIMEOUT_S) + "s\n")
-        elapsed = time.time() - run_start_time
-        f.write("[pq_minder] elapsed_s=" + str(int(elapsed)) + "\n")
+            msg = "[pq_minder] agent timed out after " + str(AGENT_TIMEOUT_S) + "s\n"
+            sys.stdout.write(msg)
+            f.write(msg)
+        else:
+            rc = proc.wait()
 
-    return rc, timed_out
+        elapsed = int(time.time() - run_start)
+        summary = "[pq_minder] elapsed_s=" + str(elapsed) + " exit=" + str(rc) + "\n"
+        sys.stdout.write(summary)
+        f.write(summary)
+
+    return rc, timed_out, elapsed
 
 
 def collect_task_report(workspace_dir):
@@ -363,8 +388,7 @@ def call_claude_judge(prompt_text, image_paths):
     response = call_anthropic_with_retry(
         client,
         model=JUDGE_MODEL,
-        max_tokens=1024,
-        thinking={"type": "adaptive"},
+        max_tokens=8000,
         messages=[{"role": "user", "content": content}],
     )
 
@@ -507,16 +531,26 @@ def run_task(harness_dir, workspace_dir, task_id, queue):
 
     stage_workspace(harness_dir, task_dir, workspace_dir, attempt)
 
+    run_start = time.time()
     agent_rc = 0
     agent_timed_out = False
+    agent_elapsed = 0
     try:
-        agent_rc, agent_timed_out = run_agent(workspace_dir, run_dir)
+        agent_rc, agent_timed_out, agent_elapsed = run_agent(workspace_dir, run_dir)
     finally:
         unstage_workspace(workspace_dir)
         signal.signal(signal.SIGINT, original_sigint[0])  # restore before judge API call
 
     if agent_timed_out:
-        verdict = {"status": "failed", "feedback": "agent timed out after " + str(AGENT_TIMEOUT_S) + "s"}
+        verdict = {
+            "status": "failed",
+            "confidence": 1.0,
+            "issues": ["agent timed out"],
+            "feedback": "Agent timed out after " + str(AGENT_TIMEOUT_S) + "s.",
+            "next_step": "rerun",
+            "started_at": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(run_start)),
+            "elapsed_s": agent_elapsed,
+        }
         write_json(os.path.join(run_dir, "verdict.json"), verdict)
         meta["attempts"] = attempt
         meta["status"] = "failed"
@@ -524,6 +558,11 @@ def run_task(harness_dir, workspace_dir, task_id, queue):
         return "failed"
 
     verdict = run_q_md_judge(task_dir, run_dir, workspace_dir)
+
+    # inject timing fields before writing - covers all judge-returned verdicts
+    # including the auto-fail path (empty task_report/) inside run_q_md_judge
+    verdict["started_at"] = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(run_start))
+    verdict["elapsed_s"] = agent_elapsed
 
     write_json(os.path.join(run_dir, "verdict.json"), verdict)
     meta["attempts"] = attempt
