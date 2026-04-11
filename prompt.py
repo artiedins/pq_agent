@@ -47,7 +47,7 @@ def create_markdown_context(files):
 
 if __name__ == "__main__":
     # The specific files requested
-    target_files = ["agent.py", "run_agent.sh", "pq_minder.py", "setup_example.sh"]
+    target_files = ["agent.py", "run_agent.sh", "pq_minder.py"]
 
     markdown_output = create_markdown_context(target_files)
 

@@ -21,20 +21,35 @@ import re
 # - Yes strategic inline comments enhancing rapid code comprehension by real humans
 # - Yes if __name__ == "__main__": main()
 
+# MODEL = "gemini-3.1-flash-lite-preview"
+# MODEL = "qwen/qwen3.5-27b"
+MODEL = "deepseek/deepseek-v3.2"
+
 
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
-if not GOOGLE_API_KEY:
-    sys.exit("Error: GOOGLE_API_KEY environment variable is not set.")
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
+
+if "/" in MODEL:
+    if not OPENROUTER_API_KEY:
+        sys.exit("Error: OPENROUTER_API_KEY environment variable is not set.")
+    OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+    HEADERS = {
+        "Authorization": "Bearer " + OPENROUTER_API_KEY,
+        "Content-Type": "application/json",
+    }
+
+else:
+    if not GOOGLE_API_KEY:
+        sys.exit("Error: GOOGLE_API_KEY environment variable is not set.")
+    OPENROUTER_URL = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+    HEADERS = {
+        "Authorization": "Bearer " + GOOGLE_API_KEY,
+        "Content-Type": "application/json",
+    }
+
 
 AGENT_DIR = os.environ.get("AGENT_DIR", os.path.dirname(os.path.abspath(__file__)))
 
-MODEL = "gemini-3.1-flash-lite-preview"
-
-OPENROUTER_URL = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
-HEADERS = {
-    "Authorization": "Bearer " + GOOGLE_API_KEY,
-    "Content-Type": "application/json",
-}
 
 WORKSPACE = os.path.abspath(os.getcwd())
 
