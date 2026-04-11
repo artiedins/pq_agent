@@ -21,8 +21,6 @@ import re
 # - Yes strategic inline comments enhancing rapid code comprehension by real humans
 # - Yes if __name__ == "__main__": main()
 
-SLOW_MODE = False
-BUMP_OVER_LIMIT_MSGS = False
 
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
 if not GOOGLE_API_KEY:
@@ -97,8 +95,8 @@ def filter_msgs_and_est_tokens(messages):
 
 def post_with_retry(payload):
     for attempt in range(9):
-        if attempt > 0 or SLOW_MODE:
-            p = attempt if SLOW_MODE else attempt - 1
+        if attempt > 0:
+            p = attempt - 1
             delay = random.uniform(2**p, 2 ** (p + 1))
             time.sleep(delay)
         try:
@@ -156,45 +154,25 @@ def chat(messages, tools, new_messages, state, session_messages):
 
     if pre_prompt_total_context > MAX_CONTEXT_LENGTH:
         print(ts() + "PERFORM COMPACTION", flush=True)
-
-        if BUMP_OVER_LIMIT_MSGS:
-            compaction_prompt = (
-                "The agent context limit was reached and this session is being compacted. "
-                "The conversation above is the full committed session history. "
-                "Write a compact plain-text summary covering:\n"
-                "1. What actions were taken and whether they succeeded or failed.\n"
-                "2. Current state of any modified files (exact filenames, key content or structure).\n"
-                "3. Any discovered facts relevant to completing the task (e.g. specific data values found).\n"
-                "4. What tool was running at the moment of compaction, "
-                "and that its result (or further prompts, or nothing) will follow immediately after this summary.\n"
-                "Include any prior compaction summaries in condensed form.\n"
-                "Do NOT summarize the system prompt or initial task instructions - those are provided fresh.\n"
-                "Be terse. If this summary exceeds 9000 tokens it will be clipped.\n"
-                "Minimize thinking and output summary content.\n"
-            )
-            compaction_payload = {
-                "model": MODEL,
-                "messages": messages + [{"role": "user", "content": compaction_prompt}],
-            }
-        else:
-            compaction_prompt = (
-                "The agent context limit was reached and this session is being compacted. "
-                "The conversation above is the full committed session history. "
-                "Write a compact plain-text summary covering:\n"
-                "1. What actions were taken and whether they succeeded or failed.\n"
-                "2. Current state of any modified files (exact filenames, key content or structure).\n"
-                "3. Any discovered facts relevant to completing the task (e.g. specific data values found).\n"
-                "4. Immediate next step.\n"
-                "Include any prior compaction summaries in condensed form.\n"
-                "Do NOT summarize the system prompt or initial task instructions - those are provided fresh.\n"
-                "Be terse. If this summary exceeds 9000 tokens it will be clipped.\n"
-                "Minimize thinking and output summary content.\n"
-            )
-            compaction_payload = {
-                "model": MODEL,
-                "messages": messages + new_messages + [{"role": "user", "content": compaction_prompt}],
-            }
-            new_messages.clear()
+        compaction_prompt = (
+            "The agent context limit was reached and this session is being compacted. "
+            "The conversation above is the full committed session history. "
+            "Write a compact plain-text summary covering:\n"
+            "1. What actions were taken and whether they succeeded or failed.\n"
+            "2. Current state of any modified files (exact filenames, key content or structure).\n"
+            "3. Any discovered facts relevant to completing the task (e.g. specific data values found).\n"
+            "4. Immediate next step.\n"
+            "Include any prior compaction summaries in condensed form.\n"
+            "Do NOT summarize the system prompt or initial task instructions - those are provided fresh.\n"
+            "Be terse. If this summary exceeds 9000 tokens it will be clipped.\n"
+            "Minimize thinking and output summary content.\n"
+        )
+        compaction_payload = {
+            "model": MODEL,
+            "max_tokens": 8000,
+            "messages": messages + new_messages + [{"role": "user", "content": compaction_prompt}],
+        }
+        new_messages.clear()
 
         resp_json = post_compaction(compaction_payload).json()
         raw_msg = resp_json["choices"][0]["message"]
@@ -231,6 +209,7 @@ def chat(messages, tools, new_messages, state, session_messages):
         "model": MODEL,
         "tools": tools,
         "tool_choice": "auto",
+        "max_tokens": 8000,
         "messages": messages,
     }
 

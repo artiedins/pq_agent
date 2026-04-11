@@ -7,6 +7,7 @@ import time
 import random
 import shutil
 import anthropic
+from datetime import datetime
 
 # Code style:
 # - No type hinting
@@ -53,6 +54,7 @@ def price_description(n):
 
 
 def build_meta_prompt(what, location, sensitivity):
+    current_date_str = datetime.now().strftime("%Y-%m-%d (%A)")
     parts = [
         "You are designing a multi-step autonomous consumer research workflow.\n\n",
         "## System Overview\n\n",
@@ -123,6 +125,7 @@ def build_meta_prompt(what, location, sensitivity):
         "task_report/report.md must include enough evidence (product names, source URLs, key\n",
         "findings) that the judge can verify real research was done - not just claimed.\n\n",
         "## Buyer Profile\n\n",
+        "- Current date: " + current_date_str + "\n",
         "- Location: " + location + "\n",
         "- Price sensitivity: " + str(sensitivity) + "/10 (" + price_description(sensitivity) + ")\n",
         "- Shopping request: " + what + "\n\n",

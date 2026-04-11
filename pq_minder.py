@@ -14,6 +14,7 @@ import signal
 import tiktoken
 from PIL import Image
 import anthropic
+import requests as _requests
 
 # Code style:
 # - No type hinting
@@ -62,20 +63,36 @@ import anthropic
 #   interrupted ctrl-C mid-run; attempt count incremented; re-run proceeds to
 #               next attempt normally without needing manual intervention
 
-# fail immediately if required api keys are absent
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
-if not ANTHROPIC_API_KEY:
-    raise RuntimeError("ANTHROPIC_API_KEY not set")
+# Judge model routing:
+#   if JUDGE_MODEL contains "/" it is an OpenRouter model (e.g. "z-ai/glm-5.1",
+#   "openai/gpt-4o") and OPENROUTER_API_KEY is used; otherwise it is an Anthropic
+#   model name (e.g. "claude-sonnet-4-6") and ANTHROPIC_API_KEY is used.
 
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
 if not GOOGLE_API_KEY:
     raise RuntimeError("GOOGLE_API_KEY not set")
 
-JUDGE_MODEL = "claude-sonnet-4-6"
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
+
+JUDGE_MODEL = "z-ai/glm-5.1"
+# JUDGE_MODEL = "claude-sonnet-4-6"
+
 AGENT_TIMEOUT_S = 7200  # 2 hours
 LOG_TAIL_LINES = 100
 MAX_IMAGE_LONG_SIDE = 1200  # pixels; bicubic downsample applied before sending to judge
 MAX_ATTEMPTS = 3
+
+
+def check_api_keys():
+    # validate the correct key is present for whichever judge backend is active;
+    # fail loud at startup rather than burning an agent run before the judge call
+    if "/" in JUDGE_MODEL:
+        if not OPENROUTER_API_KEY:
+            raise RuntimeError("JUDGE_MODEL=" + JUDGE_MODEL + " requires OPENROUTER_API_KEY (not set)")
+    else:
+        if not ANTHROPIC_API_KEY:
+            raise RuntimeError("JUDGE_MODEL=" + JUDGE_MODEL + " requires ANTHROPIC_API_KEY (not set)")
 
 
 def read_text(path):
@@ -164,21 +181,22 @@ def validate_task_inputs(harness_dir, task_dir):
 
 
 def get_prior_feedback(task_dir, current_attempt):
-    # collect feedback and issues from all prior verdict.json files in attempt order;
-    # returned as a formatted string to prepend to p.md on retry runs
-    feedback_lines = []
-    for n in range(1, current_attempt):
-        verdict_path = os.path.join(task_dir, "runs", "run_" + str(n), "verdict.json")
-        verdict = load_json(verdict_path, {})
-        feedback = verdict.get("feedback", "").strip()
-        issues = verdict.get("issues", [])
-        if feedback or issues:
-            feedback_lines.append("Attempt " + str(n) + ":")
-            for issue in issues:
-                feedback_lines.append("  - " + issue)
-            if feedback:
-                feedback_lines.append("  " + feedback)
-    return "\n".join(feedback_lines)
+    # inject ONLY the most recent prior attempt's feedback (attempt N-1) rather than
+    # stacking all prior verdicts; stacking creates noise on attempt 3+ since earlier
+    # feedback may have been superseded by what the agent addressed on attempt N-1
+    n = current_attempt - 1
+    verdict_path = os.path.join(task_dir, "runs", "run_" + str(n), "verdict.json")
+    verdict = load_json(verdict_path, {})
+    feedback = verdict.get("feedback", "").strip()
+    issues = verdict.get("issues", [])
+    if not feedback and not issues:
+        return ""
+    lines = ["Attempt " + str(n) + ":"]
+    for issue in issues:
+        lines.append("  - " + issue)
+    if feedback:
+        lines.append("  " + feedback)
+    return "\n".join(lines)
 
 
 def stage_workspace(harness_dir, task_dir, workspace_dir, attempt):
@@ -193,9 +211,9 @@ def stage_workspace(harness_dir, task_dir, workspace_dir, attempt):
     if attempt > 1:
         prior_feedback = get_prior_feedback(task_dir, attempt)
         if prior_feedback:
-            prior_note = "**NOTE: This is attempt " + str(attempt) + " of this task. " "Prior attempts failed. Feedback from prior attempts:**\n\n" + prior_feedback + "\n\n---\n\n"
+            prior_note = "**NOTE: This is attempt " + str(attempt) + " of this task. " "Prior attempt failed. Feedback from attempt " + str(attempt - 1) + ":**\n\n" + prior_feedback + "\n\n---\n\n"
             write_text(p_dst, prior_note + read_text(p_src))
-            print("  staged p.md with feedback from " + str(attempt - 1) + " prior attempt(s)")
+            print("  staged p.md with feedback from attempt " + str(attempt - 1))
         else:
             shutil.copyfile(p_src, p_dst)
     else:
@@ -361,6 +379,73 @@ def call_anthropic_with_retry(client, **kwargs):
     raise RuntimeError("call_anthropic_with_retry: exhausted retries without returning or raising")
 
 
+def call_openrouter_with_retry(payload):
+    # exponential backoff for OpenRouter; same retry logic as post_with_retry in agent.py
+    headers = {
+        "Authorization": "Bearer " + OPENROUTER_API_KEY,
+        "Content-Type": "application/json",
+    }
+    for attempt in range(9):
+        if attempt > 0:
+            p = attempt - 1
+            delay = random.uniform(2**p, 2 ** (p + 1))
+            print("  [openrouter retry " + str(attempt) + "/8] waiting " + "{:.1f}".format(delay) + "s...")
+            time.sleep(delay)
+        try:
+            resp = _requests.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=payload, timeout=120)
+        except _requests.exceptions.Timeout:
+            if attempt < 8:
+                print("  [error] openrouter request timed out, retrying (attempt " + str(attempt + 1) + "/8)...")
+                continue
+            raise
+        if resp.status_code in (429, 503) and attempt < 8:
+            print("  [error] openrouter " + str(resp.status_code) + " transient error, retrying (attempt " + str(attempt + 1) + "/8)...")
+            continue
+        if not resp.ok:
+            body_preview = resp.text[:300].replace("\n", " ").strip()
+            print("  [error] openrouter status=" + str(resp.status_code) + " body: " + body_preview)
+        resp.raise_for_status()
+        return resp
+    raise RuntimeError("call_openrouter_with_retry: exhausted retries without returning or raising")
+
+
+def call_openrouter_judge(prompt_text, image_paths):
+    # images sent as data URIs in OpenAI content-part format; most frontier models
+    # on OpenRouter support this but not all - if a model silently ignores images
+    # the judge degrades to text-only; note this in q.md if vision is required
+    content = []
+    for img_path in image_paths:
+        b64, media_type = prepare_image_b64(img_path)
+        data_uri = "data:" + media_type + ";base64," + b64
+        content.append({"type": "image_url", "image_url": {"url": data_uri}})
+    content.append({"type": "text", "text": prompt_text})
+
+    payload = {
+        "model": JUDGE_MODEL,
+        "max_tokens": 8000,
+        "messages": [{"role": "user", "content": content}],
+    }
+
+    resp = call_openrouter_with_retry(payload)
+    data = resp.json()
+
+    # print full response for inspection before doing anything with it
+    print("\n" + "=" * 70)
+    print("OPENROUTER RESPONSE (" + JUDGE_MODEL + "):")
+    choice = data.get("choices", [{}])[0]
+    msg = choice.get("message", {})
+    print(msg.get("content", "(no content)"))
+    usage = data.get("usage", {})
+    print("USAGE: prompt_tokens=" + str(usage.get("prompt_tokens", "?")) + " completion_tokens=" + str(usage.get("completion_tokens", "?")))
+    print("=" * 70)
+
+    text = (msg.get("content") or "").strip()
+    # strip ```json fences if present
+    if text.startswith("```"):
+        text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+    return json.loads(text)
+
+
 def call_claude_judge(prompt_text, image_paths):
     # estimate tokens before sending; tiktoken/cl100k_base is not anthropic's tokenizer
     # but gives a reasonable ballpark for awareness
@@ -394,7 +479,7 @@ def call_claude_judge(prompt_text, image_paths):
 
     # print full response for inspection before doing anything with it
     print("\n" + "=" * 70)
-    print("CLAUDE RESPONSE:")
+    print("CLAUDE RESPONSE (" + JUDGE_MODEL + "):")
     for block in response.content:
         print("  [" + block.type + "]")
         if block.type == "text":
@@ -417,6 +502,13 @@ def call_claude_judge(prompt_text, image_paths):
     if text.startswith("```"):
         text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
     return json.loads(text)
+
+
+def call_judge(prompt_text, image_paths):
+    # routing: "/" in model name means OpenRouter, otherwise Anthropic
+    if "/" in JUDGE_MODEL:
+        return call_openrouter_judge(prompt_text, image_paths)
+    return call_claude_judge(prompt_text, image_paths)
 
 
 def run_q_md_judge(task_dir, run_dir, workspace_dir):
@@ -455,7 +547,7 @@ def run_q_md_judge(task_dir, run_dir, workspace_dir):
     print("IMAGES (" + str(len(image_paths)) + "): " + str([os.path.basename(p) for p in image_paths]))
     print("=" * 70 + "\n")
 
-    return call_claude_judge(prompt_text, image_paths)
+    return call_judge(prompt_text, image_paths)
 
 
 def mark_downstream_blocked(harness_dir, queue, stopped_task_id):
@@ -591,6 +683,8 @@ def run_task(harness_dir, workspace_dir, task_id, queue):
 
 
 def main():
+    check_api_keys()
+
     workspace_dir = os.getcwd()
     harness_dir = os.path.join(workspace_dir, ".pq")
 
@@ -601,14 +695,28 @@ def main():
 
     print("workspace : " + workspace_dir)
     print("harness   : " + harness_dir)
+    print("judge     : " + JUDGE_MODEL)
     print("tasks     : " + str(len(queue)))
     print("timeout   : " + str(AGENT_TIMEOUT_S) + "s")
 
     for task_id in queue:
-        status = run_task(harness_dir, workspace_dir, task_id, queue)
+        remaining = MAX_ATTEMPTS
+
+        while remaining > 0:
+            status = run_task(harness_dir, workspace_dir, task_id, queue)
+            remaining -= 1
+
+            if status == "passed":
+                break
+
+            if remaining > 0:
+                print("\n  retrying automatically (" + str(remaining) + " attempt(s) remaining)...", flush=True)
+            else:
+                print("\nTask " + task_id + " exhausted all attempts (status=" + str(status) + "). Stopping queue.")
+                mark_downstream_blocked(harness_dir, queue, task_id)
+                return
+
         if status != "passed":
-            print("\nTask " + task_id + " did not pass (status=" + str(status) + "). Stopping queue.")
-            mark_downstream_blocked(harness_dir, queue, task_id)
             break
 
 
