@@ -21,9 +21,32 @@ import re
 # - Yes strategic inline comments enhancing rapid code comprehension by real humans
 # - Yes if __name__ == "__main__": main()
 
-# MODEL = "gemini-3.1-flash-lite-preview"
-# MODEL = "qwen/qwen3.5-27b"
-MODEL = "deepseek/deepseek-v3.2"
+# Model selection:
+#   pq_minder writes .agent_model to the workspace root before each run; agent reads it
+#   here at startup and falls back to DEFAULT_MODEL if the file is absent or empty.
+#   This lets the judge switch models between retry attempts without touching agent code.
+
+# MAX TOKENS SETTING
+#   Regardless of which model is used, max_tokens MUST be set to 8,000 tokens.
+
+DEFAULT_MODEL = "deepseek/deepseek-v3.2"
+
+AGENT_DIR = os.environ.get("AGENT_DIR", os.path.dirname(os.path.abspath(__file__)))
+WORKSPACE = os.path.abspath(os.getcwd())
+
+
+def _read_model_from_workspace():
+    path = os.path.join(WORKSPACE, ".agent_model")
+    if not os.path.exists(path):
+        return DEFAULT_MODEL
+    try:
+        val = open(path, "r", encoding="utf-8").read().strip()
+        return val if val else DEFAULT_MODEL
+    except Exception:
+        return DEFAULT_MODEL
+
+
+MODEL = _read_model_from_workspace()
 
 
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
@@ -47,11 +70,6 @@ else:
         "Content-Type": "application/json",
     }
 
-
-AGENT_DIR = os.environ.get("AGENT_DIR", os.path.dirname(os.path.abspath(__file__)))
-
-
-WORKSPACE = os.path.abspath(os.getcwd())
 
 _enc = tiktoken.get_encoding("cl100k_base")
 
@@ -370,7 +388,7 @@ def tool_write_file(filename, content):
         f.write(content)
     lines = content.splitlines()
     rel = os.path.relpath(target, WORKSPACE)
-    print(ts() + "  write_file: " + rel + " (" + str(len(lines)) + " lines)")
+    print(ts() + "  [tool call] write_file: " + rel + " (" + str(len(lines)) + " lines)")
     return "Written " + str(os.stat(target).st_size) + " bytes to " + rel
 
 
@@ -381,7 +399,7 @@ def tool_read_file(filename):
     with open(target, "r", encoding="utf-8") as f:
         lines = f.read().splitlines()
     rel = os.path.relpath(target, WORKSPACE)
-    print(ts() + "  read_file: " + rel + " (" + str(len(lines)) + " lines)")
+    print(ts() + "  [tool call] read_file: " + rel + " (" + str(len(lines)) + " lines)")
     return render_hashlines(lines)
 
 
@@ -414,7 +432,7 @@ def tool_edit_file(filename, start_anchor, end_anchor, new_text):
         f.write("\n".join(lines) + "\n")
 
     rel = os.path.relpath(target, WORKSPACE)
-    print(ts() + "  edit_file: " + rel + " replaced lines " + str(start_line) + "-" + str(end_line) + " with " + str(len(new_lines)) + " lines")
+    print(ts() + "  [tool call] edit_file: " + rel + " replaced lines " + str(start_line) + "-" + str(end_line) + " with " + str(len(new_lines)) + " lines")
     return render_hashlines(lines)
 
 
@@ -430,12 +448,11 @@ def tool_run_command(command):
         )
         output = result.stdout + result.stderr
     except subprocess.TimeoutExpired:
-        print(ts() + "  run_command: " + command[:80] + " -> TIMED OUT after 30s")
+        print(ts() + "  [tool call] run_command: TIMED OUT | " + command[:80])
         return "[error: command timed out after 30s]"
-    # show first non-empty output line inline so failures are visible without opening the log
     nonempty = [l for l in output.strip().splitlines() if l.strip()]
-    preview = (" | " + nonempty[0][:120]) if nonempty else ""
-    print(ts() + "  run_command: " + command[:80] + " -> exit " + str(result.returncode) + preview)
+    preview = (" | " + nonempty[0][:100]) if nonempty else ""
+    print(ts() + "  [tool call] run_command: exit " + str(result.returncode) + " | " + command[:60] + preview)
     return output + "\n[exit code: " + str(result.returncode) + "]"
 
 
@@ -443,6 +460,8 @@ def tool_run_command(command):
 
 
 def dispatch_tool(mcp, name, arguments):
+    # playwright tools: print one combined log line AFTER the MCP call returns
+    # (suppresses the pre-call announce in main() via the _PLAYWRIGHT_TOOLS check)
     if name in ("playwright_navigate", "playwright_extract_content"):
         for attempt in range(9):
             if attempt > 0:
@@ -454,16 +473,14 @@ def dispatch_tool(mcp, name, arguments):
                 result = mcp_call(mcp, "tools/call", {"name": name, "arguments": arguments})
                 text = "\n".join(b["text"] for b in result.get("content", []) if b.get("type") == "text")
                 if name == "playwright_navigate":
-                    print(ts() + "  playwright_navigate: " + arguments.get("url", "")[:80])
+                    print(ts() + "[tool call] playwright_navigate: " + arguments.get("url", "")[:120])
                 else:
-                    preview = text[:300].replace("\n", " ").strip()
-                    print(ts() + "  playwright_extract_content: " + str(len(text)) + " chars")
-                    print("  [preview] " + preview)
+                    preview = text[:200].replace("\n", " ").strip()
+                    print(ts() + "[tool call] playwright_extract_content: " + str(len(text)) + " chars | " + preview[:100])
                 return text
             except TimeoutError as e:
                 if attempt == 8:
                     raise
-                # include URL/tool context so the hung request is identifiable in the log
                 ctx = arguments.get("url", name)
                 print(ts() + "  [mcp timeout] attempt " + str(attempt + 1) + "/9 on " + ctx[:80] + ": " + str(e))
 
@@ -482,6 +499,10 @@ def dispatch_tool(mcp, name, arguments):
         return tool_run_command(arguments["command"])
 
     return "Unknown tool: " + name
+
+
+# tools that self-log inside dispatch_tool - main() skips pre-call announce for these
+_PLAYWRIGHT_TOOLS = {"playwright_navigate", "playwright_extract_content"}
 
 
 def get_env_snapshot():
@@ -623,6 +644,8 @@ def make_system_prompt():
 
 
 def main():
+    print(ts() + "Agent model: " + MODEL, flush=True)
+
     tools = make_tools()
 
     # three-part session context: (1) system rules, (2) project context, (3) this task
@@ -667,7 +690,9 @@ def main():
             for tc in msg["tool_calls"]:
                 fn_name = tc["function"]["name"]
                 fn_args = json.loads(tc["function"]["arguments"])
-                print(ts() + "[tool call] " + fn_name)
+                # playwright tools print their own combined line after the MCP call returns
+                if fn_name not in _PLAYWRIGHT_TOOLS:
+                    print(ts() + "[tool call] " + fn_name)
                 tool_result = dispatch_tool(mcp, fn_name, fn_args)
                 new_messages.append(
                     {
