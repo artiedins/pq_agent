@@ -1,4 +1,16 @@
 #!/usr/bin/env python3
+"""
+pq_web.py - web front end for pq_minder.py
+
+Run from your project workspace:
+    cd /your/project
+    python3 /path/to/pq_agent/pq_web.py
+
+Then open the printed URL in your browser.
+
+Extra requirement beyond pq_minder.py:
+    pip install flask
+"""
 
 import os
 import sys
@@ -10,36 +22,8 @@ import traceback
 import subprocess
 import logging
 
-# Code style:
-# - No type hinting
-# - No doc strings
-# - No triple quoted multi-line strings
-# - No comments with repeated characters for visual page breaks like # ---
-# - No non-ascii characters
-# - No command line argument processing
-# - No global variables unless making them local increases complexity
-# - Yes strategic inline comments enhancing rapid code comprehension by real humans
-# - Yes if __name__ == "__main__": main()
-
-# Run-in-Directory structure (all paths relative to workspace root):
-# <workspace>/                      run pq_minder.py from here
-#   .pq/                            harness dir, hidden from agent via bubblewrap tmpfs
-#     queue.txt                     task_ids one per line, in dependency order; # = comment
-#     project.md                    project-wide context injected into every agent run
-#     tasks/
-#       <task_id>/
-#         p.md                      task prompt (must exist and be non-empty)
-#         q.md                      rubric for judge (must exist)
-#         task.json                 persists attempt count and status across runs
-#         runs/
-#           run_<n>/
-#             stdout.log            full agent stdout/stderr captured by pq_minder
-#             verdict.json          judge output: status, confidence, issues, feedback
-#   task_report/                    agent writes ALL output here (md, jpg, png only)
-#     *.md                          agent self-report(s); concatenated for judge
-#     *.jpg / *.png                 images produced by agent, downsampled before sending
-
-
+# silence werkzeug access log before Flask starts — otherwise every poll
+# floods the terminal and also bleeds into the in-browser console capture
 logging.getLogger("werkzeug").setLevel(logging.ERROR)
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -665,122 +649,122 @@ _HTML = r"""<!DOCTYPE html>
 <title>PQ MINDER</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0;}
-html,body{height:100vh;overflow:hidden;background:#111;font-family:'Courier New',Courier,monospace;font-size:12px;color:#888;}
+html,body{height:100vh;overflow:hidden;background:#111;font-family:'Courier New',Courier,monospace;font-size:14px;color:#bbb;}
 .app{height:100vh;display:flex;flex-direction:column;}
 
 /* titlebar */
-.tb{background:#181818;border-bottom:2px solid #272727;padding:5px 14px;display:flex;justify-content:space-between;align-items:center;flex-shrink:0;}
-.tname{color:#eee;letter-spacing:.1em;font-size:13px;}
-.tctrl{display:flex;gap:8px;align-items:center;}
-.tstat{color:#666;font-size:11px;}
+.tb{background:#1c1c1c;border-bottom:2px solid #2e2e2e;padding:6px 16px;display:flex;justify-content:space-between;align-items:center;flex-shrink:0;}
+.tname{color:#f0f0f0;letter-spacing:.1em;font-size:15px;}
+.tctrl{display:flex;gap:9px;align-items:center;}
+.tstat{color:#999;font-size:12px;}
 
 /* buttons */
-.btn{border:1px solid #383838;font-family:inherit;font-size:11px;padding:2px 12px;cursor:pointer;background:transparent;color:#888;}
-.btn:hover{border-color:#666;color:#ccc;}
+.btn{border:1px solid #484848;font-family:inherit;font-size:12px;padding:3px 13px;cursor:pointer;background:transparent;color:#aaa;}
+.btn:hover{border-color:#888;color:#eee;}
 .btn:disabled{opacity:.28;cursor:not-allowed;}
-.btn-s{border-color:#2a4a2a;color:#5bd878;background:#0d1a0d;}
-.btn-s:not(:disabled):hover{background:#162816;}
-.btn-x{border-color:#4a2020;color:#d06060;background:#1a0d0d;}
+.btn-s{border-color:#3a6a3a;color:#6ee886;background:#0d1a0d;}
+.btn-s:not(:disabled):hover{background:#1a2e1a;}
+.btn-x{border-color:#6a2828;color:#e07070;background:#1a0d0d;}
 .btn-x:not(:disabled):hover{background:#2e1616;}
 
 /* layout */
-.body{flex:1;display:grid;grid-template-columns:420px 1fr;min-height:0;overflow:hidden;}
+.body{flex:1;display:grid;grid-template-columns:440px 1fr;min-height:0;overflow:hidden;}
 
 /* left panel */
-.left{border-right:2px solid #202020;display:flex;flex-direction:column;overflow:hidden;}
-.sh{background:#141414;border-bottom:1px solid #1e1e1e;padding:3px 12px;display:flex;justify-content:space-between;align-items:center;flex-shrink:0;}
-.shl{color:#666;font-size:10px;letter-spacing:.05em;}
-.shr{color:#555;font-size:10px;}
+.left{border-right:2px solid #242424;display:flex;flex-direction:column;overflow:hidden;}
+.sh{background:#161616;border-bottom:1px solid #242424;padding:4px 13px;display:flex;justify-content:space-between;align-items:center;flex-shrink:0;}
+.shl{color:#999;font-size:11px;letter-spacing:.05em;}
+.shr{color:#888;font-size:11px;}
 
 /* queue */
-.qwrap{flex:0 0 auto;overflow-y:auto;max-height:200px;}
-.qcols{display:grid;grid-template-columns:22px 1fr 68px 42px;padding:3px 12px;color:#363636;font-size:10px;border-bottom:1px solid #181818;}
-.qrow{display:grid;grid-template-columns:22px 1fr 68px 42px;padding:5px 12px;border-bottom:1px solid #1c1c1c;align-items:center;cursor:pointer;border-left:3px solid #222;}
-.qrow:hover{background:#151515;}
-.qrow.sel{background:#171717;}
+.qwrap{flex:0 0 auto;overflow-y:auto;max-height:210px;}
+.qcols{display:grid;grid-template-columns:24px 1fr 72px 44px;padding:3px 13px;color:#666;font-size:11px;border-bottom:1px solid #1e1e1e;}
+.qrow{display:grid;grid-template-columns:24px 1fr 72px 44px;padding:6px 13px;border-bottom:1px solid #1e1e1e;align-items:center;cursor:pointer;border-left:3px solid #282828;}
+.qrow:hover{background:#181818;}
+.qrow.sel{background:#1a1a1a;}
 .sp{border-left-color:#1D9E75 !important;}
-.sr{border-left-color:#EF9F27 !important;background:#0f0e08 !important;}
-.se{border-left-color:#b04040 !important;}
-.si{border-left-color:#666 !important;}
-.so{border-left-color:#2a2a2a !important;}
-.qnum{color:#4a4a4a;}
-.qnm{color:#ddd;font-size:11px;}
-.qnmd{color:#888;font-size:11px;}
-.qat{color:#666;font-size:10px;}
-.ql{font-size:10px;}
-.lp{color:#2bbf8a;}
-.lr{color:#EF9F27;}
-.le{color:#cc6060;}
-.li{color:#888;}
-.lo{color:#555;}
+.sr{border-left-color:#EF9F27 !important;background:#141208 !important;}
+.se{border-left-color:#cc4444 !important;}
+.si{border-left-color:#777 !important;}
+.so{border-left-color:#333 !important;}
+.qnum{color:#666;font-size:12px;}
+.qnm{color:#eee;font-size:13px;}
+.qnmd{color:#aaa;font-size:13px;}
+.qat{color:#888;font-size:11px;}
+.ql{font-size:12px;}
+.lp{color:#3dd898;}
+.lr{color:#f0a830;}
+.le{color:#e05858;}
+.li{color:#aaa;}
+.lo{color:#777;}
 .blink{animation:blink .6s step-end infinite;}
 @keyframes blink{50%{opacity:0;}}
 
 /* detail */
-.dsh{background:#141414;border-top:2px solid #202020;border-bottom:1px solid #1e1e1e;padding:3px 12px;flex-shrink:0;}
-.dsh span{color:#666;font-size:10px;letter-spacing:.04em;}
-.det{flex:1;overflow-y:auto;padding:10px 14px 16px;}
-.demp{color:#3a3a3a;font-size:11px;}
-.dl{color:#777;font-size:10px;letter-spacing:.06em;margin-top:11px;margin-bottom:3px;}
+.dsh{background:#161616;border-top:2px solid #242424;border-bottom:1px solid #242424;padding:4px 13px;flex-shrink:0;}
+.dsh span{color:#999;font-size:11px;letter-spacing:.04em;}
+.det{flex:1;overflow-y:auto;padding:11px 15px 18px;}
+.demp{color:#666;font-size:13px;}
+.dl{color:#aaa;font-size:11px;letter-spacing:.07em;margin-top:12px;margin-bottom:4px;}
 .dl:first-child{margin-top:0;}
-.dv{color:#aaa;font-size:11px;line-height:1.5;word-break:break-word;}
-.da{display:flex;gap:5px;flex-wrap:wrap;margin-top:12px;}
-.db{border:1px solid #333;color:#888;font-size:10px;padding:2px 9px;font-family:inherit;cursor:pointer;background:transparent;}
-.db:hover{border-color:#666;color:#ccc;}
-.dbr{border-color:#5c3800 !important;color:#dfa030 !important;}
-.dbr:hover{background:#1a0e00 !important;}
-.dbp{border-color:#1a3a22 !important;color:#3aaa60 !important;}
-.dbp:hover{background:#0a1810 !important;}
-.vb{margin-top:10px;border-top:1px solid #1e1e1e;padding-top:8px;font-size:11px;line-height:1.7;}
-.vk{color:#777;}
-.vp{color:#2bbf8a;}
-.vf{color:#cc6060;}
-.ve{color:#EF9F27;}
-.vv{color:#aaa;}
-.vi{color:#c07828;display:block;}
-.vfb{color:#70b070;display:block;}
-.vesc{color:#cc6060;display:block;}
+.dv{color:#ccc;font-size:12px;line-height:1.55;word-break:break-word;}
+.da{display:flex;gap:6px;flex-wrap:wrap;margin-top:13px;}
+.db{border:1px solid #444;color:#aaa;font-size:11px;padding:3px 10px;font-family:inherit;cursor:pointer;background:transparent;}
+.db:hover{border-color:#888;color:#eee;}
+.dbr{border-color:#7a4a00 !important;color:#f0b030 !important;}
+.dbr:hover{background:#1e1200 !important;}
+.dbp{border-color:#2a5a30 !important;color:#50cc70 !important;}
+.dbp:hover{background:#102018 !important;}
+.vb{margin-top:11px;border-top:1px solid #242424;padding-top:9px;font-size:12px;line-height:1.75;}
+.vk{color:#aaa;}
+.vp{color:#3dd898;}
+.vf{color:#e05858;}
+.ve{color:#f0a830;}
+.vv{color:#ccc;}
+.vi{color:#e09030;display:block;}
+.vfb{color:#80c880;display:block;}
+.vesc{color:#e05858;display:block;}
 
 /* console */
-.right{display:flex;flex-direction:column;background:#0a0a0a;}
-.ch{background:#0d0d0d;border-bottom:1px solid #1a1a1a;padding:3px 12px;display:flex;justify-content:space-between;flex-shrink:0;}
-.ch span{color:#333;font-size:10px;}
-.chtask{color:#555 !important;}
-.cbody{flex:1;overflow-y:auto;padding:7px 14px 10px;min-height:0;}
-.cbody div{font-size:11px;line-height:1.5;white-space:pre-wrap;word-break:break-all;min-height:1em;}
-.cn{color:#52c068;}
-.ch2{color:#80de98;}
-.cd{color:#3a6644;}
-.ca{color:#e09828;}
-.cr{color:#d06060;}
-.cb{color:#5a90cc;}
-.cw{color:#bbb;}
-.cs{color:#223a2c;}
+.right{display:flex;flex-direction:column;background:#0c0c0c;}
+.ch{background:#101010;border-bottom:1px solid #1e1e1e;padding:4px 13px;display:flex;justify-content:space-between;flex-shrink:0;}
+.ch span{color:#777;font-size:11px;}
+.chtask{color:#aaa !important;}
+.cbody{flex:1;overflow-y:auto;padding:8px 16px 12px;min-height:0;}
+.cbody div{font-size:13px;line-height:1.5;white-space:pre-wrap;word-break:break-all;min-height:1.2em;}
+.cn{color:#60d878;}
+.ch2{color:#90eeaa;}
+.cd{color:#5a8a68;}
+.ca{color:#f0b030;}
+.cr{color:#e06868;}
+.cb{color:#70aadd;}
+.cw{color:#ddd;}
+.cs{color:#2a4a36;}
 
 /* footer */
-.foot{background:#0c0c0c;border-top:1px solid #1a1a1a;padding:3px 14px;display:flex;justify-content:space-between;color:#3a3a3a;font-size:10px;flex-shrink:0;}
+.foot{background:#0e0e0e;border-top:1px solid #1e1e1e;padding:4px 16px;display:flex;justify-content:space-between;color:#666;font-size:11px;flex-shrink:0;}
 
 /* modal */
 .mbg{display:none;position:fixed;inset:0;background:rgba(0,0,0,.92);z-index:100;align-items:center;justify-content:center;}
 .mbg.open{display:flex;}
-.mbox{background:#111;border:1px solid #303030;width:620px;max-height:80vh;display:flex;flex-direction:column;}
-.mhdr{padding:7px 14px;border-bottom:1px solid #222;display:flex;justify-content:space-between;align-items:center;}
-.mttl{color:#999;font-size:12px;}
-.mcls{color:#555;cursor:pointer;font-size:17px;line-height:1;}
-.mcls:hover{color:#ccc;}
-.mbdy{flex:1;padding:8px;display:flex;flex-direction:column;overflow:hidden;}
-.mbdy textarea{flex:1;min-height:280px;background:#080808;color:#aaa;border:1px solid #222;font-family:inherit;font-size:11px;padding:8px;resize:none;outline:none;line-height:1.55;}
-.mbdy textarea:focus{border-color:#363636;}
-.mft{padding:7px 8px;display:flex;gap:6px;justify-content:flex-end;border-top:1px solid #1a1a1a;}
-.mb{border:1px solid #2a2a2a;color:#777;font-size:11px;padding:3px 12px;font-family:inherit;cursor:pointer;background:transparent;}
-.mb:hover{border-color:#555;color:#ccc;}
-.mbs{border-color:#2a4a2a !important;color:#5bd878 !important;background:#0d1a0d !important;}
-.mbs:hover{background:#162816 !important;}
+.mbox{background:#141414;border:1px solid #383838;width:640px;max-height:80vh;display:flex;flex-direction:column;}
+.mhdr{padding:8px 15px;border-bottom:1px solid #282828;display:flex;justify-content:space-between;align-items:center;}
+.mttl{color:#ccc;font-size:13px;}
+.mcls{color:#777;cursor:pointer;font-size:18px;line-height:1;}
+.mcls:hover{color:#eee;}
+.mbdy{flex:1;padding:9px;display:flex;flex-direction:column;overflow:hidden;}
+.mbdy textarea{flex:1;min-height:280px;background:#0a0a0a;color:#ccc;border:1px solid #2a2a2a;font-family:inherit;font-size:13px;padding:9px;resize:none;outline:none;line-height:1.55;}
+.mbdy textarea:focus{border-color:#484848;}
+.mft{padding:8px 9px;display:flex;gap:7px;justify-content:flex-end;border-top:1px solid #1e1e1e;}
+.mb{border:1px solid #383838;color:#aaa;font-size:12px;padding:3px 13px;font-family:inherit;cursor:pointer;background:transparent;}
+.mb:hover{border-color:#777;color:#eee;}
+.mbs{border-color:#3a6a3a !important;color:#6ee886 !important;background:#0d1a0d !important;}
+.mbs:hover{background:#1a2e1a !important;}
 
-::-webkit-scrollbar{width:5px;}
-::-webkit-scrollbar-track{background:#0a0a0a;}
-::-webkit-scrollbar-thumb{background:#222;}
-::-webkit-scrollbar-thumb:hover{background:#333;}
+::-webkit-scrollbar{width:6px;}
+::-webkit-scrollbar-track{background:#0c0c0c;}
+::-webkit-scrollbar-thumb{background:#2e2e2e;}
+::-webkit-scrollbar-thumb:hover{background:#444;}
 </style>
 </head>
 <body>
@@ -897,14 +881,14 @@ function renderStatus(s){
   var np=tasks.filter(function(t){return t.status==='passed';}).length;
   var ne=tasks.filter(function(t){return t.status==='escalated';}).length;
   var lbl='';
-  if(rs==='running')       lbl='<span style="color:#EF9F27">RUNNING</span>';
-  else if(rs==='stopping') lbl='<span style="color:#d06060">STOPPING</span>';
-  else if(rs==='stopped')  lbl=s.error?'<span style="color:#d06060">ERROR</span>':'<span style="color:#555">STOPPED</span>';
-  else                     lbl='<span style="color:#444">IDLE</span>';
+  if(rs==='running')       lbl='<span style="color:#f0b030">RUNNING</span>';
+  else if(rs==='stopping') lbl='<span style="color:#e07070">STOPPING</span>';
+  else if(rs==='stopped')  lbl=s.error?'<span style="color:#e07070">ERROR</span>':'<span style="color:#888">STOPPED</span>';
+  else                     lbl='<span style="color:#777">IDLE</span>';
   if(s.current_task&&rs==='running')
-    lbl+=' | <span style="color:#666">'+esc(s.current_task)+(s.current_run?' / '+esc(s.current_run):'')+'</span>';
+    lbl+=' | <span style="color:#bbb">'+esc(s.current_task)+(s.current_run?' / '+esc(s.current_run):'')+'</span>';
   lbl+=' &nbsp;|&nbsp; TASKS:'+tasks.length+' PASSED:'+np;
-  if(ne) lbl+=' ESC:<span style="color:#d06060">'+ne+'</span>';
+  if(ne) lbl+=' ESC:<span style="color:#e07070">'+ne+'</span>';
   document.getElementById('tstat').innerHTML=lbl;
   document.getElementById('btn-start').disabled=(rs==='running'||rs==='stopping');
   document.getElementById('btn-stop').disabled=(rs!=='running');

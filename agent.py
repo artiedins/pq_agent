@@ -26,9 +26,6 @@ import re
 #   here at startup and falls back to DEFAULT_MODEL if the file is absent or empty.
 #   This lets the judge switch models between retry attempts without touching agent code.
 
-# MAX TOKENS SETTING
-#   Regardless of which model is used, max_tokens MUST be set to 8,000 tokens.
-
 DEFAULT_MODEL = "deepseek/deepseek-v3.2"
 
 AGENT_DIR = os.environ.get("AGENT_DIR", os.path.dirname(os.path.abspath(__file__)))
@@ -501,10 +498,6 @@ def dispatch_tool(mcp, name, arguments):
     return "Unknown tool: " + name
 
 
-# tools that self-log inside dispatch_tool - main() skips pre-call announce for these
-_PLAYWRIGHT_TOOLS = {"playwright_navigate", "playwright_extract_content"}
-
-
 def get_env_snapshot():
     cmd = "echo '=PWD=' && pwd && echo '=LS=' && ls -1 && echo '=PY=' && python3 --version 2>&1"
     try:
@@ -690,9 +683,6 @@ def main():
             for tc in msg["tool_calls"]:
                 fn_name = tc["function"]["name"]
                 fn_args = json.loads(tc["function"]["arguments"])
-                # playwright tools print their own combined line after the MCP call returns
-                if fn_name not in _PLAYWRIGHT_TOOLS:
-                    print(ts() + "[tool call] " + fn_name)
                 tool_result = dispatch_tool(mcp, fn_name, fn_args)
                 new_messages.append(
                     {
