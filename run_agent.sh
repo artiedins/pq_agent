@@ -10,6 +10,9 @@
 # protects: $HOME entirely invisible, only project dir is writable
 # .pq is shadowed with an empty tmpfs so the agent cannot see harness files
 # allows: full network (playwright needs it), playwright browser cache read-only
+#
+# agent.py is hardcoded to deepseek/deepseek-v4-flash via OpenRouter, so
+# OPENROUTER_API_KEY is the only LLM key needed inside the sandbox.
 
 set -euo pipefail
 
@@ -21,7 +24,7 @@ fi
 AGENT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$1" && pwd)"
 
-# : "${GOOGLE_API_KEY:?GOOGLE_API_KEY must be set in the environment}"
+: "${OPENROUTER_API_KEY:?OPENROUTER_API_KEY must be set in the environment}"
 
 PW_CACHE="${HOME}/.cache/ms-playwright"
 
@@ -65,7 +68,6 @@ exec bwrap \
   --setenv PATH /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
   --setenv HOME /tmp \
   --setenv TMPDIR /tmp \
-  --setenv GOOGLE_API_KEY "$GOOGLE_API_KEY" \
   --setenv OPENROUTER_API_KEY "$OPENROUTER_API_KEY" \
   --setenv PLAYWRIGHT_BROWSERS_PATH /pw-cache \
   --setenv AGENT_DIR /agent \

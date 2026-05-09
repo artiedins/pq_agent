@@ -21,51 +21,34 @@ import re
 # - Yes strategic inline comments enhancing rapid code comprehension by real humans
 # - Yes if __name__ == "__main__": main()
 
-# Model selection:
-#   pq_minder writes .agent_model to the workspace root before each run; agent reads it
-#   here at startup and falls back to DEFAULT_MODEL if the file is absent or empty.
-#   This lets the judge switch models between retry attempts without touching agent code.
+# Model is hardcoded: deepseek/deepseek-v4-pro via OpenRouter with reasoning at
+# effort=high. Pro is preferred over Flash for long agent loops with chained
+# tool calls and code work; the per-task cost differential is pennies and the
+# Terminal-Bench/SimpleQA gaps are real. Judge model selection happens elsewhere
+# (pq_minder/pq_web) and does not affect this script.
+#
+# DeepSeek V4 thinking-mode REQUIRES the prior assistant turn's reasoning state
+# (reasoning_details, reasoning, or reasoning_content) to be passed back when
+# that turn included a tool_call - omitting it causes a 400 from the upstream
+# DeepSeek provider through OpenRouter. We rely on appending the assistant
+# message dict from the response verbatim into the conversation, which carries
+# all returned fields through to the next request.
 
-DEFAULT_MODEL = "deepseek/deepseek-v3.2"
+MODEL = "deepseek/deepseek-v4-pro:exacto"
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+REASONING_EFFORT = "high"  # OpenRouter shape for V4 family: "high" or "xhigh" (xhigh needs 384K min context). Set to None to disable.
 
 AGENT_DIR = os.environ.get("AGENT_DIR", os.path.dirname(os.path.abspath(__file__)))
 WORKSPACE = os.path.abspath(os.getcwd())
 
-
-def _read_model_from_workspace():
-    path = os.path.join(WORKSPACE, ".agent_model")
-    if not os.path.exists(path):
-        return DEFAULT_MODEL
-    try:
-        val = open(path, "r", encoding="utf-8").read().strip()
-        return val if val else DEFAULT_MODEL
-    except Exception:
-        return DEFAULT_MODEL
-
-
-MODEL = _read_model_from_workspace()
-
-
-GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
+if not OPENROUTER_API_KEY:
+    sys.exit("Error: OPENROUTER_API_KEY environment variable is not set.")
 
-if "/" in MODEL:
-    if not OPENROUTER_API_KEY:
-        sys.exit("Error: OPENROUTER_API_KEY environment variable is not set.")
-    OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-    HEADERS = {
-        "Authorization": "Bearer " + OPENROUTER_API_KEY,
-        "Content-Type": "application/json",
-    }
-
-else:
-    if not GOOGLE_API_KEY:
-        sys.exit("Error: GOOGLE_API_KEY environment variable is not set.")
-    OPENROUTER_URL = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
-    HEADERS = {
-        "Authorization": "Bearer " + GOOGLE_API_KEY,
-        "Content-Type": "application/json",
-    }
+HEADERS = {
+    "Authorization": "Bearer " + OPENROUTER_API_KEY,
+    "Content-Type": "application/json",
+}
 
 
 _enc = tiktoken.get_encoding("cl100k_base")
@@ -157,6 +140,9 @@ def post_compaction(payload):
         resp.raise_for_status()
         return resp
     except requests.exceptions.HTTPError as e:
+        # defensive fallback: if the server rejects the reasoning param, retry without it.
+        # with the round-trip working this should rarely fire, but keeping it as a safety
+        # net for future provider quirks. the warning will be visible in logs.
         if e.response.status_code == 400 and "reasoning" in payload:
             print(ts() + "  [warn] reasoning param rejected, retrying without it...")
             payload = {k: v for k, v in payload.items() if k != "reasoning"}
@@ -169,7 +155,19 @@ def post_compaction(payload):
 def extract_compaction_summary(raw_msg):
     summary = raw_msg.get("content")
     if not summary or not isinstance(summary, str) or summary.strip().lower() in ("", "none", "yes"):
+        # fall back through OpenRouter reasoning shapes: plain string fields first,
+        # then the structured reasoning_details array (sequence of {type, text, ...} blocks)
         summary = raw_msg.get("reasoning") or raw_msg.get("reasoning_content")
+        if not summary:
+            details = raw_msg.get("reasoning_details") or []
+            parts = []
+            for d in details:
+                if isinstance(d, dict):
+                    t = d.get("text") or d.get("content")
+                    if t:
+                        parts.append(t)
+            if parts:
+                summary = "\n".join(parts)
     if summary:
         summary = summary.strip()
     return summary or None
@@ -202,6 +200,8 @@ def chat(messages, tools, new_messages, state, session_messages):
             "max_tokens": 8000,
             "messages": messages + new_messages + [{"role": "user", "content": compaction_prompt}],
         }
+        if REASONING_EFFORT:
+            compaction_payload["reasoning"] = {"effort": REASONING_EFFORT}
         new_messages.clear()
 
         resp_json = post_compaction(compaction_payload).json()
@@ -242,6 +242,8 @@ def chat(messages, tools, new_messages, state, session_messages):
         "max_tokens": 8000,
         "messages": messages,
     }
+    if REASONING_EFFORT:
+        payload["reasoning"] = {"effort": REASONING_EFFORT}
 
     data = post_with_retry(payload).json()
 
@@ -677,6 +679,10 @@ def main():
         choice = response["choices"][0]
         msg = choice["message"]
         finish = choice["finish_reason"]
+        # CRITICAL: msg may include reasoning_details / reasoning / reasoning_content fields
+        # when V4 thinking mode is on. Appending the dict verbatim preserves them so they
+        # round-trip on the next request. Do NOT strip these fields - DeepSeek 400s if a
+        # prior tool-call turn's reasoning state is missing on the follow-up.
         new_messages.append(msg)
 
         if finish == "tool_calls":

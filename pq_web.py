@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
-"""
-pq_web.py - web front end for pq_minder.py
-
-Run from your project workspace:
-    cd /your/project
-    python3 /path/to/pq_agent/pq_web.py
-
-Then open the printed URL in your browser.
-
-Extra requirement beyond pq_minder.py:
-    pip install flask
-"""
+# pq_web.py - web front end for pq_minder.py
+#
+# Run from your project workspace:
+#     cd /your/project
+#     python3 /path/to/pq_agent/pq_web.py
+#
+# Then open the printed URL in your browser.
+#
+# This file holds the server logic: Flask routes, runner thread, task driver.
+# The HTML/CSS/JS template lives in pq_web_html.py - imported here as a single
+# constant. Splitting them keeps this file diff-friendly across feature work.
+#
+# Extra requirement beyond pq_minder.py:
+#     pip install flask
 
 import os
 import sys
@@ -22,8 +24,7 @@ import traceback
 import subprocess
 import logging
 
-# silence werkzeug access log before Flask starts — otherwise every poll
-# floods the terminal and also bleeds into the in-browser console capture
+# silence werkzeug access log before Flask starts
 logging.getLogger("werkzeug").setLevel(logging.ERROR)
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -41,23 +42,31 @@ from pq_minder import (
     call_judge_turn,
     build_first_judge_text,
     build_followup_judge_text,
+    build_content_items,
     format_feedback_for_agent,
+    save_agent_initial_prompt,
+    save_judge_input,
     read_text,
     write_text,
     load_json,
     write_json,
     tail_file,
     make_escalation_verdict,
-    DEFAULT_AGENT_MODEL,
-    VALID_AGENT_MODELS,
+    check_api_keys,
+    JUDGE_PROVIDER_OPTIONS,
+    AGENT_MODEL,
     MAX_ATTEMPTS,
     LOG_TAIL_LINES,
     LOW_CONF_THRESHOLD,
     AGENT_TIMEOUT_S,
-    JUDGE_MODEL,
-    build_content_items,
-    check_api_keys,
 )
+
+from pq_web_html import HTML
+
+# Web UI default judge override. pq_minder.py defaults to Claude Opus 4.7 for CLI
+# use; the web UI defaults to Kimi K2.6 (cheaper, still strong). Change this one
+# line to flip the web default - the CLI default is independent.
+WEB_DEFAULT_JUDGE_PROVIDER = "kimi"
 
 WORKSPACE = os.path.abspath(os.getcwd())
 HARNESS_DIR = os.path.join(WORKSPACE, ".pq")
@@ -66,22 +75,24 @@ PORT = 5000
 app = Flask(__name__)
 _orig_stdout = sys.stdout
 
-# ── shared state (all mutations under _lock) ──────────────────────────────────
+# shared state (all mutations under _lock)
 
 _lock = threading.RLock()
 _stop_event = threading.Event()
 _runner_thread = None
 
-_console = []  # list[str] streamed to browser via SSE
+_console = []
 _runner_status = "idle"
 _current_task = None
 _current_run = None
-_current_model = DEFAULT_AGENT_MODEL
 _run_start_time = None
 _error = None
 
+# user-selected judge provider; passed into each run. Agent is hardcoded.
+_judge_provider = WEB_DEFAULT_JUDGE_PROVIDER
 
-# ── stdout tee: captures print() output into _console ─────────────────────────
+
+# stdout tee: captures print() output into _console
 
 
 class _Tee:
@@ -108,7 +119,6 @@ class _Tee:
 
 
 def _append_line(line):
-    """Append one line, suppressing runs of consecutive blank lines."""
     stripped = line.rstrip("\r")
     with _lock:
         if stripped.strip() or not _console or _console[-1].strip():
@@ -116,12 +126,11 @@ def _append_line(line):
 
 
 def _cap(text):
-    """Append a (possibly multi-line) string to the console buffer."""
     for line in str(text).split("\n"):
         _append_line(line)
 
 
-# ── modified run_agent that feeds subprocess output into _console ──────────────
+# modified run_agent that feeds subprocess output into _console
 
 
 def _run_agent_web(workspace_dir, run_dir):
@@ -178,11 +187,11 @@ def _run_agent_web(workspace_dir, run_dir):
     return rc, timed_out, elapsed
 
 
-# ── task runner (mirrors pq_minder.run_task) ──────────────────────────────────
+# task runner
 
 
-def _run_task(harness_dir, workspace_dir, task_id):
-    global _current_task, _current_run, _current_model, _run_start_time
+def _run_task(harness_dir, workspace_dir, task_id, judge_provider):
+    global _current_task, _current_run, _run_start_time
 
     task_dir = os.path.join(harness_dir, "tasks", task_id)
     if not os.path.exists(task_dir):
@@ -220,10 +229,6 @@ def _run_task(harness_dir, workspace_dir, task_id):
     retry_note = None
     prior_verdict = None
     agent_was_told = None
-    current_agent_model = DEFAULT_AGENT_MODEL
-
-    with _lock:
-        _current_model = current_agent_model
 
     final_status = "failed"
 
@@ -240,13 +245,16 @@ def _run_task(harness_dir, workspace_dir, task_id):
         with _lock:
             _current_task = task_id
             _current_run = "run_" + str(attempt_num)
-            _current_model = current_agent_model
             _run_start_time = time.time()
 
         _cap("")
-        _cap("Task " + task_id + " attempt " + str(attempt_num) + "/" + str(MAX_ATTEMPTS) + " [model: " + current_agent_model + "]")
+        _cap("Task " + task_id + " attempt " + str(attempt_num) + "/" + str(MAX_ATTEMPTS) + " [judge: " + judge_provider + " | agent: " + AGENT_MODEL + "]")
 
-        stage_workspace(harness_dir, task_dir, workspace_dir, attempt_num, current_agent_model)
+        stage_workspace(harness_dir, task_dir, workspace_dir, attempt_num)
+
+        # save staged prompt immediately after staging, before agent runs
+        save_agent_initial_prompt(run_dir, workspace_dir, task_id, attempt_num)
+
         run_start = time.time()
         try:
             agent_rc, agent_timed_out, agent_elapsed = _run_agent_web(workspace_dir, run_dir)
@@ -296,13 +304,13 @@ def _run_task(harness_dir, workspace_dir, task_id):
                 _cap("  judge: " + str(len(image_paths)) + " image(s): " + str([os.path.basename(p) for p in image_paths]))
 
         if not judge_messages:
-            judge_text = build_first_judge_text(rubric, report_text, log_tail, current_agent_model)
+            judge_text = build_first_judge_text(rubric, report_text, log_tail, AGENT_MODEL)
         else:
             judge_text = build_followup_judge_text(
                 report_text,
                 log_tail,
                 attempt_num,
-                current_agent_model,
+                AGENT_MODEL,
                 prior_verdict=prior_verdict,
                 agent_was_told=agent_was_told,
                 retry_note=retry_note,
@@ -310,10 +318,14 @@ def _run_task(harness_dir, workspace_dir, task_id):
             retry_note = None
 
         judge_messages.append({"role": "user", "content": build_content_items(judge_text, image_paths)})
-        _cap("  calling judge (" + JUDGE_MODEL + ")...")
+
+        # save complete judge conversation before calling, for diffable audit trail
+        save_judge_input(run_dir, judge_messages, task_id, attempt_num)
+
+        _cap("  calling judge (" + judge_provider + ")...")
 
         try:
-            verdict_raw, verdict = call_judge_turn(judge_messages)
+            verdict_raw, verdict = call_judge_turn(judge_messages, judge_provider)
         except Exception as e:
             _cap("  [escalate] judge call/parse failed: " + str(e))
             verdict = make_escalation_verdict(
@@ -333,7 +345,8 @@ def _run_task(harness_dir, workspace_dir, task_id):
         judge_messages.append({"role": "assistant", "content": verdict_raw})
         verdict["started_at"] = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(run_start))
         verdict["elapsed_s"] = agent_elapsed
-        verdict["agent_model"] = current_agent_model
+        verdict["agent_model"] = AGENT_MODEL
+        verdict["judge_provider"] = judge_provider
         write_json(os.path.join(run_dir, "verdict.json"), verdict)
         meta["attempts"] = attempt_num
         write_json(task_json_path, meta)
@@ -342,15 +355,6 @@ def _run_task(harness_dir, workspace_dir, task_id):
         _cap("Verdict: status=" + str(verdict.get("status")) + " confidence={:.2f}".format(conf))
         if verdict.get("issues"):
             _cap("Issues: " + str(verdict["issues"]))
-
-        req_model = verdict.get("next_model")
-        if req_model and req_model in VALID_AGENT_MODELS and req_model != current_agent_model:
-            _cap("  [model switch] " + current_agent_model + " -> " + req_model)
-            current_agent_model = req_model
-            with _lock:
-                _current_model = current_agent_model
-        elif req_model and req_model == current_agent_model:
-            _cap("  [model keep] judge confirmed " + current_agent_model)
 
         if verdict.get("status") == "passed" and conf >= LOW_CONF_THRESHOLD:
             meta["status"] = "passed"
@@ -406,7 +410,7 @@ def _run_task(harness_dir, workspace_dir, task_id):
     return final_status
 
 
-# ── queue runner thread ────────────────────────────────────────────────────────
+# queue runner thread
 
 
 def _queue_runner():
@@ -414,8 +418,11 @@ def _queue_runner():
 
     sys.stdout = _Tee(_orig_stdout)
 
+    with _lock:
+        jp = _judge_provider
+
     try:
-        check_api_keys()
+        check_api_keys(judge_provider=jp)
     except RuntimeError as e:
         with _lock:
             _runner_status = "stopped"
@@ -430,16 +437,21 @@ def _queue_runner():
 
     try:
         queue = read_queue(HARNESS_DIR)
-        _cap("Queue: " + str(len(queue)) + " tasks | judge: " + JUDGE_MODEL)
-        _cap("Agent default: " + DEFAULT_AGENT_MODEL)
+        _cap("Queue: " + str(len(queue)) + " tasks")
+        _cap("Judge: " + jp)
+        _cap("Agent: " + AGENT_MODEL)
         _cap("")
 
         for task_id in queue:
             if _stop_event.is_set():
                 _cap("[STOPPED] Queue halted by user")
                 break
+            # capture current judge selection at start of each task so a
+            # mid-queue change takes effect on the next task rather than mid-task
+            with _lock:
+                jp = _judge_provider
             try:
-                status = _run_task(HARNESS_DIR, WORKSPACE, task_id)
+                status = _run_task(HARNESS_DIR, WORKSPACE, task_id, jp)
             except Exception as e:
                 _cap("[ERROR] task " + task_id + ": " + str(e))
                 _cap(traceback.format_exc())
@@ -468,7 +480,7 @@ def _queue_runner():
             _current_run = None
 
 
-# ── helpers ───────────────────────────────────────────────────────────────────
+# helpers
 
 
 def _load_tasks():
@@ -518,12 +530,12 @@ def _get_local_ip():
         return "0.0.0.0"
 
 
-# ── Flask routes ──────────────────────────────────────────────────────────────
+# Flask routes
 
 
 @app.route("/")
 def index():
-    return _HTML
+    return HTML
 
 
 @app.route("/api/state")
@@ -532,7 +544,7 @@ def api_state():
         rs = _runner_status
         ct = _current_task
         cr = _current_run
-        cm = _current_model
+        jp = _judge_provider
         rst = _run_start_time
         err = _error
     elapsed = int(time.time() - rst) if rst and rs == "running" else 0
@@ -541,21 +553,45 @@ def api_state():
             "runner_status": rs,
             "current_task": ct,
             "current_run": cr,
-            "current_model": cm,
+            "judge_provider": jp,
+            "agent_model": AGENT_MODEL,
             "elapsed": elapsed,
             "error": err,
             "tasks": _load_tasks(),
-            "judge": JUDGE_MODEL,
-            "valid_models": list(VALID_AGENT_MODELS),
             "max_attempts": MAX_ATTEMPTS,
+        }
+    )
+
+
+@app.route("/api/judge", methods=["GET", "POST"])
+def api_judge():
+    global _judge_provider
+    if request.method == "POST":
+        with _lock:
+            if _runner_status == "running":
+                return jsonify({"error": "cannot change judge while running"}), 400
+        data = request.json or {}
+        new_judge = data.get("judge")
+        valid = [o["key"] for o in JUDGE_PROVIDER_OPTIONS]
+        with _lock:
+            if new_judge is not None:
+                if new_judge not in valid:
+                    return jsonify({"error": "invalid judge provider: " + new_judge}), 400
+                _judge_provider = new_judge
+            jp = _judge_provider
+        return jsonify({"judge": jp})
+    with _lock:
+        jp = _judge_provider
+    return jsonify(
+        {
+            "judge": jp,
+            "judge_options": JUDGE_PROVIDER_OPTIONS,
         }
     )
 
 
 @app.route("/api/console/stream")
 def api_console_stream():
-    """SSE endpoint — one persistent connection replaces all console polling."""
-
     def generate():
         sent = 0
         try:
@@ -639,386 +675,7 @@ def api_q(task_id):
     return jsonify({"content": read_text(q_path) if os.path.exists(q_path) else ""})
 
 
-# ── HTML single-file app ──────────────────────────────────────────────────────
-
-_HTML = r"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>PQ MINDER</title>
-<style>
-*{box-sizing:border-box;margin:0;padding:0;}
-html,body{height:100vh;overflow:hidden;background:#111;font-family:'Courier New',Courier,monospace;font-size:14px;color:#bbb;}
-.app{height:100vh;display:flex;flex-direction:column;}
-
-/* titlebar */
-.tb{background:#1c1c1c;border-bottom:2px solid #2e2e2e;padding:6px 16px;display:flex;justify-content:space-between;align-items:center;flex-shrink:0;}
-.tname{color:#f0f0f0;letter-spacing:.1em;font-size:15px;}
-.tctrl{display:flex;gap:9px;align-items:center;}
-.tstat{color:#999;font-size:12px;}
-
-/* buttons */
-.btn{border:1px solid #484848;font-family:inherit;font-size:12px;padding:3px 13px;cursor:pointer;background:transparent;color:#aaa;}
-.btn:hover{border-color:#888;color:#eee;}
-.btn:disabled{opacity:.28;cursor:not-allowed;}
-.btn-s{border-color:#3a6a3a;color:#6ee886;background:#0d1a0d;}
-.btn-s:not(:disabled):hover{background:#1a2e1a;}
-.btn-x{border-color:#6a2828;color:#e07070;background:#1a0d0d;}
-.btn-x:not(:disabled):hover{background:#2e1616;}
-
-/* layout */
-.body{flex:1;display:grid;grid-template-columns:440px 1fr;min-height:0;overflow:hidden;}
-
-/* left panel */
-.left{border-right:2px solid #242424;display:flex;flex-direction:column;overflow:hidden;}
-.sh{background:#161616;border-bottom:1px solid #242424;padding:4px 13px;display:flex;justify-content:space-between;align-items:center;flex-shrink:0;}
-.shl{color:#999;font-size:11px;letter-spacing:.05em;}
-.shr{color:#888;font-size:11px;}
-
-/* queue */
-.qwrap{flex:0 0 auto;overflow-y:auto;max-height:210px;}
-.qcols{display:grid;grid-template-columns:24px 1fr 72px 44px;padding:3px 13px;color:#666;font-size:11px;border-bottom:1px solid #1e1e1e;}
-.qrow{display:grid;grid-template-columns:24px 1fr 72px 44px;padding:6px 13px;border-bottom:1px solid #1e1e1e;align-items:center;cursor:pointer;border-left:3px solid #282828;}
-.qrow:hover{background:#181818;}
-.qrow.sel{background:#1a1a1a;}
-.sp{border-left-color:#1D9E75 !important;}
-.sr{border-left-color:#EF9F27 !important;background:#141208 !important;}
-.se{border-left-color:#cc4444 !important;}
-.si{border-left-color:#777 !important;}
-.so{border-left-color:#333 !important;}
-.qnum{color:#666;font-size:12px;}
-.qnm{color:#eee;font-size:13px;}
-.qnmd{color:#aaa;font-size:13px;}
-.qat{color:#888;font-size:11px;}
-.ql{font-size:12px;}
-.lp{color:#3dd898;}
-.lr{color:#f0a830;}
-.le{color:#e05858;}
-.li{color:#aaa;}
-.lo{color:#777;}
-.blink{animation:blink .6s step-end infinite;}
-@keyframes blink{50%{opacity:0;}}
-
-/* detail */
-.dsh{background:#161616;border-top:2px solid #242424;border-bottom:1px solid #242424;padding:4px 13px;flex-shrink:0;}
-.dsh span{color:#999;font-size:11px;letter-spacing:.04em;}
-.det{flex:1;overflow-y:auto;padding:11px 15px 18px;}
-.demp{color:#666;font-size:13px;}
-.dl{color:#aaa;font-size:11px;letter-spacing:.07em;margin-top:12px;margin-bottom:4px;}
-.dl:first-child{margin-top:0;}
-.dv{color:#ccc;font-size:12px;line-height:1.55;word-break:break-word;}
-.da{display:flex;gap:6px;flex-wrap:wrap;margin-top:13px;}
-.db{border:1px solid #444;color:#aaa;font-size:11px;padding:3px 10px;font-family:inherit;cursor:pointer;background:transparent;}
-.db:hover{border-color:#888;color:#eee;}
-.dbr{border-color:#7a4a00 !important;color:#f0b030 !important;}
-.dbr:hover{background:#1e1200 !important;}
-.dbp{border-color:#2a5a30 !important;color:#50cc70 !important;}
-.dbp:hover{background:#102018 !important;}
-.vb{margin-top:11px;border-top:1px solid #242424;padding-top:9px;font-size:12px;line-height:1.75;}
-.vk{color:#aaa;}
-.vp{color:#3dd898;}
-.vf{color:#e05858;}
-.ve{color:#f0a830;}
-.vv{color:#ccc;}
-.vi{color:#e09030;display:block;}
-.vfb{color:#80c880;display:block;}
-.vesc{color:#e05858;display:block;}
-
-/* console */
-.right{display:flex;flex-direction:column;background:#0c0c0c;}
-.ch{background:#101010;border-bottom:1px solid #1e1e1e;padding:4px 13px;display:flex;justify-content:space-between;flex-shrink:0;}
-.ch span{color:#777;font-size:11px;}
-.chtask{color:#aaa !important;}
-.cbody{flex:1;overflow-y:auto;padding:8px 16px 12px;min-height:0;}
-.cbody div{font-size:13px;line-height:1.5;white-space:pre-wrap;word-break:break-all;min-height:1.2em;}
-.cn{color:#60d878;}
-.ch2{color:#90eeaa;}
-.cd{color:#5a8a68;}
-.ca{color:#f0b030;}
-.cr{color:#e06868;}
-.cb{color:#70aadd;}
-.cw{color:#ddd;}
-.cs{color:#2a4a36;}
-
-/* footer */
-.foot{background:#0e0e0e;border-top:1px solid #1e1e1e;padding:4px 16px;display:flex;justify-content:space-between;color:#666;font-size:11px;flex-shrink:0;}
-
-/* modal */
-.mbg{display:none;position:fixed;inset:0;background:rgba(0,0,0,.92);z-index:100;align-items:center;justify-content:center;}
-.mbg.open{display:flex;}
-.mbox{background:#141414;border:1px solid #383838;width:640px;max-height:80vh;display:flex;flex-direction:column;}
-.mhdr{padding:8px 15px;border-bottom:1px solid #282828;display:flex;justify-content:space-between;align-items:center;}
-.mttl{color:#ccc;font-size:13px;}
-.mcls{color:#777;cursor:pointer;font-size:18px;line-height:1;}
-.mcls:hover{color:#eee;}
-.mbdy{flex:1;padding:9px;display:flex;flex-direction:column;overflow:hidden;}
-.mbdy textarea{flex:1;min-height:280px;background:#0a0a0a;color:#ccc;border:1px solid #2a2a2a;font-family:inherit;font-size:13px;padding:9px;resize:none;outline:none;line-height:1.55;}
-.mbdy textarea:focus{border-color:#484848;}
-.mft{padding:8px 9px;display:flex;gap:7px;justify-content:flex-end;border-top:1px solid #1e1e1e;}
-.mb{border:1px solid #383838;color:#aaa;font-size:12px;padding:3px 13px;font-family:inherit;cursor:pointer;background:transparent;}
-.mb:hover{border-color:#777;color:#eee;}
-.mbs{border-color:#3a6a3a !important;color:#6ee886 !important;background:#0d1a0d !important;}
-.mbs:hover{background:#1a2e1a !important;}
-
-::-webkit-scrollbar{width:6px;}
-::-webkit-scrollbar-track{background:#0c0c0c;}
-::-webkit-scrollbar-thumb{background:#2e2e2e;}
-::-webkit-scrollbar-thumb:hover{background:#444;}
-</style>
-</head>
-<body>
-<div class="app">
-
-  <div class="tb">
-    <span class="tname">PQ_MINDER</span>
-    <div class="tctrl">
-      <button class="btn btn-s" id="btn-start" onclick="doStart()">START</button>
-      <button class="btn btn-x" id="btn-stop" onclick="doStop()" disabled>STOP</button>
-      <span class="tstat" id="tstat">IDLE</span>
-    </div>
-  </div>
-
-  <div class="body">
-    <div class="left">
-      <div class="sh">
-        <span class="shl" id="qcount">QUEUE [0]</span>
-        <span class="shr" id="qsum"></span>
-      </div>
-      <div class="qcols"><span>#</span><span>TASK_ID</span><span>STATUS</span><span>ATT</span></div>
-      <div class="qwrap" id="qlist"></div>
-      <div class="dsh"><span id="dsht">SELECTED: —</span></div>
-      <div class="det" id="det"><div class="demp">click a task to view details</div></div>
-    </div>
-
-    <div class="right">
-      <div class="ch">
-        <span>CONSOLE [LIVE]</span>
-        <span class="chtask" id="ctask">—</span>
-      </div>
-      <div class="cbody" id="cbody"></div>
-    </div>
-  </div>
-
-  <div class="foot">
-    <span id="fagent">agent: —</span>
-    <span id="fjudge">judge: —</span>
-    <span id="felapsed">elapsed: —</span>
-    <span id="flines">lines: 0</span>
-  </div>
-</div>
-
-<div class="mbg" id="modal" onclick="if(event.target===this)closeModal()">
-  <div class="mbox">
-    <div class="mhdr">
-      <span class="mttl" id="mttl">EDIT</span>
-      <span class="mcls" onclick="closeModal()">&#xd7;</span>
-    </div>
-    <div class="mbdy"><textarea id="mta" spellcheck="false"></textarea></div>
-    <div class="mft">
-      <button class="mb" onclick="closeModal()">CANCEL</button>
-      <button class="mb mbs" onclick="saveModal()">SAVE</button>
-    </div>
-  </div>
-</div>
-
-<script>
-var selTask=null, lastState=null, modalUrl=null, es=null, lineCount=0;
-
-var SLBL={open:'[PEND]',passed:'[PASS]',failed:'[FAIL]',escalated:'[ESC!]',interrupted:'[INT]',blocked:'[BLKD]',stopping:'[STOP]'};
-var SCSS={open:'so',passed:'sp',failed:'se',escalated:'se',interrupted:'si',blocked:'so',stopping:'si'};
-var SLC={open:'lo',passed:'lp',failed:'le',escalated:'le',interrupted:'li',blocked:'lo',stopping:'li'};
-
-function esc(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
-function pad(n){return n<10?'0'+n:''+n;}
-function fmtT(s){var h=Math.floor(s/3600),m=Math.floor((s%3600)/60),ss=s%60;return(h?pad(h)+':':'')+pad(m)+':'+pad(ss);}
-
-function colorLine(r){
-  if(!r||!r.trim()) return '<span class="cs">&nbsp;</span>';
-  var t=esc(r);
-  if(/\[tool call\]/i.test(r))    return '<span class="ca">'+t+'</span>';
-  if(/\[escalate\]/i.test(r)||/\[ERROR\]/i.test(r)) return '<span class="cr">'+t+'</span>';
-  if(/\bPASSED\b/.test(r)||/passed on attempt/i.test(r)||/All tasks complete/i.test(r)) return '<span class="ch2">'+t+'</span>';
-  if(/\[warn\]/i.test(r)||/\[model switch\]/i.test(r)||/\[ESCALATE\]/i.test(r)||/\[STOPPED\]/i.test(r)||/low-confidence/i.test(r)) return '<span class="ca">'+t+'</span>';
-  if(/calling judge/i.test(r)||/RESPONSE.*model=/i.test(r)||/JUDGE PROMPT/i.test(r)) return '<span class="cb">'+t+'</span>';
-  if(/^Verdict:/i.test(r)) return '<span class="cw">'+t+'</span>';
-  if(/^Issues:/i.test(r)) return '<span class="ca">'+t+'</span>';
-  if(/^Task\s+\S+\s+attempt/i.test(r)) return '<span class="ch2">'+t+'</span>';
-  if(/\[pq_minder\]/.test(r)||/^Starting agent/.test(r)||/^MCP/.test(r)||/^Agent model/.test(r)||/^Queue:/.test(r)||/^Agent default/.test(r)) return '<span class="cd">'+t+'</span>';
-  return '<span class="cn">'+t+'</span>';
-}
-
-function appendLine(raw){
-  var cb=document.getElementById('cbody');
-  var atBot=(cb.scrollHeight-cb.scrollTop-cb.clientHeight)<70;
-  var d=document.createElement('div');
-  d.innerHTML=colorLine(raw);
-  cb.appendChild(d);
-  lineCount++;
-  document.getElementById('flines').textContent='lines: '+lineCount;
-  if(atBot) cb.scrollTop=cb.scrollHeight;
-}
-
-function connectSSE(){
-  if(es){es.close();es=null;}
-  es=new EventSource('/api/console/stream');
-  es.onmessage=function(e){appendLine(JSON.parse(e.data));};
-  es.onerror=function(){};
-}
-
-function pollState(){
-  fetch('/api/state').then(function(r){return r.json();}).then(function(s){
-    lastState=s;
-    renderStatus(s);
-    renderQueue(s);
-    renderFooter(s);
-    if(selTask){var t=s.tasks.find(function(x){return x.id===selTask;});if(t)renderDetail(t,s);}
-  }).catch(function(){});
-}
-
-function renderStatus(s){
-  var rs=s.runner_status,tasks=s.tasks||[];
-  var np=tasks.filter(function(t){return t.status==='passed';}).length;
-  var ne=tasks.filter(function(t){return t.status==='escalated';}).length;
-  var lbl='';
-  if(rs==='running')       lbl='<span style="color:#f0b030">RUNNING</span>';
-  else if(rs==='stopping') lbl='<span style="color:#e07070">STOPPING</span>';
-  else if(rs==='stopped')  lbl=s.error?'<span style="color:#e07070">ERROR</span>':'<span style="color:#888">STOPPED</span>';
-  else                     lbl='<span style="color:#777">IDLE</span>';
-  if(s.current_task&&rs==='running')
-    lbl+=' | <span style="color:#bbb">'+esc(s.current_task)+(s.current_run?' / '+esc(s.current_run):'')+'</span>';
-  lbl+=' &nbsp;|&nbsp; TASKS:'+tasks.length+' PASSED:'+np;
-  if(ne) lbl+=' ESC:<span style="color:#e07070">'+ne+'</span>';
-  document.getElementById('tstat').innerHTML=lbl;
-  document.getElementById('btn-start').disabled=(rs==='running'||rs==='stopping');
-  document.getElementById('btn-stop').disabled=(rs!=='running');
-  document.getElementById('ctask').textContent=
-    (s.current_task&&rs==='running')?(s.current_task+(s.current_run?' / '+s.current_run:'')):'—';
-}
-
-function renderQueue(s){
-  var tasks=s.tasks||[], html='';
-  tasks.forEach(function(t){
-    var isRun=(s.current_task===t.id&&s.runner_status==='running');
-    var sc=isRun?'sr':(SCSS[t.status]||'so');
-    var lc=isRun?'lr':(SLC[t.status]||'lo');
-    var lbl=isRun?'[RUN]':(SLBL[t.status]||'[???]');
-    var nc=(t.status==='passed')?'qnm':'qnmd';
-    var sel=(selTask===t.id)?' sel':'';
-    html+='<div class="qrow '+sc+sel+'" data-id="'+esc(t.id)+'">';
-    html+='<span class="qnum">'+t.index+'</span>';
-    html+='<span class="'+nc+'">'+esc(t.id)+'</span>';
-    html+='<span class="ql '+lc+'">'+lbl+(isRun?'<span class="blink"> &#9646;</span>':'')+'</span>';
-    html+='<span class="qat">'+t.attempts+'/'+(s.max_attempts||3)+'</span>';
-    html+='</div>';
-  });
-  var el=document.getElementById('qlist');
-  el.innerHTML=html;
-  el.querySelectorAll('.qrow').forEach(function(r){
-    r.addEventListener('click',function(){selectTask(this.dataset.id);});
-  });
-  document.getElementById('qcount').textContent='QUEUE ['+tasks.length+']';
-  var np=tasks.filter(function(t){return t.status==='passed';}).length;
-  var ne=tasks.filter(function(t){return t.status==='escalated';}).length;
-  var sum=np+'/'+tasks.length+' PASSED';
-  if(ne) sum+=' | '+ne+' ESC';
-  document.getElementById('qsum').textContent=sum;
-}
-
-function selectTask(id){
-  selTask=id;
-  if(!lastState) return;
-  var t=lastState.tasks.find(function(x){return x.id===id;});
-  if(t) renderDetail(t,lastState);
-}
-
-function renderDetail(t,s){
-  var isRun=(s.current_task===t.id&&s.runner_status==='running');
-  document.getElementById('dsht').textContent='SELECTED: '+t.id;
-  var h='';
-  h+='<div class="dl">P.MD</div>';
-  h+='<div class="dv">'+esc(t.p_text.length>240?t.p_text.substring(0,240)+'\u2026':t.p_text)+'</div>';
-  h+='<div class="dl">Q.MD</div>';
-  h+='<div class="dv">'+esc(t.q_text.length>170?t.q_text.substring(0,170)+'\u2026':t.q_text)+'</div>';
-  h+='<div class="da">';
-  h+='<button class="db" onclick="editFile(\''+t.id+'\',\'p\')">[EDIT P]</button>';
-  h+='<button class="db" onclick="editFile(\''+t.id+'\',\'q\')">[EDIT Q]</button>';
-  if(!isRun){
-    h+='<button class="db dbr" onclick="doRetry(\''+t.id+'\')">[RETRY]</button>';
-    if(t.status!=='passed')
-      h+='<button class="db dbp" onclick="doPass(\''+t.id+'\')">[FLAG:PASS]</button>';
-  }
-  h+='</div>';
-  var v=t.last_verdict;
-  if(v&&v.status){
-    var vc=(v.status==='passed')?'vp':(v.escalation_reason?'ve':'vf');
-    h+='<div class="vb">';
-    h+='<span class="vk">VERDICT: </span><span class="'+vc+'">'+v.status.toUpperCase()+'</span>';
-    if(v.confidence!==undefined) h+=' <span class="vk">conf=</span><span class="vv">'+parseFloat(v.confidence).toFixed(2)+'</span>';
-    if(v.agent_model) h+=' <span class="vk">model=</span><span class="vv">'+esc(v.agent_model.split('/').pop())+'</span>';
-    if(v.elapsed_s)   h+=' <span class="vk">t=</span><span class="vv">'+fmtT(v.elapsed_s)+'</span>';
-    if(v.issues&&v.issues.length) v.issues.forEach(function(i){h+='<span class="vi">&#8627; '+esc(i)+'</span>';});
-    if(v.feedback) h+='<span class="vfb">feedback: '+esc(v.feedback)+'</span>';
-    if(v.escalation_reason) h+='<span class="vesc">esc: '+esc(v.escalation_reason)+'</span>';
-    h+='</div>';
-  }
-  document.getElementById('det').innerHTML=h;
-}
-
-function renderFooter(s){
-  document.getElementById('fagent').textContent='agent: '+(s.current_model||'—');
-  document.getElementById('fjudge').textContent='judge: '+(s.judge||'—');
-  document.getElementById('felapsed').textContent=
-    (s.runner_status==='running'&&s.elapsed)?'elapsed: '+fmtT(s.elapsed):'elapsed: —';
-}
-
-function doStart(){
-  fetch('/api/start',{method:'POST'}).then(function(){
-    document.getElementById('cbody').innerHTML='';
-    lineCount=0;
-    document.getElementById('flines').textContent='lines: 0';
-    connectSSE();
-    pollState();
-  });
-}
-function doStop(){fetch('/api/stop',{method:'POST'}).then(pollState);}
-
-function doRetry(id){
-  if(!confirm('Reset "'+id+'" to open (attempts=0)?')) return;
-  fetch('/api/task/'+id+'/retry',{method:'POST'}).then(pollState);
-}
-function doPass(id){
-  if(!confirm('Mark "'+id+'" as PASSED?')) return;
-  fetch('/api/task/'+id+'/pass',{method:'POST'}).then(pollState);
-}
-
-function editFile(id,type){
-  modalUrl='/api/task/'+id+'/'+type;
-  document.getElementById('mttl').textContent='EDIT '+type.toUpperCase()+'.MD \u2014 '+id;
-  fetch('/api/task/'+id+'/'+type).then(function(r){return r.json();}).then(function(d){
-    document.getElementById('mta').value=d.content||'';
-    document.getElementById('modal').classList.add('open');
-    setTimeout(function(){document.getElementById('mta').focus();},40);
-  });
-}
-function closeModal(){document.getElementById('modal').classList.remove('open');}
-function saveModal(){
-  var c=document.getElementById('mta').value;
-  fetch(modalUrl,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({content:c})})
-    .then(function(){closeModal();pollState();});
-}
-
-document.addEventListener('keydown',function(e){if(e.key==='Escape')closeModal();});
-
-// only one poll (state, 2s) + one persistent SSE connection for console
-setInterval(pollState, 2000);
-pollState();
-connectSSE();
-</script>
-</body>
-</html>"""
-
-# ── entry point ───────────────────────────────────────────────────────────────
+# entry point
 
 if __name__ == "__main__":
     if not os.path.exists(HARNESS_DIR):
@@ -1031,8 +688,8 @@ if __name__ == "__main__":
     print("PQ_MINDER web")
     print("  workspace : " + WORKSPACE)
     print("  harness   : " + HARNESS_DIR)
-    print("  judge     : " + JUDGE_MODEL)
-    print("  agent     : " + DEFAULT_AGENT_MODEL)
+    print("  judge     : " + WEB_DEFAULT_JUDGE_PROVIDER + " (web default)")
+    print("  agent     : " + AGENT_MODEL)
     print("")
     print("  http://localhost:" + str(PORT))
     print("  http://" + local_ip + ":" + str(PORT))

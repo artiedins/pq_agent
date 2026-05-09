@@ -3,11 +3,16 @@
 import os
 import sys
 import json
-import time
-import random
 import shutil
-import anthropic
 from datetime import datetime
+
+# llm_client lives next to this script; sys.path is configured below so we
+# can import it whether pq_shopping is run from its own directory or another.
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+if _SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPT_DIR)
+
+from llm_client import call_llm
 
 # Code style:
 # - No type hinting
@@ -20,11 +25,17 @@ from datetime import datetime
 # - Yes strategic inline comments enhancing rapid code comprehension by real humans
 # - Yes if __name__ == "__main__": main()
 
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
-if not ANTHROPIC_API_KEY:
-    sys.exit("Error: ANTHROPIC_API_KEY not set")
 
-MODEL = "claude-sonnet-4-6"
+# Setup-time provider options. ds4_flash is excluded because it's the agent
+# model and we want a stronger model designing the research workflow.
+SETUP_PROVIDER_OPTIONS = [
+    {"key": "anthropic", "label": "Claude Opus 4.7"},
+    {"key": "qwen", "label": "Qwen3.6-Plus"},
+    {"key": "glm", "label": "GLM-5.1"},
+    {"key": "ds4_pro", "label": "DeepSeek V4 Pro"},
+]
+DEFAULT_SETUP_PROVIDER = "anthropic"
+
 DEFAULT_LOCATION = "Gardena, CA, USA"
 DEFAULT_PRICE_SENSITIVITY = 8
 
@@ -39,6 +50,27 @@ def ask(prompt, default=None):
     if not val and default is not None:
         return str(default)
     return val
+
+
+def ask_provider():
+    # show numbered list and accept either the number or the key as input
+    print("\nWhich model should design the research tasks?")
+    for i, opt in enumerate(SETUP_PROVIDER_OPTIONS, 1):
+        marker = " (default)" if opt["key"] == DEFAULT_SETUP_PROVIDER else ""
+        print("  " + str(i) + ") " + opt["label"] + " [" + opt["key"] + "]" + marker)
+    raw = ask("Choice", DEFAULT_SETUP_PROVIDER)
+    raw = raw.strip().lower()
+    # numeric index
+    if raw.isdigit():
+        idx = int(raw) - 1
+        if 0 <= idx < len(SETUP_PROVIDER_OPTIONS):
+            return SETUP_PROVIDER_OPTIONS[idx]["key"]
+    # key match
+    for opt in SETUP_PROVIDER_OPTIONS:
+        if raw == opt["key"]:
+            return opt["key"]
+    print("  (unrecognized choice, using default " + DEFAULT_SETUP_PROVIDER + ")")
+    return DEFAULT_SETUP_PROVIDER
 
 
 def price_description(n):
@@ -58,10 +90,10 @@ def build_meta_prompt(what, location, sensitivity):
     parts = [
         "You are designing a multi-step autonomous consumer research workflow.\n\n",
         "## System Overview\n\n",
-        "The workflow uses a task queue where an AI agent (Gemini Flash Lite) executes each task\n",
-        "using browser and file tools, then a judge (Claude Sonnet) evaluates the output against\n",
-        "a rubric. Tasks run in order. Files written to the workspace persist between tasks -\n",
-        "this is the mechanism by which later tasks build on earlier ones.\n\n",
+        "The workflow uses a task queue where an AI agent (DeepSeek V4 Flash with reasoning) executes\n",
+        "each task using browser and file tools, then a judge model evaluates the output against a\n",
+        "rubric. Tasks run in order. Files written to the workspace persist between tasks - this is\n",
+        "the mechanism by which later tasks build on earlier ones.\n\n",
         "The agent has these tools:\n",
         "- playwright_navigate(url): navigate browser to a URL, returns page title\n",
         "- playwright_extract_content(selector?): extract current page as clean markdown;\n",
@@ -157,7 +189,7 @@ def build_meta_prompt(what, location, sensitivity):
         "  the judge, not a final report - it must include source URLs and named products\n",
         "- For the final task: specify the report structure from the section above\n",
         "- Write as instructions to a capable but literal AI assistant\n\n",
-        "q.md requirements (Claude Sonnet reads this to judge the agent's work):\n",
+        "q.md requirements (the judge reads this to evaluate the agent's work):\n",
         "- Use only concrete, checkable criteria\n",
         "- For tasks 1-2: the judge reads task_report/report.md to verify; criteria must be\n",
         "  checkable from that document alone (product names present, URLs cited, files confirmed)\n",
@@ -186,79 +218,31 @@ def build_meta_prompt(what, location, sensitivity):
     return "".join(parts)
 
 
-def call_anthropic_with_retry(client, **kwargs):
-    for attempt in range(9):
-        if attempt > 0:
-            p = attempt - 1
-            delay = random.uniform(2**p, 2 ** (p + 1))
-            print("  [retry " + str(attempt) + "/8] waiting " + "{:.1f}".format(delay) + "s...")
-            time.sleep(delay)
-        try:
-            return client.messages.create(**kwargs)
-        except anthropic.RateLimitError:
-            if attempt < 8:
-                print("  [error] 429 rate limit, retrying...")
-                continue
-            raise
-        except anthropic.APIConnectionError as e:
-            if attempt < 8:
-                print("  [error] connection error, retrying: " + str(e))
-                continue
-            raise
-        except anthropic.APIStatusError as e:
-            if e.status_code >= 500 and attempt < 8:
-                print("  [error] " + str(e.status_code) + " server error, retrying...")
-                continue
-            raise
-    raise RuntimeError("call_anthropic_with_retry: exhausted retries")
-
-
-def generate_tasks(what, location, sensitivity):
-    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+def generate_tasks(what, location, sensitivity, provider):
     prompt = build_meta_prompt(what, location, sensitivity)
 
-    # Updated print statement
-    print("\nGenerating research tasks...")
+    print("\nGenerating research tasks via " + provider + "...")
 
-    # Removed the 'thinking' parameter entirely.
-    # This forces Claude to skip the reasoning scratchpad and jump straight to the output.
-    response = call_anthropic_with_retry(
-        client,
-        model=MODEL,
-        max_tokens=8000,
-        messages=[{"role": "user", "content": prompt}],
-    )
+    # call_llm handles retries, rate limits, and provider-specific quirks.
+    # Returns a string; we strip any markdown fences before json.loads.
+    text = call_llm(prompt, provider=provider).strip()
 
-    text = ""
-    thinking_chars = 0
-    for block in response.content:
-        if block.type == "text":
-            text += block.text
-        elif block.type == "thinking":
-            thinking_chars = len(block.thinking)
-
-    if thinking_chars:
-        print("  (extended thinking: " + str(thinking_chars) + " chars)")
-
-    print("  input_tokens=" + str(response.usage.input_tokens) + " output_tokens=" + str(response.usage.output_tokens))
-
-    # Safety check: Catch if the API forcibly cut off the generation
-    if getattr(response, "stop_reason", None) == "max_tokens":
-        print("  WARNING: Hit max_tokens limit! Output is likely truncated.")
-
-    text = text.strip()
-
-    # Strip markdown code blocks more robustly (handles ```json and ```)
     if text.startswith("```"):
-        text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+        # robust fence stripping: drop first line and last fence line
+        lines = text.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines.pop(0)
+        if lines and lines[-1].startswith("```"):
+            lines.pop(-1)
+        text = "\n".join(lines).strip()
 
     try:
         data = json.loads(text)
     except json.JSONDecodeError as e:
-        sys.exit("Error: Claude returned invalid JSON: " + str(e) + "\nRaw response begins:\n" + text[:400])
+        sys.exit("Error: model returned invalid JSON: " + str(e) + "\nRaw response begins:\n" + text[:400])
 
     if "tasks" not in data or not data["tasks"]:
-        sys.exit("Error: Claude returned no tasks in JSON")
+        sys.exit("Error: model returned no tasks in JSON")
     for i, task in enumerate(data["tasks"]):
         for key in ("id", "p", "q"):
             if key not in task or not str(task[key]).strip():
@@ -339,12 +323,15 @@ def main():
         sensitivity = DEFAULT_PRICE_SENSITIVITY
         print("  (invalid input, using default " + str(DEFAULT_PRICE_SENSITIVITY) + ")")
 
+    provider = ask_provider()
+
     print("")
     print("What        : " + what)
     print("Location    : " + location)
     print("Sensitivity : " + str(sensitivity) + "/10 (" + price_description(sensitivity) + ")")
+    print("Designer    : " + provider)
 
-    data = generate_tasks(what, location, sensitivity)
+    data = generate_tasks(what, location, sensitivity, provider)
 
     task_ids = write_pq_structure(data, workspace_dir)
 
@@ -357,6 +344,9 @@ def main():
     print("")
     print("To run the research queue:")
     print("  python3 " + minder_path)
+    print("")
+    print("Or with the web UI:")
+    print("  python3 " + os.path.join(script_dir, "pq_web.py"))
     print("")
     print("Final report will appear in task_report/report.md after the last task passes.")
 
