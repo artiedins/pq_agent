@@ -130,6 +130,22 @@ def post_with_retry(payload):
             if body_preview:
                 print("  body: " + body_preview)
         resp.raise_for_status()
+        # Validate the body parses as JSON before declaring success. OpenRouter
+        # occasionally returns 200 OK with truncated or SSE-style bodies (we've
+        # seen this most often immediately after compaction, when payloads peak).
+        # Treat parse failures like transient 429/503s and retry rather than
+        # letting .json() crash the run at the call site. ValueError covers both
+        # json.JSONDecodeError and requests.exceptions.JSONDecodeError.
+        try:
+            resp.json()
+        except ValueError as e:
+            if attempt < 8:
+                body_preview = resp.text[:200].replace("\n", " ").strip()
+                print(ts() + "  [error] response body not valid JSON, retrying (attempt " + str(attempt + 1) + "/8): " + str(e))
+                if body_preview:
+                    print("  body: " + body_preview)
+                continue
+            raise
         break
     return resp
 
@@ -174,7 +190,10 @@ def extract_compaction_summary(raw_msg):
 
 
 def chat(messages, tools, new_messages, state, session_messages):
-    MAX_CONTEXT_LENGTH = 130000
+    # 150K is a conservative cap. V4 Pro nominally supports 1M but long-context
+    # quality degrades well before that, and compaction itself is a fragile
+    # operation - bigger headroom = fewer compaction events = fewer crashes.
+    MAX_CONTEXT_LENGTH = 150000
 
     new_prompt_tokens = filter_msgs_and_est_tokens(new_messages)
     new_prompt_tokens = int(round(0.2221 * (new_prompt_tokens**1.1866)))
