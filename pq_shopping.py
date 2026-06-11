@@ -29,7 +29,7 @@ from llm_client import call_llm
 # Setup-time provider options. ds4_flash is excluded because it's the agent
 # model and we want a stronger model designing the research workflow.
 SETUP_PROVIDER_OPTIONS = [
-    {"key": "anthropic", "label": "Claude Opus 4.7"},
+    {"key": "anthropic", "label": "Claude Opus 4.8"},
     {"key": "qwen", "label": "Qwen3.6-Plus"},
     {"key": "glm", "label": "GLM-5.1"},
     {"key": "ds4_pro", "label": "DeepSeek V4 Pro"},

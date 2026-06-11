@@ -30,8 +30,8 @@ MAX_RETRIES = 8
 # - temperature/top_p/top_k return 400 if set to non-default values.
 # - effort controls token spend. "medium" is the right tradeoff for synthesis
 #   tasks: enough deliberation to think hard, not so much that it over-elaborates.
-ANTHROPIC_MODEL = "claude-opus-4-7"
-ANTHROPIC_MAX_TOKENS = 8000
+ANTHROPIC_MODEL = "claude-opus-4-8"
+ANTHROPIC_MAX_TOKENS = 8192 * 2
 ANTHROPIC_EFFORT = "medium"
 
 
@@ -51,7 +51,7 @@ QWEN_BASE_URL = os.environ.get(
     "HRV_QWEN_BASE_URL",
     "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
 )
-QWEN_MAX_TOKENS = 8000
+QWEN_MAX_TOKENS = 32000
 QWEN_ENABLE_THINKING = True
 
 
@@ -59,7 +59,7 @@ QWEN_ENABLE_THINKING = True
 # transport: OpenAI-compatible API at openrouter.ai with the unified
 # "reasoning" param riding in extra_body. Differences are just the model slug.
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-OPENROUTER_MAX_TOKENS = 8000
+OPENROUTER_MAX_TOKENS = 32000
 OPENROUTER_REASONING_ENABLED = True
 OPENROUTER_APP_URL = os.environ.get("HRV_OPENROUTER_APP_URL", "")
 OPENROUTER_APP_TITLE = os.environ.get("HRV_OPENROUTER_APP_TITLE", "llm-client")

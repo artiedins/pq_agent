@@ -98,10 +98,10 @@ JUDGE_PROVIDER_OPTIONS = [
     {"key": "kimi", "label": "Kimi K2.6"},
 ]
 
-DEFAULT_JUDGE_PROVIDER = "anthropic"
+DEFAULT_JUDGE_PROVIDER = "kimi"
 
 # Agent model is fixed in agent.py; recorded in verdict.json for the audit trail.
-AGENT_MODEL = "deepseek/deepseek-v4-pro:exacto"
+AGENT_MODEL = "deepseek/deepseek-v4-flash:exacto"
 
 VALID_JUDGE_PROVIDERS = tuple(o["key"] for o in JUDGE_PROVIDER_OPTIONS)
 

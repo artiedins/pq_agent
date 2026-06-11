@@ -9,6 +9,7 @@ import time
 import random
 import tiktoken
 import re
+import urllib.parse
 
 # Code style:
 # - No type hinting
@@ -21,22 +22,54 @@ import re
 # - Yes strategic inline comments enhancing rapid code comprehension by real humans
 # - Yes if __name__ == "__main__": main()
 
-# Model is hardcoded: deepseek/deepseek-v4-pro via OpenRouter with reasoning at
-# effort=high. Pro is preferred over Flash for long agent loops with chained
-# tool calls and code work; the per-task cost differential is pennies and the
-# Terminal-Bench/SimpleQA gaps are real. Judge model selection happens elsewhere
-# (pq_minder/pq_web) and does not affect this script.
+# Harness is targeted at flash/mimo class models (cheap, fast, weaker at exotic
+# formats and long-horizon discipline). Design choices that follow from that:
+# - search_web is a single tool (encode + navigate + extract) so the model never
+#   hand-builds DDG URLs
+# - str_replace exists alongside hashline edit_file because small models are
+#   trained heavily on search/replace style edits
+# - soft tool-call budget with injected wrap-up notices, since cheap models are
+#   bad at time estimation
+# - reasoning effort is high at plan and wrap-up, medium in the middle
 #
 # DeepSeek V4 thinking-mode REQUIRES the prior assistant turn's reasoning state
 # (reasoning_details, reasoning, or reasoning_content) to be passed back when
 # that turn included a tool_call - omitting it causes a 400 from the upstream
 # DeepSeek provider through OpenRouter. We rely on appending the assistant
 # message dict from the response verbatim into the conversation, which carries
-# all returned fields through to the next request.
+# all returned fields through to the next request. This append-verbatim rule is
+# harmless for providers that don't need it, so it stays regardless of MODEL.
 
-MODEL = "deepseek/deepseek-v4-pro:exacto"
+MODEL = "deepseek/deepseek-v4-flash:exacto"
+# MODEL = "xiaomi/mimo-v2.5"
+# MODEL = "deepseek/deepseek-v4-pro:exacto"
+# MODEL = "tencent/hy3-preview:exacto"
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-REASONING_EFFORT = "high"  # OpenRouter shape for V4 family: "high" or "xhigh" (xhigh needs 384K min context). Set to None to disable.
+
+# Reasoning sandwich: spend thinking where it pays. High effort on the first
+# turn (planning) and again once the wrap-up threshold is crossed (verification
+# and report writing); medium for the mechanical middle turns. Set any of these
+# to None to disable the reasoning param for that phase.
+REASONING_EFFORT_PLAN = "high"
+REASONING_EFFORT_WORK = "medium"
+REASONING_EFFORT_WRAPUP = "high"
+REASONING_EFFORT_COMPACTION = "high"
+
+# Soft tool-call budget. The model is told the budget in the system prompt and
+# gets injected notices as it approaches and exceeds it. There is no hard stop;
+# pq_minder's wall clock remains the only hard limit.
+MAX_STEPS_SUGGESTION = 80
+WRAPUP_WARN_AT = 60
+
+# Playwright page extracts are the only tool results we truncate; everything
+# else enters the conversation untouched. End-truncation is intentional here:
+# page content front-loads the useful part.
+MAX_PLAYWRIGHT_RESULT_TOKENS = 9000
+
+# If the model ends its turn without having written task_report/report.md we
+# nudge it instead of exiting, up to this many times, so a forgetful final turn
+# doesn't burn an entire pq_minder attempt.
+MAX_REPORT_RESCUES = 2
 
 AGENT_DIR = os.environ.get("AGENT_DIR", os.path.dirname(os.path.abspath(__file__)))
 WORKSPACE = os.path.abspath(os.getcwd())
@@ -58,51 +91,29 @@ def ts():
     return time.strftime("[%H:%M:%S] ")
 
 
-def shorten_content_with_notice(m):
-    m = m[:-2000]
-    m += "\n**USER AGENT HARNESS NOTICE:** This content has been trimmed due to excessive length. Please use this if you can, otherwise find another way to achieve your goal.\n"
-    return m
+def truncate_playwright_text(text):
+    # single-pass end truncation with one notice appended, replacing the old
+    # iterative trim loop that could stack garbled notices on top of each other
+    toks = _enc.encode(text)
+    if len(toks) <= MAX_PLAYWRIGHT_RESULT_TOKENS:
+        return text
+    head = _enc.decode(toks[:MAX_PLAYWRIGHT_RESULT_TOKENS])
+    return head + "\n**USER AGENT HARNESS NOTICE:** This content has been trimmed due to excessive length. Please use this if you can, otherwise find another way to achieve your goal.\n"
 
 
-def filter_msgs_and_est_tokens(messages):
+def est_messages_tokens(messages):
+    # pure estimator - never mutates messages. Used only to decide when to
+    # compact; real token counts from the API overwrite the estimate each turn.
     tokens = 3  # reply priming overhead
-
-    MAX_MSG_TOKENS = 9000
-
-    for i, msg in enumerate(messages):
+    for msg in messages:
         tokens += 3  # per-message framing
-
-        shorten_loops = 0
-        msg_tokens = MAX_MSG_TOKENS + 100
-        while msg_tokens > MAX_MSG_TOKENS:
-            shorten_loops += 1
-            msg_tokens = 0
-            for key, val in msg.items():
-                if val is None:
-                    continue
-                if isinstance(val, str):
-                    msg_tokens += len(_enc.encode(val))
-                else:
-                    msg_tokens += len(_enc.encode(json.dumps(val)))
-
-            if msg_tokens > MAX_MSG_TOKENS:
-                if "content" in msg and isinstance(msg["content"], str) and len(msg["content"]) > 15000 and shorten_loops < 30000:
-                    messages[i]["content"] = shorten_content_with_notice(msg["content"])
-                else:
-                    for key, val in msg.items():
-                        if val is None:
-                            continue
-                        if isinstance(val, str):
-                            print("AAAA", key, len(val), len(_enc.encode(val)))
-                        else:
-                            print("BBBB", key, len(json.dumps(val)), len(_enc.encode(json.dumps(val))))
-                    raise Exception("fix this")
-
-        if shorten_loops > 1:
-            print(ts() + "SHORTENED:", len(messages[i]["content"]), re.sub(r"\s+", " ", messages[i]["content"][:180]), flush=True)
-
-        tokens += msg_tokens
-
+        for key, val in msg.items():
+            if val is None:
+                continue
+            if isinstance(val, str):
+                tokens += len(_enc.encode(val))
+            else:
+                tokens += len(_enc.encode(json.dumps(val)))
     return tokens
 
 
@@ -119,7 +130,8 @@ def post_with_retry(payload):
                 print(ts() + "  [error] request timed out, retrying (attempt " + str(attempt + 1) + "/8)...")
                 continue
             raise
-        if resp.status_code in (429, 503) and attempt < 8:
+        # retry all 5xx, not just 503 - OpenRouter throws 502/520/524 regularly
+        if (resp.status_code == 429 or resp.status_code >= 500) and attempt < 8:
             print(ts() + "  [error] " + str(resp.status_code) + " transient error, retrying (attempt " + str(attempt + 1) + "/8)...")
             continue
         if not resp.ok:
@@ -189,13 +201,13 @@ def extract_compaction_summary(raw_msg):
     return summary or None
 
 
-def chat(messages, tools, new_messages, state, session_messages):
-    # 150K is a conservative cap. V4 Pro nominally supports 1M but long-context
-    # quality degrades well before that, and compaction itself is a fragile
-    # operation - bigger headroom = fewer compaction events = fewer crashes.
+def chat(messages, tools, new_messages, state, session_messages, effort):
+    # 150K is a conservative cap. Long-context quality degrades well before
+    # nominal limits, and compaction itself is a fragile operation - bigger
+    # headroom = fewer compaction events = fewer crashes.
     MAX_CONTEXT_LENGTH = 150000
 
-    new_prompt_tokens = filter_msgs_and_est_tokens(new_messages)
+    new_prompt_tokens = est_messages_tokens(new_messages)
     new_prompt_tokens = int(round(0.2221 * (new_prompt_tokens**1.1866)))
     pre_prompt_total_context = state["last_post_tokens"] + new_prompt_tokens
 
@@ -219,8 +231,8 @@ def chat(messages, tools, new_messages, state, session_messages):
             "max_tokens": 8000,
             "messages": messages + new_messages + [{"role": "user", "content": compaction_prompt}],
         }
-        if REASONING_EFFORT:
-            compaction_payload["reasoning"] = {"effort": REASONING_EFFORT}
+        if REASONING_EFFORT_COMPACTION:
+            compaction_payload["reasoning"] = {"effort": REASONING_EFFORT_COMPACTION}
         new_messages.clear()
 
         resp_json = post_compaction(compaction_payload).json()
@@ -239,10 +251,14 @@ def chat(messages, tools, new_messages, state, session_messages):
         if not summary:
             raise Exception("compaction returned no usable summary")
 
+        # enforce the clip promised in the compaction prompt
+        toks = _enc.encode(summary)
+        if len(toks) > 9000:
+            summary = _enc.decode(toks[:9000]) + "\n[summary clipped at 9000 tokens]"
+
         summary_msg = {"role": "user", "content": "[context compacted] Session summary:\n" + summary}
 
         new_session = list(session_messages) + [summary_msg]
-        filter_msgs_and_est_tokens(new_session)
         messages.clear()
         messages += new_session
 
@@ -261,8 +277,8 @@ def chat(messages, tools, new_messages, state, session_messages):
         "max_tokens": 8000,
         "messages": messages,
     }
-    if REASONING_EFFORT:
-        payload["reasoning"] = {"effort": REASONING_EFFORT}
+    if effort:
+        payload["reasoning"] = {"effort": effort}
 
     data = post_with_retry(payload).json()
 
@@ -355,6 +371,26 @@ def restart_mcp(mcp):
     _mcp_handshake(mcp)
 
 
+def call_playwright(mcp, name, arguments):
+    # shared retry/restart wrapper for all playwright-backed tools; returns
+    # the extracted text already truncated to the playwright result cap
+    for attempt in range(9):
+        if attempt > 0:
+            delay = random.uniform(2 ** (attempt - 1), 2**attempt)
+            print(ts() + "  [mcp retry " + str(attempt) + "/8] waiting " + "{:.1f}".format(delay) + "s then restarting mcp...")
+            time.sleep(delay)
+            restart_mcp(mcp)
+        try:
+            result = mcp_call(mcp, "tools/call", {"name": name, "arguments": arguments})
+            text = "\n".join(b["text"] for b in result.get("content", []) if b.get("type") == "text")
+            return truncate_playwright_text(text)
+        except TimeoutError as e:
+            if attempt == 8:
+                raise
+            ctx = arguments.get("url", name)
+            print(ts() + "  [mcp timeout] attempt " + str(attempt + 1) + "/9 on " + ctx[:80] + ": " + str(e))
+
+
 # hashline helpers
 
 
@@ -364,6 +400,14 @@ def line_hash(line):
 
 def render_hashlines(lines):
     return "\n".join(str(i) + ":" + line_hash(l) + "|" + l.rstrip() for i, l in enumerate(lines, 1))
+
+
+def render_hashline_region(lines, center, radius=5):
+    # fresh anchors for a window around a failed anchor, so the model can
+    # self-correct without spending a turn on a full read_file
+    lo = max(1, center - radius)
+    hi = min(len(lines), center + radius)
+    return "\n".join(str(i) + ":" + line_hash(lines[i - 1]) + "|" + lines[i - 1].rstrip() for i in range(lo, hi + 1))
 
 
 def parse_anchor(anchor):
@@ -421,6 +465,29 @@ def tool_read_file(filename):
     return render_hashlines(lines)
 
 
+def tool_str_replace(filename, old_str, new_str):
+    target = safe_path(filename)
+    if not os.path.exists(target):
+        return "Error: file not found: " + filename + " - use write_file to create it first"
+    with open(target, "r", encoding="utf-8") as f:
+        content = f.read()
+
+    count = content.count(old_str)
+    if count == 0:
+        return "Error: old_str not found in " + filename + ". Match must be exact including whitespace and indentation. Use read_file to see the current content."
+    if count > 1:
+        return "Error: old_str appears " + str(count) + " times in " + filename + " - include more surrounding lines so it matches exactly once."
+
+    new_content = content.replace(old_str, new_str, 1)
+    with open(target, "w", encoding="utf-8") as f:
+        f.write(new_content)
+
+    rel = os.path.relpath(target, WORKSPACE)
+    n_lines = len(new_content.splitlines())
+    print(ts() + "  [tool call] str_replace: " + rel + " (file now " + str(n_lines) + " lines)")
+    return "Replaced 1 occurrence in " + rel + ". File now has " + str(n_lines) + " lines."
+
+
 def tool_edit_file(filename, start_anchor, end_anchor, new_text):
     target = safe_path(filename)
     if not os.path.exists(target):
@@ -436,13 +503,23 @@ def tool_edit_file(filename, start_anchor, end_anchor, new_text):
     if end_line < start_line or end_line > len(lines):
         return "Error: end_anchor line " + str(end_line) + " out of range"
 
+    # on hash mismatch, return fresh anchors for the region so the model can
+    # retry immediately instead of burning a turn on read_file
     actual_start = line_hash(lines[start_line - 1])
     if actual_start != start_hash:
-        return "Error: start_anchor hash mismatch at line " + str(start_line) + ": expected " + start_hash + ", got " + actual_start + " - re-read the file first"
+        return (
+            "Error: start_anchor hash mismatch at line " + str(start_line) + ": expected " + start_hash + ", got " + actual_start + ". "
+            "Current content near line " + str(start_line) + " with fresh anchors:\n" + render_hashline_region(lines, start_line) + "\n"
+            "Retry using these anchors, or use str_replace instead."
+        )
 
     actual_end = line_hash(lines[end_line - 1])
     if actual_end != end_hash:
-        return "Error: end_anchor hash mismatch at line " + str(end_line) + ": expected " + end_hash + ", got " + actual_end + " - re-read the file first"
+        return (
+            "Error: end_anchor hash mismatch at line " + str(end_line) + ": expected " + end_hash + ", got " + actual_end + ". "
+            "Current content near line " + str(end_line) + " with fresh anchors:\n" + render_hashline_region(lines, end_line) + "\n"
+            "Retry using these anchors, or use str_replace instead."
+        )
 
     new_lines = new_text.splitlines()
     lines[start_line - 1 : end_line] = new_lines
@@ -455,6 +532,11 @@ def tool_edit_file(filename, start_anchor, end_anchor, new_text):
 
 
 def tool_run_command(command):
+    # scrub the API key from the child environment; commands the model runs
+    # have no legitimate need for it. note this is best-effort (same-user
+    # processes can still read /proc), but it stops accidental leaks via env
+    # dumps in debug output that would then flow back into the conversation.
+    child_env = {k: v for k, v in os.environ.items() if k != "OPENROUTER_API_KEY"}
     try:
         result = subprocess.run(
             command,
@@ -463,49 +545,60 @@ def tool_run_command(command):
             capture_output=True,
             text=True,
             timeout=30,
+            env=child_env,
         )
         output = result.stdout + result.stderr
-    except subprocess.TimeoutExpired:
+    except subprocess.TimeoutExpired as e:
+        # TimeoutExpired carries whatever output was captured before the kill;
+        # a stuck command's partial output is exactly what the model needs to
+        # diagnose it, so return it instead of discarding it
+        partial = ""
+        for s in (e.stdout, e.stderr):
+            if s:
+                partial += s.decode("utf-8", "replace") if isinstance(s, bytes) else s
         print(ts() + "  [tool call] run_command: TIMED OUT | " + command[:80])
-        return "[error: command timed out after 30s]"
+        return partial + "\n[error: command timed out after 30s; any partial output is shown above]"
     nonempty = [l for l in output.strip().splitlines() if l.strip()]
     preview = (" | " + nonempty[0][:100]) if nonempty else ""
     print(ts() + "  [tool call] run_command: exit " + str(result.returncode) + " | " + command[:60] + preview)
     return output + "\n[exit code: " + str(result.returncode) + "]"
 
 
+def tool_search_web(mcp, query):
+    # one tool = one search: encode the query, navigate DDG plain HTML, extract
+    # markdown. Collapsing the navigate+extract dance into a single call removes
+    # the URL-encoding and sequencing failure modes that trip up small models.
+    url = "https://html.duckduckgo.com/html/?q=" + urllib.parse.quote_plus(query)
+    call_playwright(mcp, "playwright_navigate", {"url": url})
+    text = call_playwright(mcp, "playwright_extract_content", {})
+    print(ts() + "[tool call] search_web: " + query[:80] + " | " + str(len(text)) + " chars")
+    return text
+
+
 # tool dispatcher
 
 
 def dispatch_tool(mcp, name, arguments):
-    # playwright tools: print one combined log line AFTER the MCP call returns
-    # (suppresses the pre-call announce in main() via the _PLAYWRIGHT_TOOLS check)
-    if name in ("playwright_navigate", "playwright_extract_content"):
-        for attempt in range(9):
-            if attempt > 0:
-                delay = random.uniform(2 ** (attempt - 1), 2**attempt)
-                print(ts() + "  [mcp retry " + str(attempt) + "/8] waiting " + "{:.1f}".format(delay) + "s then restarting mcp...")
-                time.sleep(delay)
-                restart_mcp(mcp)
-            try:
-                result = mcp_call(mcp, "tools/call", {"name": name, "arguments": arguments})
-                text = "\n".join(b["text"] for b in result.get("content", []) if b.get("type") == "text")
-                if name == "playwright_navigate":
-                    print(ts() + "[tool call] playwright_navigate: " + arguments.get("url", "")[:120])
-                else:
-                    preview = text[:200].replace("\n", " ").strip()
-                    print(ts() + "[tool call] playwright_extract_content: " + str(len(text)) + " chars | " + preview[:100])
-                return text
-            except TimeoutError as e:
-                if attempt == 8:
-                    raise
-                ctx = arguments.get("url", name)
-                print(ts() + "  [mcp timeout] attempt " + str(attempt + 1) + "/9 on " + ctx[:80] + ": " + str(e))
+    if name == "search_web":
+        return tool_search_web(mcp, arguments["query"])
+
+    if name == "playwright_navigate":
+        text = call_playwright(mcp, name, arguments)
+        print(ts() + "[tool call] playwright_navigate: " + arguments.get("url", "")[:120])
+        return text
+
+    if name == "playwright_extract_content":
+        text = call_playwright(mcp, name, arguments)
+        preview = text[:200].replace("\n", " ").strip()
+        print(ts() + "[tool call] playwright_extract_content: " + str(len(text)) + " chars | " + preview[:100])
+        return text
 
     if name == "write_file":
         return tool_write_file(arguments["filename"], arguments["content"])
     if name == "read_file":
         return tool_read_file(arguments["filename"])
+    if name == "str_replace":
+        return tool_str_replace(arguments["filename"], arguments["old_str"], arguments["new_str"])
     if name == "edit_file":
         return tool_edit_file(
             arguments["filename"],
@@ -550,8 +643,20 @@ def make_tools():
         {
             "type": "function",
             "function": {
+                "name": "search_web",
+                "description": "Search the web and get results back as markdown. Provide a plain text query e.g. 'python csv parsing example'. Use this for ALL web searches - do not build search URLs yourself.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"query": {"type": "string", "description": "Plain text search query"}},
+                    "required": ["query"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
                 "name": "playwright_navigate",
-                "description": "Navigate the browser to a URL and return the page title. Use DDG plain HTML (https://html.duckduckgo.com/html/?q=...) for searches.",
+                "description": "Navigate the browser to a specific URL and return the page title. Use this for visiting known URLs (e.g. links found in search results). For searches use the search_web tool instead.",
                 "parameters": {
                     "type": "object",
                     "properties": {"url": {"type": "string"}},
@@ -580,7 +685,7 @@ def make_tools():
             "type": "function",
             "function": {
                 "name": "write_file",
-                "description": "Create or overwrite a file with the given content. Use a relative path e.g. 'solution.py'. You MUST use this tool to create files - do not write file content in your reply.",
+                "description": "Create or overwrite a file with the given content. Use a relative path e.g. 'solution.py'. You MUST use this tool to create files - do not write file content in your reply. For files under about 200 lines, rewriting the whole file with write_file is often the most reliable way to make changes.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -595,7 +700,7 @@ def make_tools():
             "type": "function",
             "function": {
                 "name": "read_file",
-                "description": "Read a file. Returns each line prefixed with a hashline anchor in the format LINENUM:HASH|content e.g. '3:a4|some text here'. You MUST call read_file before calling edit_file to get valid anchors.",
+                "description": "Read a file. Returns each line prefixed with a hashline anchor in the format LINENUM:HASH|content e.g. '3:a4|some text here'. You MUST call read_file before editing a file with str_replace or edit_file.",
                 "parameters": {
                     "type": "object",
                     "properties": {"filename": {"type": "string"}},
@@ -606,8 +711,24 @@ def make_tools():
         {
             "type": "function",
             "function": {
+                "name": "str_replace",
+                "description": "Edit a file by replacing one exact occurrence of old_str with new_str. old_str must match the file content exactly (including whitespace and indentation, WITHOUT the LINENUM:HASH| prefixes from read_file) and must appear exactly once - include enough surrounding lines to make it unique. This is the simplest way to make a small targeted edit.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "filename": {"type": "string"},
+                        "old_str": {"type": "string", "description": "Exact text to replace, must appear exactly once in the file"},
+                        "new_str": {"type": "string", "description": "Replacement text"},
+                    },
+                    "required": ["filename", "old_str", "new_str"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
                 "name": "edit_file",
-                "description": "Edit a file using hashline anchors from a previous read_file call. Replaces the lines from start_anchor to end_anchor (inclusive) with new_text. Returns the updated file with new anchors. You MUST use this tool to edit files.",
+                "description": "Edit a file by line range using hashline anchors from a previous read_file call. Replaces the lines from start_anchor to end_anchor (inclusive) with new_text. Returns the updated file with new anchors. Use this for replacing larger line ranges; for small targeted edits str_replace is usually easier.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -638,21 +759,31 @@ def make_tools():
 
 
 def make_system_prompt():
-    # three concerns: tool rules, output constraints, and finishing protocol
+    # four concerns: tool rules, work budget, verification, and finishing protocol
     return (
         "You are an autonomous agent with browser, shell, and file tools.\n\n"
         "Tool rules:\n"
         "1. Always use tools for file operations and commands - never output file contents in your reply.\n"
-        "2. Always call read_file before edit_file to get current line anchors.\n"
-        "3. Anchors are LINENUM:HASH strings - copy them exactly from read_file output.\n"
-        "4. For web searches use DuckDuckGo plain HTML: https://html.duckduckgo.com/html/?q=<query>\n\n"
+        "2. To edit a file: call read_file first, then use str_replace for small targeted changes, "
+        "edit_file for replacing a range of lines, or write_file to rewrite the whole file. "
+        "For files under about 200 lines a full write_file rewrite is often the most reliable edit.\n"
+        "3. edit_file anchors are LINENUM:HASH strings - copy them exactly from read_file output.\n"
+        "4. For web searches use the search_web tool with a plain text query.\n\n"
+        "Work budget:\n"
+        "Aim to finish within about " + str(MAX_STEPS_SUGGESTION) + " tool calls. This is a soft target, "
+        "not a hard cutoff - if you find yourself over budget, prioritize finishing and reporting over polish. "
+        "You will receive a notice when you should start wrapping up.\n\n"
+        "Verification:\n"
+        "Before writing your report, verify your work by actually running it: execute your code, re-read final files, "
+        "re-check computed values. Include the real observed output in your report. "
+        "A report that claims success without demonstrated verification is incomplete.\n\n"
         "When the task is complete, use write_file to create task_report/report.md containing:\n"
         "1. A step-by-step summary of what you did.\n"
         "2. Key decisions and why you made them.\n"
         "3. Anything you are uncertain about.\n"
-        "4. Your assessment of whether the task succeeded.\n"
+        "4. Your assessment of whether the task succeeded, including the verification evidence you observed.\n"
         "5. You may create or copy images (.jpg or .png, and no larger than 1200 pixels please) to task_report/ if the task requires those for evaluation.\n"
-        "5. Markdown or images in task_report/ are only for evaluation and will be deleted after your work is evaluated.\n"
+        "6. Markdown or images in task_report/ are only for evaluation and will be deleted after your work is evaluated.\n"
         "After writing task_report/report.md, reply with one short sentence confirming completion.\n"
     )
 
@@ -693,22 +824,48 @@ def main():
 
     print(ts() + "Starting agent loop...\n")
 
+    tool_calls_done = 0
+    warned_wrapup = False
+    warned_over = False
+    report_rescues = 0
+
     while True:
-        response = chat(messages, tools, new_messages, state, session_messages)
+        # reasoning sandwich: high at plan (first turn) and wrap-up, medium between
+        if tool_calls_done == 0:
+            effort = REASONING_EFFORT_PLAN
+        elif tool_calls_done >= WRAPUP_WARN_AT:
+            effort = REASONING_EFFORT_WRAPUP
+        else:
+            effort = REASONING_EFFORT_WORK
+
+        response = chat(messages, tools, new_messages, state, session_messages, effort)
         choice = response["choices"][0]
         msg = choice["message"]
         finish = choice["finish_reason"]
         # CRITICAL: msg may include reasoning_details / reasoning / reasoning_content fields
-        # when V4 thinking mode is on. Appending the dict verbatim preserves them so they
+        # when thinking mode is on. Appending the dict verbatim preserves them so they
         # round-trip on the next request. Do NOT strip these fields - DeepSeek 400s if a
         # prior tool-call turn's reasoning state is missing on the follow-up.
         new_messages.append(msg)
 
-        if finish == "tool_calls":
-            for tc in msg["tool_calls"]:
+        # branch on the presence of tool_calls rather than finish_reason: some
+        # providers report tool calls under finish_reason "stop", and a "length"
+        # finish can still carry complete earlier tool calls
+        tool_calls = msg.get("tool_calls") or []
+
+        if tool_calls:
+            for tc in tool_calls:
                 fn_name = tc["function"]["name"]
-                fn_args = json.loads(tc["function"]["arguments"])
-                tool_result = dispatch_tool(mcp, fn_name, fn_args)
+                # malformed tool-call JSON is a normal failure mode for cheap
+                # models - return it as a tool error so the model self-corrects
+                # instead of crashing the whole run
+                try:
+                    fn_args = json.loads(tc["function"]["arguments"])
+                except (ValueError, TypeError) as e:
+                    print(ts() + "  [tool call] " + fn_name + ": MALFORMED ARGUMENTS")
+                    tool_result = "Error: tool call arguments were not valid JSON (" + str(e) + "). Re-issue the call with corrected, complete JSON arguments."
+                else:
+                    tool_result = dispatch_tool(mcp, fn_name, fn_args)
                 new_messages.append(
                     {
                         "role": "tool",
@@ -716,9 +873,61 @@ def main():
                         "content": tool_result,
                     }
                 )
-        else:
-            print(ts() + "\n[done] " + str(msg["content"]))
-            break
+                tool_calls_done += 1
+
+            # soft budget notices, each injected at most once
+            if not warned_wrapup and tool_calls_done >= WRAPUP_WARN_AT:
+                warned_wrapup = True
+                new_messages.append(
+                    {
+                        "role": "user",
+                        "content": "[harness notice] You have used "
+                        + str(tool_calls_done)
+                        + " of a suggested "
+                        + str(MAX_STEPS_SUGGESTION)
+                        + " tool calls. Start wrapping up: verify what you have built and write task_report/report.md soon.",
+                    }
+                )
+            if not warned_over and tool_calls_done >= MAX_STEPS_SUGGESTION:
+                warned_over = True
+                new_messages.append(
+                    {
+                        "role": "user",
+                        "content": "[harness notice] You have exceeded the suggested budget of "
+                        + str(MAX_STEPS_SUGGESTION)
+                        + " tool calls. Finish now: verify what you have, write task_report/report.md, and reply with your completion confirmation.",
+                    }
+                )
+            continue
+
+        if finish == "length":
+            # reply was cut off by max_tokens mid-thought (or mid-tool-call);
+            # treating it as "done" would end the run on a half-finished task
+            print(ts() + "  [warn] reply truncated at max_tokens, nudging model to continue")
+            new_messages.append(
+                {
+                    "role": "user",
+                    "content": "[harness notice] Your previous reply was cut off by the output token limit. Continue from where you left off. If you were issuing a tool call, re-issue it completely. Keep replies shorter.",
+                }
+            )
+            continue
+
+        # model produced a final text reply - make sure the report actually exists
+        # before accepting it, otherwise this whole attempt is wasted
+        report_path = os.path.join(WORKSPACE, "task_report", "report.md")
+        if not os.path.exists(report_path) and report_rescues < MAX_REPORT_RESCUES:
+            report_rescues += 1
+            print(ts() + "  [warn] model stopped without task_report/report.md - rescue " + str(report_rescues) + "/" + str(MAX_REPORT_RESCUES))
+            new_messages.append(
+                {
+                    "role": "user",
+                    "content": "[harness notice] You ended your turn but task_report/report.md does not exist. Use write_file to create task_report/report.md now (summary, key decisions, uncertainties, success assessment with verification evidence), then reply with one short confirmation sentence.",
+                }
+            )
+            continue
+
+        print(ts() + "\n[done] " + str(msg["content"]))
+        break
 
     mcp["proc"].stdin.close()
     mcp["proc"].terminate()
