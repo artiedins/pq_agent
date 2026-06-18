@@ -17,9 +17,10 @@ import sys
 
 # Edit this list to match the filenames produced by the model under test.
 # Paths are relative to the current working directory.
+
+
 REVIEW_FILES = [
     "descent.py",
-    "run_descent.py",
     "test_descent.py",
     "task_report/report.md",
     "task_report/stats.yaml",

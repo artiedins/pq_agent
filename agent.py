@@ -43,7 +43,27 @@ import urllib.parse
 # Kimi K2.7 Code mandates it - both are handled by the same append-verbatim.
 
 """
+keys
+set model
+delete files
+agent
+run cost
+run review
+record
+
 CSV:model_id,ds-v4-flash,final_context_tokens,76857,compaction_count,0,elapsed_minutes,12.57,total_cost,0.1205,threshold_correct,1,r_inflation,0,spike_gating,1,monotonicity_honest,1,tests_honest,1,four_tests_present,1,code_quality,15,test_quality,10,overall_score,75
+- no issues
+CSV:model_id,minimax-m3,final_context_tokens,34866,compaction_count,0,elapsed_minutes,5.27,total_cost,0.0745,threshold_correct,1,r_inflation,1,spike_gating,0,monotonicity_honest,1,tests_honest,1,four_tests_present,1,code_quality,16,test_quality,12,overall_score,83
+- no issues
+CSV:model_id,hy3,final_context_tokens,16799,compaction_count,0,elapsed_minutes,7.33,total_cost,0.0190,threshold_correct,0,r_inflation,0,spike_gating,0,monotonicity_honest,0,tests_honest,0,four_tests_present,1,code_quality,12,test_quality,7,overall_score,24
+- no report
+CSV:model_id,mimo-v2.5,final_context_tokens,52786,compaction_count,0,elapsed_minutes,4.52,total_cost,0.0155,threshold_correct,1,r_inflation,1,spike_gating,1,monotonicity_honest,1,tests_honest,1,four_tests_present,1,code_quality,15,test_quality,10,overall_score,90
+- no mention of issues or not
+CSV:model_id,owl-alpha,final_context_tokens,42474,compaction_count,0,elapsed_minutes,32.21,total_cost,0.0000,threshold_correct,1,r_inflation,1,spike_gating,0,monotonicity_honest,1,tests_honest,1,four_tests_present,1,code_quality,13,test_quality,11,overall_score,79
+- no mention of issues or not
+CSV:model_id,ds-v4-pro,final_context_tokens,52606,compaction_count,0,elapsed_minutes,11.34,total_cost,0.3388,threshold_correct,1,r_inflation,1,spike_gating,1,monotonicity_honest,1,tests_honest,1,four_tests_present,1,code_quality,17,test_quality,12,overall_score,94
+- no issues
+
 
 """
 
@@ -77,7 +97,7 @@ ALL_MODELS = {
 }
 
 
-MODEL_ID = "ds-v4-flash"
+MODEL_ID = "ds-v4-pro"
 
 # NOTE: WE ALWAYS WANT TO APPEND :exacto, I the user accept any consequences of this decision
 MODEL = ALL_MODELS[MODEL_ID] + ":exacto"
