@@ -30,7 +30,7 @@ MAX_RETRIES = 8
 # - temperature/top_p/top_k return 400 if set to non-default values.
 # - effort controls token spend. "medium" is the right tradeoff for synthesis
 #   tasks: enough deliberation to think hard, not so much that it over-elaborates.
-ANTHROPIC_MODEL = "claude-opus-4-8"
+ANTHROPIC_MODEL = "claude-opus-4-6"
 ANTHROPIC_MAX_TOKENS = 8192 * 2
 ANTHROPIC_EFFORT = "medium"
 

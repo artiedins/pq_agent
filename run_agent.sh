@@ -2,7 +2,9 @@
 
 # run_agent.sh - launch agent.py inside a bubblewrap sandbox
 #
-# usage: bash run_agent.sh <project_dir>
+# usage: bash run_agent.sh [project_dir]
+#
+# if project_dir is omitted, the current working directory is used.
 #
 # the agent code lives here (read-only inside sandbox at /agent)
 # the project dir is where the agent reads and writes (read-write at /workspace)
@@ -16,13 +18,17 @@
 
 set -euo pipefail
 
-if [ $# -ne 1 ]; then
-    echo "usage: bash run_agent.sh <project_dir>" >&2
+AGENT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+if [ $# -eq 0 ]; then
+    PROJECT_DIR="$(pwd)"
+elif [ $# -eq 1 ]; then
+    PROJECT_DIR="$(cd "$1" && pwd)"
+else
+    echo "usage: bash run_agent.sh [project_dir]" >&2
+    echo "  if project_dir is omitted, the current working directory is used." >&2
     exit 1
 fi
-
-AGENT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_DIR="$(cd "$1" && pwd)"
 
 : "${OPENROUTER_API_KEY:?OPENROUTER_API_KEY must be set in the environment}"
 

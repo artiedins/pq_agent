@@ -39,12 +39,95 @@ import urllib.parse
 # message dict from the response verbatim into the conversation, which carries
 # all returned fields through to the next request. This append-verbatim rule is
 # harmless for providers that don't need it, so it stays regardless of MODEL.
+# MiniMax M2.x/M3 "highly recommend preserving reasoning between turns" and
+# Kimi K2.7 Code mandates it - both are handled by the same append-verbatim.
 
-MODEL = "deepseek/deepseek-v4-flash:exacto"
-# MODEL = "xiaomi/mimo-v2.5"
-# MODEL = "deepseek/deepseek-v4-pro:exacto"
-# MODEL = "tencent/hy3-preview:exacto"
+"""
+CSV:model_id,ds-v4-flash,final_context_tokens,76857,compaction_count,0,elapsed_minutes,12.57,total_cost,0.1205,threshold_correct,1,r_inflation,0,spike_gating,1,monotonicity_honest,1,tests_honest,1,four_tests_present,1,code_quality,15,test_quality,10,overall_score,75
+
+"""
+
+ALL_MODELS = {
+    "ds-v4-flash": "deepseek/deepseek-v4-flash",
+    "minimax-m3": "minimax/minimax-m3",
+    "hy3": "tencent/hy3-preview",
+    "mimo-v2.5": "xiaomi/mimo-v2.5",
+    "owl-alpha": "openrouter/owl-alpha",
+    "ds-v4-pro": "deepseek/deepseek-v4-pro",
+    "ds-v3.2": "deepseek/deepseek-v3.2",
+    "glm-5.1": "z-ai/glm-5.1",
+    "nemotron-3-ultra": "nvidia/nemotron-3-ultra-550b-a55b",
+    "step-3.7-flash": "stepfun/step-3.7-flash",
+    "nex-n2-pro": "nex-agi/nex-n2-pro",
+    "laguna-m1": "poolside/laguna-m.1",
+    "mimo-v2.5-pro": "xiaomi/mimo-v2.5-pro",
+    "kimi-k2.6": "moonshotai/kimi-k2.6",
+    "gpt-oss-120b": "openai/gpt-oss-120b",
+    "nemotron-3-super": "nvidia/nemotron-3-super-120b-a12b",
+    "gemma-4-26b": "google/gemma-4-26b-a4b-it",
+    "glm-5.2": "z-ai/glm-5.2",
+    "gemma-4-31b": "google/gemma-4-31b-it",
+    "minimax-m2.7": "minimax/minimax-m2.7",
+    "qwen3-235b": "qwen/qwen3-235b-a22b-2507",
+    "qwen3.6-35b": "qwen/qwen3.6-35b-a3b",
+    "qwen3.6-27b": "qwen/qwen3.6-27b",
+    "north-mini-code": "cohere/north-mini-code",
+    "kimi-k2.7-code": "moonshotai/kimi-k2.7-code",
+    "qwen3.5-397b": "qwen/qwen3.5-397b-a17b",
+}
+
+
+MODEL_ID = "ds-v4-flash"
+
+# NOTE: WE ALWAYS WANT TO APPEND :exacto, I the user accept any consequences of this decision
+MODEL = ALL_MODELS[MODEL_ID] + ":exacto"
+
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+
+# Per-model tuning for best results through OpenRouter's unified API.
+# Models not listed here use defaults: effort-based reasoning sandwich, 8000
+# max_tokens. Key findings from provider docs and OpenRouter model pages:
+#
+# reasoning_mode controls how the reasoning param is constructed per-call:
+#   "effort"     (default) - send reasoning.effort = high/medium/etc
+#   "always_on"  - model always thinks; omit reasoning param entirely so
+#                  the provider doesn't reject or misinterpret it
+#   "disabled"   - send reasoning.enabled = false; model works best without
+#                  thinking in agentic tool-calling loops
+#
+# Kimi K2.7 Code: always-on thinking that cannot be disabled. Kimi's docs
+# mandate max_tokens >= 16000 so reasoning_content + content aren't truncated.
+# The model also requires preserving reasoning_content across all turns, which
+# the append-verbatim pattern already provides.
+#
+# MiMo V2.x: Xiaomi's integration guidance explicitly says "turn off reasoning
+# mode for the best and fastest performance" when using agentic tools.
+#
+# DeepSeek V4: supports reasoning.effort "high" and "xhigh" (xhigh maps to
+# max reasoning). The default effort sandwich works well here.
+#
+# MiniMax M3/M2.x: supports reasoning via OpenRouter's unified API. MiniMax
+# "highly recommends preserving reasoning between turns" - already handled.
+#
+# Gemma 4 (26b, 31b): configurable reasoning/thinking mode via OpenRouter.
+# Standard effort sandwich works. 256K context, fine with 150K compaction.
+#
+# All other models use OpenRouter's normalized reasoning.effort and work fine
+# with the default effort sandwich.
+
+MODEL_OVERRIDES = {
+    # Kimi: always-on thinking, higher max_tokens mandatory
+    "kimi-k2.7-code": {"max_tokens": 16000, "reasoning_mode": "always_on"},
+    "kimi-k2.6": {"max_tokens": 16000},
+    # MiMo: reasoning off for agentic tool-calling per Xiaomi guidance
+    "mimo-v2.5": {"reasoning_mode": "disabled"},
+    "mimo-v2.5-pro": {"reasoning_mode": "disabled"},
+}
+
+
+def _mcfg(key, default=None):
+    return MODEL_OVERRIDES.get(MODEL_ID, {}).get(key, default)
+
 
 # Reasoning sandwich: spend thinking where it pays. High effort on the first
 # turn (planning) and again once the wrap-up threshold is crossed (verification
@@ -201,6 +284,23 @@ def extract_compaction_summary(raw_msg):
     return summary or None
 
 
+def build_reasoning_param(effort):
+    # construct the reasoning dict for the payload based on per-model config.
+    # returns None when no reasoning param should be sent.
+    rmode = _mcfg("reasoning_mode", "effort")
+    if rmode == "always_on":
+        # model always thinks internally; sending effort is unnecessary and
+        # some providers reject it. omit the param entirely.
+        return None
+    if rmode == "disabled":
+        # model performs best without thinking in agentic loops
+        return {"enabled": False}
+    # default "effort" mode
+    if effort:
+        return {"effort": effort}
+    return None
+
+
 def chat(messages, tools, new_messages, state, session_messages, effort):
     # 150K is a conservative cap. Long-context quality degrades well before
     # nominal limits, and compaction itself is a fragile operation - bigger
@@ -213,6 +313,7 @@ def chat(messages, tools, new_messages, state, session_messages, effort):
 
     if pre_prompt_total_context > MAX_CONTEXT_LENGTH:
         print(ts() + "PERFORM COMPACTION", flush=True)
+        state["compaction_count"] += 1
         compaction_prompt = (
             "The agent context limit was reached and this session is being compacted. "
             "The conversation above is the full committed session history. "
@@ -226,13 +327,15 @@ def chat(messages, tools, new_messages, state, session_messages, effort):
             "Be terse. If this summary exceeds 9000 tokens it will be clipped.\n"
             "Minimize thinking and output summary content.\n"
         )
+        max_tok = _mcfg("max_tokens", 8000)
         compaction_payload = {
             "model": MODEL,
-            "max_tokens": 8000,
+            "max_tokens": max_tok,
             "messages": messages + new_messages + [{"role": "user", "content": compaction_prompt}],
         }
-        if REASONING_EFFORT_COMPACTION:
-            compaction_payload["reasoning"] = {"effort": REASONING_EFFORT_COMPACTION}
+        rparam = build_reasoning_param(REASONING_EFFORT_COMPACTION)
+        if rparam:
+            compaction_payload["reasoning"] = rparam
         new_messages.clear()
 
         resp_json = post_compaction(compaction_payload).json()
@@ -270,15 +373,17 @@ def chat(messages, tools, new_messages, state, session_messages, effort):
     messages += new_messages
     new_messages.clear()
 
+    max_tok = _mcfg("max_tokens", 8000)
     payload = {
         "model": MODEL,
         "tools": tools,
         "tool_choice": "auto",
-        "max_tokens": 8000,
+        "max_tokens": max_tok,
         "messages": messages,
     }
-    if effort:
-        payload["reasoning"] = {"effort": effort}
+    rparam = build_reasoning_param(effort)
+    if rparam:
+        payload["reasoning"] = rparam
 
     data = post_with_retry(payload).json()
 
@@ -781,15 +886,34 @@ def make_system_prompt():
         "1. A step-by-step summary of what you did.\n"
         "2. Key decisions and why you made them.\n"
         "3. Anything you are uncertain about.\n"
-        "4. Your assessment of whether the task succeeded, including the verification evidence you observed.\n"
-        "5. You may create or copy images (.jpg or .png, and no larger than 1200 pixels please) to task_report/ if the task requires those for evaluation.\n"
-        "6. Markdown or images in task_report/ are only for evaluation and will be deleted after your work is evaluated.\n"
+        "4. Anything about the environment or tool calling that you seemed to unnecessarily struggle with.\n"
+        "5. Your assessment of whether the task succeeded, including the verification evidence you observed.\n"
+        "6. You may create or copy images (.jpg or .png, and no larger than 1200 pixels please) to task_report/ if the task requires those for evaluation.\n"
+        "7. Markdown or images in task_report/ are only for evaluation and will be deleted after your work is evaluated.\n"
         "After writing task_report/report.md, reply with one short sentence confirming completion.\n"
     )
 
 
+def write_stats(state, start_time):
+    elapsed_minutes = (time.time() - start_time) / 60.0
+    stats_dir = os.path.join(WORKSPACE, "task_report")
+    os.makedirs(stats_dir, exist_ok=True)
+    stats_path = os.path.join(stats_dir, "stats.yaml")
+    with open(stats_path, "w", encoding="utf-8") as f:
+        f.write("model_id: " + MODEL_ID + "\n")
+        f.write("final_context_tokens: " + str(state["last_post_tokens"]) + "\n")
+        f.write("compaction_count: " + str(state["compaction_count"]) + "\n")
+        f.write("elapsed_minutes: " + "{:.2f}".format(elapsed_minutes) + "\n")
+    print(ts() + "Stats written to task_report/stats.yaml")
+
+
 def main():
+    start_time = time.time()
+
     print(ts() + "Agent model: " + MODEL, flush=True)
+    rmode = _mcfg("reasoning_mode", "effort")
+    if rmode != "effort":
+        print(ts() + "Reasoning mode: " + rmode, flush=True)
 
     tools = make_tools()
 
@@ -808,7 +932,7 @@ def main():
     if snapshot:
         initial_content += "\n\n" + snapshot
 
-    state = {"last_post_tokens": 949}
+    state = {"last_post_tokens": 949, "compaction_count": 0}
 
     session_messages = [
         {"role": "system", "content": system_prompt},
@@ -845,7 +969,8 @@ def main():
         # CRITICAL: msg may include reasoning_details / reasoning / reasoning_content fields
         # when thinking mode is on. Appending the dict verbatim preserves them so they
         # round-trip on the next request. Do NOT strip these fields - DeepSeek 400s if a
-        # prior tool-call turn's reasoning state is missing on the follow-up.
+        # prior tool-call turn's reasoning state is missing on the follow-up. MiniMax and
+        # Kimi K2.7 Code also require preserved reasoning across turns.
         new_messages.append(msg)
 
         # branch on the presence of tool_calls rather than finish_reason: some
@@ -928,6 +1053,9 @@ def main():
 
         print(ts() + "\n[done] " + str(msg["content"]))
         break
+
+    # write stats before cleanup, always, even if the agent didn't write a report
+    write_stats(state, start_time)
 
     mcp["proc"].stdin.close()
     mcp["proc"].terminate()

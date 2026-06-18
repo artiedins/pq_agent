@@ -12,6 +12,8 @@ def get_language_tag(filename):
         return "python"
     elif ext == ".sh":
         return "bash"
+    elif ext == ".md":
+        return "markdown"
     return "text"
 
 
@@ -47,21 +49,8 @@ def create_markdown_context(files):
 
 if __name__ == "__main__":
     # The specific files requested
-    target_files = ["agent.py", "run_agent.sh", "pq_minder.py", "llm_client.py"]
+    target_files = ["agent.py", "run_agent.sh"]
 
     markdown_output = create_markdown_context(target_files)
 
-    # Print to stdout so it can be easily copied or piped
     print(markdown_output)
-
-    print("""# OUR TASK
-
-## review harness best practice
-
-search the internet for help
-
-## suggest changes to agent.py to make it more effective
-
-harness should be targeted for deepseek v4 flash or xiaomi mimo v2.5 type of intelligence / cost level of models
-
-""")
