@@ -32,7 +32,7 @@ ALL_MODELS = {
 }
 
 
-MODEL_ID = "minimax-m3"
+MODEL_ID = "ds-v4-flash"
 
 # NOTE: WE ALWAYS WANT TO APPEND :exacto, I the user accept any consequences of this decision
 MODEL = ALL_MODELS[MODEL_ID] + ":exacto"
