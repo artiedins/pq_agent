@@ -3,7 +3,9 @@ import sys
 import json
 import zlib
 import select
+import signal
 import subprocess
+import tempfile
 import requests
 import time
 import random
@@ -42,62 +44,21 @@ import urllib.parse
 # MiniMax M2.x/M3 "highly recommend preserving reasoning between turns" and
 # Kimi K2.7 Code mandates it - both are handled by the same append-verbatim.
 
-"""
-keys
-set model
-delete files
-agent
-run cost
-run review
-record
-
-CSV:model_id,ds-v4-flash,final_context_tokens,76857,compaction_count,0,elapsed_minutes,12.57,total_cost,0.1205,threshold_correct,1,r_inflation,0,spike_gating,1,monotonicity_honest,1,tests_honest,1,four_tests_present,1,code_quality,15,test_quality,10,overall_score,75
-- no issues
-CSV:model_id,minimax-m3,final_context_tokens,34866,compaction_count,0,elapsed_minutes,5.27,total_cost,0.0745,threshold_correct,1,r_inflation,1,spike_gating,0,monotonicity_honest,1,tests_honest,1,four_tests_present,1,code_quality,16,test_quality,12,overall_score,83
-- no issues
-CSV:model_id,hy3,final_context_tokens,16799,compaction_count,0,elapsed_minutes,7.33,total_cost,0.0190,threshold_correct,0,r_inflation,0,spike_gating,0,monotonicity_honest,0,tests_honest,0,four_tests_present,1,code_quality,12,test_quality,7,overall_score,24
-- no report
-CSV:model_id,mimo-v2.5,final_context_tokens,52786,compaction_count,0,elapsed_minutes,4.52,total_cost,0.0155,threshold_correct,1,r_inflation,1,spike_gating,1,monotonicity_honest,1,tests_honest,1,four_tests_present,1,code_quality,15,test_quality,10,overall_score,90
-- no mention of issues or not
-CSV:model_id,owl-alpha,final_context_tokens,42474,compaction_count,0,elapsed_minutes,32.21,total_cost,0.0000,threshold_correct,1,r_inflation,1,spike_gating,0,monotonicity_honest,1,tests_honest,1,four_tests_present,1,code_quality,13,test_quality,11,overall_score,79
-- no mention of issues or not
-CSV:model_id,ds-v4-pro,final_context_tokens,52606,compaction_count,0,elapsed_minutes,11.34,total_cost,0.3388,threshold_correct,1,r_inflation,1,spike_gating,1,monotonicity_honest,1,tests_honest,1,four_tests_present,1,code_quality,17,test_quality,12,overall_score,94
-- no issues
-
-
-"""
 
 ALL_MODELS = {
-    "ds-v4-flash": "deepseek/deepseek-v4-flash",
-    "minimax-m3": "minimax/minimax-m3",
-    "hy3": "tencent/hy3-preview",
-    "mimo-v2.5": "xiaomi/mimo-v2.5",
-    "owl-alpha": "openrouter/owl-alpha",
     "ds-v4-pro": "deepseek/deepseek-v4-pro",
-    "ds-v3.2": "deepseek/deepseek-v3.2",
-    "glm-5.1": "z-ai/glm-5.1",
-    "nemotron-3-ultra": "nvidia/nemotron-3-ultra-550b-a55b",
-    "step-3.7-flash": "stepfun/step-3.7-flash",
-    "nex-n2-pro": "nex-agi/nex-n2-pro",
-    "laguna-m1": "poolside/laguna-m.1",
-    "mimo-v2.5-pro": "xiaomi/mimo-v2.5-pro",
-    "kimi-k2.6": "moonshotai/kimi-k2.6",
-    "gpt-oss-120b": "openai/gpt-oss-120b",
-    "nemotron-3-super": "nvidia/nemotron-3-super-120b-a12b",
-    "gemma-4-26b": "google/gemma-4-26b-a4b-it",
-    "glm-5.2": "z-ai/glm-5.2",
-    "gemma-4-31b": "google/gemma-4-31b-it",
-    "minimax-m2.7": "minimax/minimax-m2.7",
-    "qwen3-235b": "qwen/qwen3-235b-a22b-2507",
-    "qwen3.6-35b": "qwen/qwen3.6-35b-a3b",
-    "qwen3.6-27b": "qwen/qwen3.6-27b",
-    "north-mini-code": "cohere/north-mini-code",
     "kimi-k2.7-code": "moonshotai/kimi-k2.7-code",
-    "qwen3.5-397b": "qwen/qwen3.5-397b-a17b",
+    "glm-5.1": "z-ai/glm-5.1",
+    "gemma-4-31b": "google/gemma-4-31b-it",
+    "minimax-m3": "minimax/minimax-m3",
+    "kimi-k2.6": "moonshotai/kimi-k2.6",
+    "step-3.7-flash": "stepfun/step-3.7-flash",
+    "ds-v4-flash": "deepseek/deepseek-v4-flash",
 }
 
 
-MODEL_ID = "ds-v4-pro"
+MODEL_ID = "ds-v4-flash"
+
 
 # NOTE: WE ALWAYS WANT TO APPEND :exacto, I the user accept any consequences of this decision
 MODEL = ALL_MODELS[MODEL_ID] + ":exacto"
@@ -172,7 +133,13 @@ MAX_PLAYWRIGHT_RESULT_TOKENS = 9000
 # If the model ends its turn without having written task_report/report.md we
 # nudge it instead of exiting, up to this many times, so a forgetful final turn
 # doesn't burn an entire pq_minder attempt.
-MAX_REPORT_RESCUES = 2
+MAX_REPORT_RESCUES = 3
+
+# Adaptive output boost: on first truncation, max_tokens is doubled up to this
+# cap. At DS V4 Flash rates ($0.18/M output), 32000 reserves ~$0.006 per
+# request through OpenRouter - negligible. For truly large files the
+# decomposition nudge kicks in on the second truncation.
+MAX_OUTPUT_BOOST = 32000
 
 AGENT_DIR = os.environ.get("AGENT_DIR", os.path.dirname(os.path.abspath(__file__)))
 WORKSPACE = os.path.abspath(os.getcwd())
@@ -233,6 +200,13 @@ def post_with_retry(payload):
                 print(ts() + "  [error] request timed out, retrying (attempt " + str(attempt + 1) + "/8)...")
                 continue
             raise
+        except requests.exceptions.ConnectionError as e:
+            # covers ChunkedEncodingError, broken pipes, reset connections.
+            # these are transient network faults, not OpenRouter account errors.
+            if attempt < 8:
+                print(ts() + "  [error] connection error, retrying (attempt " + str(attempt + 1) + "/8): " + str(e)[:120])
+                continue
+            raise
         # retry all 5xx, not just 503 - OpenRouter throws 502/520/524 regularly
         if (resp.status_code == 429 or resp.status_code >= 500) and attempt < 8:
             print(ts() + "  [error] " + str(resp.status_code) + " transient error, retrying (attempt " + str(attempt + 1) + "/8)...")
@@ -252,7 +226,7 @@ def post_with_retry(payload):
         # letting .json() crash the run at the call site. ValueError covers both
         # json.JSONDecodeError and requests.exceptions.JSONDecodeError.
         try:
-            resp.json()
+            data = resp.json()
         except ValueError as e:
             if attempt < 8:
                 body_preview = resp.text[:200].replace("\n", " ").strip()
@@ -261,6 +235,24 @@ def post_with_retry(payload):
                     print("  body: " + body_preview)
                 continue
             raise
+        # OpenRouter can return 200 OK with an error body instead of choices.
+        # This happens on provider-side failures, content moderation, and
+        # transient upstream errors. Permanent errors (auth, billing) arrive
+        # with non-200 status and are caught by raise_for_status above.
+        if "choices" not in data and "error" in data:
+            err = data["error"]
+            code = err.get("code", 0)
+            msg = err.get("message", "unknown error")
+            # 4xx-class errors from the error body are permanent (bad request,
+            # auth, billing) - surface them immediately so the user sees the
+            # raw OpenRouter message. Provider errors (5xx) and content filter
+            # issues after generation are retryable.
+            if isinstance(code, int) and 400 <= code < 500 and code != 429:
+                raise RuntimeError("OpenRouter error " + str(code) + ": " + msg)
+            if attempt < 8:
+                print(ts() + "  [error] response has error instead of choices (code=" + str(code) + "), retrying (attempt " + str(attempt + 1) + "/8): " + msg[:120])
+                continue
+            raise RuntimeError("OpenRouter error after retries: " + str(code) + ": " + msg)
         break
     return resp
 
@@ -347,7 +339,7 @@ def chat(messages, tools, new_messages, state, session_messages, effort):
             "Be terse. If this summary exceeds 9000 tokens it will be clipped.\n"
             "Minimize thinking and output summary content.\n"
         )
-        max_tok = _mcfg("max_tokens", 8000)
+        max_tok = _mcfg("max_tokens", 16000)
         compaction_payload = {
             "model": MODEL,
             "max_tokens": max_tok,
@@ -393,7 +385,7 @@ def chat(messages, tools, new_messages, state, session_messages, effort):
     messages += new_messages
     new_messages.clear()
 
-    max_tok = _mcfg("max_tokens", 8000)
+    max_tok = state.get("max_tokens_override") or _mcfg("max_tokens", 16000)
     payload = {
         "model": MODEL,
         "tools": tools,
@@ -662,31 +654,54 @@ def tool_run_command(command):
     # processes can still read /proc), but it stops accidental leaks via env
     # dumps in debug output that would then flow back into the conversation.
     child_env = {k: v for k, v in os.environ.items() if k != "OPENROUTER_API_KEY"}
+    # file-backed output instead of pipes. pipes block on close, so a
+    # backgrounded child ("python3 -m http.server &") keeps communicate()
+    # stuck for the full timeout even though the shell exited instantly.
+    # with temp files, wait() returns as soon as the shell exits and we read
+    # whatever was written. backgrounded children keep writing to the
+    # (unlinked) temp file harmlessly.
+    #
+    # start_new_session gives the shell its own process group so killpg on
+    # timeout reaps backgrounded children that would otherwise accumulate.
+    # on normal exit the group is left alone - the model may need the server.
+    out_f = tempfile.TemporaryFile()
+    err_f = tempfile.TemporaryFile()
+    proc = subprocess.Popen(
+        command,
+        shell=True,
+        cwd=WORKSPACE,
+        stdout=out_f,
+        stderr=err_f,
+        env=child_env,
+        start_new_session=True,
+    )
     try:
-        result = subprocess.run(
-            command,
-            shell=True,
-            cwd=WORKSPACE,
-            capture_output=True,
-            text=True,
-            timeout=30,
-            env=child_env,
-        )
-        output = result.stdout + result.stderr
-    except subprocess.TimeoutExpired as e:
-        # TimeoutExpired carries whatever output was captured before the kill;
-        # a stuck command's partial output is exactly what the model needs to
-        # diagnose it, so return it instead of discarding it
-        partial = ""
-        for s in (e.stdout, e.stderr):
-            if s:
-                partial += s.decode("utf-8", "replace") if isinstance(s, bytes) else s
+        proc.wait(timeout=30)
+    except subprocess.TimeoutExpired:
+        # kill the entire process group - this reaps backgrounded children
+        # that would otherwise survive the shell's death and accumulate
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        proc.kill()
+        proc.wait()
+        out_f.seek(0)
+        err_f.seek(0)
+        partial = out_f.read().decode("utf-8", "replace") + err_f.read().decode("utf-8", "replace")
+        out_f.close()
+        err_f.close()
         print(ts() + "  [tool call] run_command: TIMED OUT | " + command[:80])
         return partial + "\n[error: command timed out after 30s; any partial output is shown above]"
+    out_f.seek(0)
+    err_f.seek(0)
+    output = out_f.read().decode("utf-8", "replace") + err_f.read().decode("utf-8", "replace")
+    out_f.close()
+    err_f.close()
     nonempty = [l for l in output.strip().splitlines() if l.strip()]
     preview = (" | " + nonempty[0][:100]) if nonempty else ""
-    print(ts() + "  [tool call] run_command: exit " + str(result.returncode) + " | " + command[:60] + preview)
-    return output + "\n[exit code: " + str(result.returncode) + "]"
+    print(ts() + "  [tool call] run_command: exit " + str(proc.returncode) + " | " + command[:60] + preview)
+    return output + "\n[exit code: " + str(proc.returncode) + "]"
 
 
 def tool_search_web(mcp, query):
@@ -810,7 +825,7 @@ def make_tools():
             "type": "function",
             "function": {
                 "name": "write_file",
-                "description": "Create or overwrite a file with the given content. Use a relative path e.g. 'solution.py'. You MUST use this tool to create files - do not write file content in your reply. For files under about 200 lines, rewriting the whole file with write_file is often the most reliable way to make changes.",
+                "description": "Create or overwrite a file with the given content. Use a relative path e.g. 'solution.py'. You MUST use this tool to create new files - do not write file content in your reply. Also the best choice when rewriting most or all of a file (under about 200 lines) since you avoid anchor/match complexity.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -837,7 +852,7 @@ def make_tools():
             "type": "function",
             "function": {
                 "name": "str_replace",
-                "description": "Edit a file by replacing one exact occurrence of old_str with new_str. old_str must match the file content exactly (including whitespace and indentation, WITHOUT the LINENUM:HASH| prefixes from read_file) and must appear exactly once - include enough surrounding lines to make it unique. This is the simplest way to make a small targeted edit.",
+                "description": "Edit a file by replacing one exact occurrence of old_str with new_str. old_str must match the file content exactly (including whitespace and indentation, WITHOUT the LINENUM:HASH| prefixes from read_file) and must appear exactly once - include enough surrounding lines to make it unique. Best for small targeted edits (a few lines). Call read_file first to see current content.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -853,7 +868,7 @@ def make_tools():
             "type": "function",
             "function": {
                 "name": "edit_file",
-                "description": "Edit a file by line range using hashline anchors from a previous read_file call. Replaces the lines from start_anchor to end_anchor (inclusive) with new_text. Returns the updated file with new anchors. Use this for replacing larger line ranges; for small targeted edits str_replace is usually easier.",
+                "description": "Edit a file by line range using hashline anchors from a previous read_file call. Replaces the lines from start_anchor to end_anchor (inclusive) with new_text. Returns the updated file with new anchors so you can chain further edits. Best for replacing larger blocks of code (5+ lines) where you want precise line-range control.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -889,9 +904,10 @@ def make_system_prompt():
         "You are an autonomous agent with browser, shell, and file tools.\n\n"
         "Tool rules:\n"
         "1. Always use tools for file operations and commands - never output file contents in your reply.\n"
-        "2. To edit a file: call read_file first, then use str_replace for small targeted changes, "
-        "edit_file for replacing a range of lines, or write_file to rewrite the whole file. "
-        "For files under about 200 lines a full write_file rewrite is often the most reliable edit.\n"
+        "2. To edit a file: call read_file first, then choose the best edit tool for the job:\n"
+        "   - str_replace: for small targeted changes (a few lines).\n"
+        "   - edit_file: for replacing larger blocks using line-range anchors.\n"
+        "   - write_file: for rewriting the whole file (best when changing most of it, or files under ~200 lines).\n"
         "3. edit_file anchors are LINENUM:HASH strings - copy them exactly from read_file output.\n"
         "4. For web searches use the search_web tool with a plain text query.\n\n"
         "Work budget:\n"
@@ -919,11 +935,20 @@ def write_stats(state, start_time):
     stats_dir = os.path.join(WORKSPACE, "task_report")
     os.makedirs(stats_dir, exist_ok=True)
     stats_path = os.path.join(stats_dir, "stats.yaml")
+    ec = state["edit_counts"]
     with open(stats_path, "w", encoding="utf-8") as f:
         f.write("model_id: " + MODEL_ID + "\n")
         f.write("final_context_tokens: " + str(state["last_post_tokens"]) + "\n")
         f.write("compaction_count: " + str(state["compaction_count"]) + "\n")
         f.write("elapsed_minutes: " + "{:.2f}".format(elapsed_minutes) + "\n")
+        f.write("edit_counts:\n")
+        f.write("  write_file: " + str(ec["write_file"]) + "\n")
+        f.write("  str_replace: " + str(ec["str_replace"]) + "\n")
+        f.write("  edit_file: " + str(ec["edit_file"]) + "\n")
+    # print a summary so the operator can see edit method preferences at a glance
+    total_edits = ec["write_file"] + ec["str_replace"] + ec["edit_file"]
+    if total_edits > 0:
+        print(ts() + "Edit methods used: write_file=" + str(ec["write_file"]) + " str_replace=" + str(ec["str_replace"]) + " edit_file=" + str(ec["edit_file"]) + " (total=" + str(total_edits) + ")")
     print(ts() + "Stats written to task_report/stats.yaml")
 
 
@@ -952,7 +977,7 @@ def main():
     if snapshot:
         initial_content += "\n\n" + snapshot
 
-    state = {"last_post_tokens": 949, "compaction_count": 0}
+    state = {"last_post_tokens": 949, "compaction_count": 0, "edit_counts": {"write_file": 0, "str_replace": 0, "edit_file": 0}, "truncation_streak": 0}
 
     session_messages = [
         {"role": "system", "content": system_prompt},
@@ -973,112 +998,162 @@ def main():
     warned_over = False
     report_rescues = 0
 
-    while True:
-        # reasoning sandwich: high at plan (first turn) and wrap-up, medium between
-        if tool_calls_done == 0:
-            effort = REASONING_EFFORT_PLAN
-        elif tool_calls_done >= WRAPUP_WARN_AT:
-            effort = REASONING_EFFORT_WRAPUP
-        else:
-            effort = REASONING_EFFORT_WORK
+    try:
+        while True:
+            # reasoning sandwich: high at plan (first turn) and wrap-up, medium between
+            if tool_calls_done == 0:
+                effort = REASONING_EFFORT_PLAN
+            elif tool_calls_done >= WRAPUP_WARN_AT:
+                effort = REASONING_EFFORT_WRAPUP
+            else:
+                effort = REASONING_EFFORT_WORK
 
-        response = chat(messages, tools, new_messages, state, session_messages, effort)
-        choice = response["choices"][0]
-        msg = choice["message"]
-        finish = choice["finish_reason"]
-        # CRITICAL: msg may include reasoning_details / reasoning / reasoning_content fields
-        # when thinking mode is on. Appending the dict verbatim preserves them so they
-        # round-trip on the next request. Do NOT strip these fields - DeepSeek 400s if a
-        # prior tool-call turn's reasoning state is missing on the follow-up. MiniMax and
-        # Kimi K2.7 Code also require preserved reasoning across turns.
-        new_messages.append(msg)
+            response = chat(messages, tools, new_messages, state, session_messages, effort)
+            choice = response["choices"][0]
+            msg = choice["message"]
+            finish = choice["finish_reason"]
+            # CRITICAL: msg may include reasoning_details / reasoning / reasoning_content fields
+            # when thinking mode is on. Appending the dict verbatim preserves them so they
+            # round-trip on the next request. Do NOT strip these fields - DeepSeek 400s if a
+            # prior tool-call turn's reasoning state is missing on the follow-up. MiniMax and
+            # Kimi K2.7 Code also require preserved reasoning across turns.
+            new_messages.append(msg)
 
-        # branch on the presence of tool_calls rather than finish_reason: some
-        # providers report tool calls under finish_reason "stop", and a "length"
-        # finish can still carry complete earlier tool calls
-        tool_calls = msg.get("tool_calls") or []
+            # branch on the presence of tool_calls rather than finish_reason: some
+            # providers report tool calls under finish_reason "stop", and a "length"
+            # finish can still carry complete earlier tool calls
+            tool_calls = msg.get("tool_calls") or []
 
-        if tool_calls:
-            for tc in tool_calls:
-                fn_name = tc["function"]["name"]
-                # malformed tool-call JSON is a normal failure mode for cheap
-                # models - return it as a tool error so the model self-corrects
-                # instead of crashing the whole run
-                try:
-                    fn_args = json.loads(tc["function"]["arguments"])
-                except (ValueError, TypeError) as e:
-                    print(ts() + "  [tool call] " + fn_name + ": MALFORMED ARGUMENTS")
-                    tool_result = "Error: tool call arguments were not valid JSON (" + str(e) + "). Re-issue the call with corrected, complete JSON arguments."
+            if tool_calls:
+                # model produced parseable tool calls - reset any truncation state
+                state["truncation_streak"] = 0
+                for tc in tool_calls:
+                    fn_name = tc["function"]["name"]
+                    # two layers of cheap-model error recovery:
+                    # layer 1: malformed JSON in tool call arguments
+                    # layer 2: valid JSON but wrong/missing parameter keys
+                    # both return the error as a tool result so the model self-corrects
+                    try:
+                        fn_args = json.loads(tc["function"]["arguments"])
+                    except (ValueError, TypeError) as e:
+                        print(ts() + "  [tool call] " + fn_name + ": MALFORMED ARGUMENTS")
+                        tool_result = "Error: tool call arguments were not valid JSON (" + str(e) + "). Re-issue the call with corrected, complete JSON arguments."
+                    else:
+                        try:
+                            tool_result = dispatch_tool(mcp, fn_name, fn_args)
+                        except KeyError as e:
+                            print(ts() + "  [tool call] " + fn_name + ": MISSING PARAMETER " + str(e))
+                            tool_result = "Error: tool call missing required parameter " + str(e) + ". Check the tool definition and re-issue with the correct parameter names."
+                        except TypeError as e:
+                            print(ts() + "  [tool call] " + fn_name + ": BAD PARAMETER TYPE")
+                            tool_result = "Error: tool call parameter type error (" + str(e) + "). Re-issue with correct argument types."
+                    # track file editing method usage for observability
+                    if fn_name in state["edit_counts"]:
+                        state["edit_counts"][fn_name] += 1
+                    new_messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tc["id"],
+                            "content": tool_result,
+                        }
+                    )
+                    tool_calls_done += 1
+
+                # soft budget notices, each injected at most once
+                if not warned_wrapup and tool_calls_done >= WRAPUP_WARN_AT:
+                    warned_wrapup = True
+                    new_messages.append(
+                        {
+                            "role": "user",
+                            "content": "[harness notice] You have used "
+                            + str(tool_calls_done)
+                            + " of a suggested "
+                            + str(MAX_STEPS_SUGGESTION)
+                            + " tool calls. Start wrapping up: verify what you have built and write task_report/report.md soon.",
+                        }
+                    )
+                if not warned_over and tool_calls_done >= MAX_STEPS_SUGGESTION:
+                    warned_over = True
+                    new_messages.append(
+                        {
+                            "role": "user",
+                            "content": "[harness notice] You have exceeded the suggested budget of "
+                            + str(MAX_STEPS_SUGGESTION)
+                            + " tool calls. Finish now: verify what you have, write task_report/report.md, and reply with your completion confirmation.",
+                        }
+                    )
+                continue
+
+            if finish == "length":
+                # reply was cut off by max_tokens mid-thought (or mid-tool-call).
+                # strategy: first truncation -> boost max_tokens and retry.
+                # subsequent truncations -> keep boost, tell model to decompose
+                # large writes into skeleton + incremental edits.
+                state["truncation_streak"] += 1
+                streak = state["truncation_streak"]
+
+                if streak == 1:
+                    # first truncation: double max_tokens up to the boost cap
+                    base = _mcfg("max_tokens", 16000)
+                    boosted = min(base * 2, MAX_OUTPUT_BOOST)
+                    state["max_tokens_override"] = boosted
+                    print(ts() + "  [warn] reply truncated at max_tokens, boosting output to " + str(boosted) + " and nudging model")
+                    new_messages.append(
+                        {
+                            "role": "user",
+                            "content": "[harness notice] Your previous reply was cut off by the output token limit. "
+                            "The output budget has been increased. Continue from where you left off. "
+                            "If you were issuing a tool call, re-issue it completely. "
+                            "Tip: if a file is very large, write a skeleton version first with write_file, "
+                            "then add remaining sections with str_replace.",
+                        }
+                    )
                 else:
-                    tool_result = dispatch_tool(mcp, fn_name, fn_args)
-                new_messages.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": tc["id"],
-                        "content": tool_result,
-                    }
-                )
-                tool_calls_done += 1
+                    # second+ truncation: the boosted budget still wasn't enough.
+                    # the file is genuinely too large for a single tool call.
+                    print(ts() + "  [warn] reply truncated again (streak=" + str(streak) + "), sending decomposition nudge")
+                    new_messages.append(
+                        {
+                            "role": "user",
+                            "content": "[harness notice] Your reply was cut off again by the output token limit. "
+                            "The file you are trying to write is too large for a single tool call. "
+                            "You MUST split it: use write_file to create a skeleton or partial version first, "
+                            "then use str_replace to add the remaining sections one at a time. "
+                            "Do NOT attempt to write the entire file in one call.",
+                        }
+                    )
+                continue
 
-            # soft budget notices, each injected at most once
-            if not warned_wrapup and tool_calls_done >= WRAPUP_WARN_AT:
-                warned_wrapup = True
-                new_messages.append(
-                    {
-                        "role": "user",
-                        "content": "[harness notice] You have used "
-                        + str(tool_calls_done)
-                        + " of a suggested "
-                        + str(MAX_STEPS_SUGGESTION)
-                        + " tool calls. Start wrapping up: verify what you have built and write task_report/report.md soon.",
-                    }
-                )
-            if not warned_over and tool_calls_done >= MAX_STEPS_SUGGESTION:
-                warned_over = True
+            # model produced a final text reply - make sure the report actually exists
+            # before accepting it, otherwise this whole attempt is wasted
+            report_path = os.path.join(WORKSPACE, "task_report", "report.md")
+            if not os.path.exists(report_path) and report_rescues < MAX_REPORT_RESCUES:
+                report_rescues += 1
+                print(ts() + "  [warn] model stopped without task_report/report.md - rescue " + str(report_rescues) + "/" + str(MAX_REPORT_RESCUES))
                 new_messages.append(
                     {
                         "role": "user",
-                        "content": "[harness notice] You have exceeded the suggested budget of "
-                        + str(MAX_STEPS_SUGGESTION)
-                        + " tool calls. Finish now: verify what you have, write task_report/report.md, and reply with your completion confirmation.",
+                        "content": "[harness notice] You ended your turn but task_report/report.md does not exist. Use write_file to create task_report/report.md now (summary, key decisions, uncertainties, success assessment with verification evidence), then reply with one short confirmation sentence.",
                     }
                 )
-            continue
+                continue
 
-        if finish == "length":
-            # reply was cut off by max_tokens mid-thought (or mid-tool-call);
-            # treating it as "done" would end the run on a half-finished task
-            print(ts() + "  [warn] reply truncated at max_tokens, nudging model to continue")
-            new_messages.append(
-                {
-                    "role": "user",
-                    "content": "[harness notice] Your previous reply was cut off by the output token limit. Continue from where you left off. If you were issuing a tool call, re-issue it completely. Keep replies shorter.",
-                }
-            )
-            continue
+            print(ts() + "\n[done] " + str(msg["content"]))
+            break
 
-        # model produced a final text reply - make sure the report actually exists
-        # before accepting it, otherwise this whole attempt is wasted
-        report_path = os.path.join(WORKSPACE, "task_report", "report.md")
-        if not os.path.exists(report_path) and report_rescues < MAX_REPORT_RESCUES:
-            report_rescues += 1
-            print(ts() + "  [warn] model stopped without task_report/report.md - rescue " + str(report_rescues) + "/" + str(MAX_REPORT_RESCUES))
-            new_messages.append(
-                {
-                    "role": "user",
-                    "content": "[harness notice] You ended your turn but task_report/report.md does not exist. Use write_file to create task_report/report.md now (summary, key decisions, uncertainties, success assessment with verification evidence), then reply with one short confirmation sentence.",
-                }
-            )
-            continue
-
-        print(ts() + "\n[done] " + str(msg["content"]))
-        break
-
-    # write stats before cleanup, always, even if the agent didn't write a report
-    write_stats(state, start_time)
-
-    mcp["proc"].stdin.close()
-    mcp["proc"].terminate()
+    finally:
+        # guaranteed cleanup - runs after normal exit AND unhandled exceptions.
+        # OOM/SIGKILL bypass finally (nothing can catch those), but every
+        # Python-level crash is covered: API failures, MCP pipe breaks, etc.
+        try:
+            write_stats(state, start_time)
+        except Exception as e:
+            print(ts() + "[warn] failed to write stats: " + str(e))
+        try:
+            mcp["proc"].stdin.close()
+            mcp["proc"].terminate()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
