@@ -32,7 +32,7 @@ ALL_MODELS = {
 }
 
 
-MODEL_ID = "ds-v4-flash"
+MODEL_ID = "minimax-m3"
 
 # NOTE: WE ALWAYS WANT TO APPEND :exacto, I the user accept any consequences of this decision
 MODEL = ALL_MODELS[MODEL_ID] + ":exacto"
@@ -891,14 +891,11 @@ def make_system_prompt():
         "   - write_file: for rewriting the whole file.\n"
         "3. edit_file anchors are LINENUM:HASH strings - copy them exactly from read_file output.\n"
         "4. For web searches use the search_web tool with a plain text query.\n"
-        "   - Web research tool: Use the playwright MCP for headed chrome, and try to avoid calling curl/wget from command line unless absolutely necessary.\n"
+        "   - Web research tool: Use the playwright MCP connected to a headed-and-stateful chrome, and try to avoid calling curl/wget from command line unless absolutely necessary.\n"
         "   - Web research notes: write any possibly useful info to file(s) immediately before doing any other work. Do not wait, as these notes could be useful if we do context compaction.\n"
         "\nResearch workflow:\n"
-        "- For each search, write a 3-5 line note to a scratch file BEFORE doing anything else with the result. Compaction can happen mid-research; the note survives it.\n"
-        "- Prefer primary sources and real user discussions. Reddit is especially valuable - our headed browser can access it while most AI chatbots cannot, giving us unique 'alpha'. Prefer reddit threads for real-world experiences and opinions.\n"
-        "- When you find a useful source, record the URL and access date in the same note.\n"
-        "- Cross-reference at least two independent sources before stating any non-trivial fact.\n"
-        "- When the task is 'find me X', write the answer to task_report/report.md immediately and verify it; do not leave the answer only in chat history.\n"
+        "- For each search or web retrevial, write notes to file(s) BEFORE doing anything else with the result. Compaction can happen mid-research; the notes survive it.\n"
+        "- Prefer primary sources and real user discussions. Reddit is especially valuable - our headed browser can access it while most AI chatbots cannot, giving us unique 'alpha' - so specifically target these kinds of 'walled gardens'.\n"
         "\nVerification:\n"
         "Before writing your report, verify your work by actually running it: execute your code, re-read final files, "
         "re-check computed values. Include the real observed output in your report. "
