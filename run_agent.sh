@@ -13,7 +13,6 @@
 # .pq is shadowed with an empty tmpfs so the agent cannot see harness files
 # allows: full network (playwright needs it), playwright browser cache read-only
 #
-# agent.py is hardcoded to deepseek/deepseek-v4-flash via OpenRouter, so
 # OPENROUTER_API_KEY is the only LLM key needed inside the sandbox.
 
 set -euo pipefail

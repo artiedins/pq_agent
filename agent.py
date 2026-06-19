@@ -24,85 +24,26 @@ import urllib.parse
 # - Yes strategic inline comments enhancing rapid code comprehension by real humans
 # - Yes if __name__ == "__main__": main()
 
-# Harness is targeted at flash/mimo class models (cheap, fast, weaker at exotic
-# formats and long-horizon discipline). Design choices that follow from that:
-# - search_web is a single tool (encode + navigate + extract) so the model never
-#   hand-builds DDG URLs
-# - str_replace exists alongside hashline edit_file because small models are
-#   trained heavily on search/replace style edits
-# - soft tool-call budget with injected wrap-up notices, since cheap models are
-#   bad at time estimation
-# - reasoning effort is high at plan and wrap-up, medium in the middle
-#
-# DeepSeek V4 thinking-mode REQUIRES the prior assistant turn's reasoning state
-# (reasoning_details, reasoning, or reasoning_content) to be passed back when
-# that turn included a tool_call - omitting it causes a 400 from the upstream
-# DeepSeek provider through OpenRouter. We rely on appending the assistant
-# message dict from the response verbatim into the conversation, which carries
-# all returned fields through to the next request. This append-verbatim rule is
-# harmless for providers that don't need it, so it stays regardless of MODEL.
-# MiniMax M2.x/M3 "highly recommend preserving reasoning between turns" and
-# Kimi K2.7 Code mandates it - both are handled by the same append-verbatim.
-
 
 ALL_MODELS = {
-    "ds-v4-pro": "deepseek/deepseek-v4-pro",
     "kimi-k2.7-code": "moonshotai/kimi-k2.7-code",
-    "glm-5.1": "z-ai/glm-5.1",
-    "gemma-4-31b": "google/gemma-4-31b-it",
     "minimax-m3": "minimax/minimax-m3",
-    "kimi-k2.6": "moonshotai/kimi-k2.6",
-    "step-3.7-flash": "stepfun/step-3.7-flash",
     "ds-v4-flash": "deepseek/deepseek-v4-flash",
 }
 
 
 MODEL_ID = "ds-v4-flash"
 
-
 # NOTE: WE ALWAYS WANT TO APPEND :exacto, I the user accept any consequences of this decision
 MODEL = ALL_MODELS[MODEL_ID] + ":exacto"
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
-# Per-model tuning for best results through OpenRouter's unified API.
-# Models not listed here use defaults: effort-based reasoning sandwich, 8000
-# max_tokens. Key findings from provider docs and OpenRouter model pages:
-#
-# reasoning_mode controls how the reasoning param is constructed per-call:
-#   "effort"     (default) - send reasoning.effort = high/medium/etc
-#   "always_on"  - model always thinks; omit reasoning param entirely so
-#                  the provider doesn't reject or misinterpret it
-#   "disabled"   - send reasoning.enabled = false; model works best without
-#                  thinking in agentic tool-calling loops
-#
-# Kimi K2.7 Code: always-on thinking that cannot be disabled. Kimi's docs
-# mandate max_tokens >= 16000 so reasoning_content + content aren't truncated.
-# The model also requires preserving reasoning_content across all turns, which
-# the append-verbatim pattern already provides.
-#
-# MiMo V2.x: Xiaomi's integration guidance explicitly says "turn off reasoning
-# mode for the best and fastest performance" when using agentic tools.
-#
-# DeepSeek V4: supports reasoning.effort "high" and "xhigh" (xhigh maps to
-# max reasoning). The default effort sandwich works well here.
-#
-# MiniMax M3/M2.x: supports reasoning via OpenRouter's unified API. MiniMax
-# "highly recommends preserving reasoning between turns" - already handled.
-#
-# Gemma 4 (26b, 31b): configurable reasoning/thinking mode via OpenRouter.
-# Standard effort sandwich works. 256K context, fine with 150K compaction.
-#
-# All other models use OpenRouter's normalized reasoning.effort and work fine
-# with the default effort sandwich.
 
 MODEL_OVERRIDES = {
-    # Kimi: always-on thinking, higher max_tokens mandatory
-    "kimi-k2.7-code": {"max_tokens": 16000, "reasoning_mode": "always_on"},
-    "kimi-k2.6": {"max_tokens": 16000},
-    # MiMo: reasoning off for agentic tool-calling per Xiaomi guidance
-    "mimo-v2.5": {"reasoning_mode": "disabled"},
-    "mimo-v2.5-pro": {"reasoning_mode": "disabled"},
+    "kimi-k2.7-code": {"max_tokens": 16000, "max_output_tokens": 16384, "reasoning_mode": "always_on"},
+    "minimax-m3": {"max_tokens": 32768, "max_output_tokens": 131072, "reasoning_mode": "effort"},
+    "ds-v4-flash": {"max_tokens": 32768, "max_output_tokens": 131072, "reasoning_mode": "effort"},
 }
 
 
@@ -141,6 +82,15 @@ MAX_REPORT_RESCUES = 3
 # decomposition nudge kicks in on the second truncation.
 MAX_OUTPUT_BOOST = 32000
 
+# Timeout for API requests to OpenRouter. Thinking models (Kimi always-on,
+# DS V4 with high/xhigh effort) can take well over 60s to first token on long
+# prompts. Set generously to avoid killing in-flight computation on retry.
+API_REQUEST_TIMEOUT = 300
+
+# Timeout for shell commands run by the model. Needs to be long enough for
+# pip install on a cold cache, compilation with C extensions, and test suites.
+RUN_COMMAND_TIMEOUT = 120
+
 AGENT_DIR = os.environ.get("AGENT_DIR", os.path.dirname(os.path.abspath(__file__)))
 WORKSPACE = os.path.abspath(os.getcwd())
 
@@ -151,6 +101,8 @@ if not OPENROUTER_API_KEY:
 HEADERS = {
     "Authorization": "Bearer " + OPENROUTER_API_KEY,
     "Content-Type": "application/json",
+    "X-Title": "pq-agent",
+    "HTTP-Referer": "https://github.com/artiedins/pq_agent",
 }
 
 
@@ -194,7 +146,7 @@ def post_with_retry(payload):
             delay = random.uniform(2**p, 2 ** (p + 1))
             time.sleep(delay)
         try:
-            resp = requests.post(OPENROUTER_URL, headers=HEADERS, json=payload, timeout=60)
+            resp = requests.post(OPENROUTER_URL, headers=HEADERS, json=payload, timeout=API_REQUEST_TIMEOUT)
         except requests.exceptions.Timeout:
             if attempt < 8:
                 print(ts() + "  [error] request timed out, retrying (attempt " + str(attempt + 1) + "/8)...")
@@ -276,24 +228,41 @@ def post_compaction(payload):
 
 
 def extract_compaction_summary(raw_msg):
-    summary = raw_msg.get("content")
-    if not summary or not isinstance(summary, str) or summary.strip().lower() in ("", "none", "yes"):
-        # fall back through OpenRouter reasoning shapes: plain string fields first,
-        # then the structured reasoning_details array (sequence of {type, text, ...} blocks)
-        summary = raw_msg.get("reasoning") or raw_msg.get("reasoning_content")
-        if not summary:
-            details = raw_msg.get("reasoning_details") or []
-            parts = []
-            for d in details:
-                if isinstance(d, dict):
-                    t = d.get("text") or d.get("content")
-                    if t:
-                        parts.append(t)
-            if parts:
-                summary = "\n".join(parts)
-    if summary:
-        summary = summary.strip()
-    return summary or None
+    # thinking models often put a short preamble in content and the real
+    # summary in reasoning_details. concatenate both to avoid losing detail.
+    content = raw_msg.get("content")
+    if not isinstance(content, str):
+        content = ""
+    content = content.strip()
+    if content.lower() in ("none", "yes"):
+        content = ""
+
+    # gather reasoning from all OpenRouter shapes
+    reasoning = raw_msg.get("reasoning") or raw_msg.get("reasoning_content") or ""
+    if isinstance(reasoning, str):
+        reasoning = reasoning.strip()
+    else:
+        reasoning = ""
+
+    details = raw_msg.get("reasoning_details") or []
+    detail_parts = []
+    for d in details:
+        if isinstance(d, dict):
+            t = d.get("text") or d.get("content")
+            if t:
+                detail_parts.append(t)
+    detail_text = "\n".join(detail_parts).strip()
+
+    # prefer the longer reasoning source
+    reasoning_text = detail_text if len(detail_text) >= len(reasoning) else reasoning
+
+    # concatenate content and reasoning if both are substantial
+    if content and reasoning_text:
+        summary = content + "\n\n" + reasoning_text
+    else:
+        summary = content or reasoning_text
+
+    return summary.strip() or None
 
 
 def build_reasoning_param(effort):
@@ -320,7 +289,6 @@ def chat(messages, tools, new_messages, state, session_messages, effort):
     MAX_CONTEXT_LENGTH = 150000
 
     new_prompt_tokens = est_messages_tokens(new_messages)
-    new_prompt_tokens = int(round(0.2221 * (new_prompt_tokens**1.1866)))
     pre_prompt_total_context = state["last_post_tokens"] + new_prompt_tokens
 
     if pre_prompt_total_context > MAX_CONTEXT_LENGTH:
@@ -334,6 +302,8 @@ def chat(messages, tools, new_messages, state, session_messages, effort):
             "2. Current state of any modified files (exact filenames, key content or structure).\n"
             "3. Any discovered facts relevant to completing the task (e.g. specific data values found).\n"
             "4. Immediate next step.\n"
+            "5. Preserve exact file paths, function signatures, variable names, and data values. "
+            "Vague descriptions like 'modified the solver' are not helpful for resuming work.\n"
             "Include any prior compaction summaries in condensed form.\n"
             "Do NOT summarize the system prompt or initial task instructions - those are provided fresh.\n"
             "Be terse. If this summary exceeds 9000 tokens it will be clipped.\n"
@@ -369,10 +339,17 @@ def chat(messages, tools, new_messages, state, session_messages, effort):
         # enforce the clip promised in the compaction prompt
         toks = _enc.encode(summary)
         if len(toks) > 9000:
-            summary = _enc.decode(toks[:9000]) + "\n[summary clipped at 9000 tokens]"
+            summary = _enc.decode(toks[:9000], errors="replace") + "\n[summary clipped at 9000 tokens]"
 
         summary_msg = {"role": "user", "content": "[context compacted] Session summary:\n" + summary}
 
+        # post-compaction message list is system + user summary only - no
+        # assistant messages survive, so there is no reasoning_content /
+        # reasoning_details state that needs to be preserved. the next API call
+        # starts a fresh assistant turn from the summary context. this is safe
+        # for all three backends (Kimi, MiniMax, DeepSeek) because the
+        # reasoning passback requirement only applies to continuing from a
+        # prior assistant turn, not starting fresh.
         new_session = list(session_messages) + [summary_msg]
         messages.clear()
         messages += new_session
@@ -470,6 +447,10 @@ def start_mcp():
 
 
 def restart_mcp(mcp):
+    try:
+        mcp["proc"].stdin.close()
+    except Exception:
+        pass
     mcp["proc"].terminate()
     time.sleep(1)
     proc = subprocess.Popen(
@@ -676,7 +657,7 @@ def tool_run_command(command):
         start_new_session=True,
     )
     try:
-        proc.wait(timeout=30)
+        proc.wait(timeout=RUN_COMMAND_TIMEOUT)
     except subprocess.TimeoutExpired:
         # kill the entire process group - this reaps backgrounded children
         # that would otherwise survive the shell's death and accumulate
@@ -692,7 +673,7 @@ def tool_run_command(command):
         out_f.close()
         err_f.close()
         print(ts() + "  [tool call] run_command: TIMED OUT | " + command[:80])
-        return partial + "\n[error: command timed out after 30s; any partial output is shown above]"
+        return partial + "\n[error: command timed out after " + str(RUN_COMMAND_TIMEOUT) + "s; any partial output is shown above]"
     out_f.seek(0)
     err_f.seek(0)
     output = out_f.read().decode("utf-8", "replace") + err_f.read().decode("utf-8", "replace")
@@ -796,7 +777,7 @@ def make_tools():
             "type": "function",
             "function": {
                 "name": "playwright_navigate",
-                "description": "Navigate the browser to a specific URL and return the page title. Use this for visiting known URLs (e.g. links found in search results). For searches use the search_web tool instead.",
+                "description": "Navigate the browser to a specific URL and return the page content as markdown. Use this for visiting known URLs (e.g. links found in search results). For searches use the search_web tool instead.",
                 "parameters": {
                     "type": "object",
                     "properties": {"url": {"type": "string"}},
@@ -885,7 +866,7 @@ def make_tools():
             "type": "function",
             "function": {
                 "name": "run_command",
-                "description": "Run a shell command in the workspace and return its output. Timeout is 30 seconds.",
+                "description": "Run a shell command in the workspace and return its output. Timeout is " + str(RUN_COMMAND_TIMEOUT) + " seconds.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -901,24 +882,28 @@ def make_tools():
 def make_system_prompt():
     # four concerns: tool rules, work budget, verification, and finishing protocol
     return (
-        "You are an autonomous agent with browser, shell, and file tools.\n\n"
-        "Tool rules:\n"
+        "You are an autonomous agent with browser, shell, and file tools.\n"
+        "\nTool rules:\n"
         "1. Always use tools for file operations and commands - never output file contents in your reply.\n"
         "2. To edit a file: call read_file first, then choose the best edit tool for the job:\n"
-        "   - str_replace: for small targeted changes (a few lines).\n"
+        "   - str_replace: for small targeted changes.\n"
         "   - edit_file: for replacing larger blocks using line-range anchors.\n"
-        "   - write_file: for rewriting the whole file (best when changing most of it, or files under ~200 lines).\n"
+        "   - write_file: for rewriting the whole file.\n"
         "3. edit_file anchors are LINENUM:HASH strings - copy them exactly from read_file output.\n"
-        "4. For web searches use the search_web tool with a plain text query.\n\n"
-        "Work budget:\n"
-        "Aim to finish within about " + str(MAX_STEPS_SUGGESTION) + " tool calls. This is a soft target, "
-        "not a hard cutoff - if you find yourself over budget, prioritize finishing and reporting over polish. "
-        "You will receive a notice when you should start wrapping up.\n\n"
-        "Verification:\n"
+        "4. For web searches use the search_web tool with a plain text query.\n"
+        "   - Web research tool: Use the playwright MCP for headed chrome, and try to avoid calling curl/wget from command line unless absolutely necessary.\n"
+        "   - Web research notes: write any possibly useful info to file(s) immediately before doing any other work. Do not wait, as these notes could be useful if we do context compaction.\n"
+        "\nResearch workflow:\n"
+        "- For each search, write a 3-5 line note to a scratch file BEFORE doing anything else with the result. Compaction can happen mid-research; the note survives it.\n"
+        "- Prefer primary sources and real user discussions. Reddit is especially valuable - our headed browser can access it while most AI chatbots cannot, giving us unique 'alpha'. Prefer reddit threads for real-world experiences and opinions.\n"
+        "- When you find a useful source, record the URL and access date in the same note.\n"
+        "- Cross-reference at least two independent sources before stating any non-trivial fact.\n"
+        "- When the task is 'find me X', write the answer to task_report/report.md immediately and verify it; do not leave the answer only in chat history.\n"
+        "\nVerification:\n"
         "Before writing your report, verify your work by actually running it: execute your code, re-read final files, "
         "re-check computed values. Include the real observed output in your report. "
-        "A report that claims success without demonstrated verification is incomplete.\n\n"
-        "When the task is complete, use write_file to create task_report/report.md containing:\n"
+        "A report that claims success without demonstrated verification is incomplete.\n"
+        "\nWhen the task is complete, use write_file to create task_report/report.md containing:\n"
         "1. A step-by-step summary of what you did.\n"
         "2. Key decisions and why you made them.\n"
         "3. Anything you are uncertain about.\n"
@@ -1027,6 +1012,8 @@ def main():
             if tool_calls:
                 # model produced parseable tool calls - reset any truncation state
                 state["truncation_streak"] = 0
+                if "max_tokens_override" in state:
+                    del state["max_tokens_override"]
                 for tc in tool_calls:
                     fn_name = tc["function"]["name"]
                     # two layers of cheap-model error recovery:
@@ -1093,9 +1080,11 @@ def main():
                 streak = state["truncation_streak"]
 
                 if streak == 1:
-                    # first truncation: double max_tokens up to the boost cap
+                    # first truncation: double max_tokens up to the boost cap,
+                    # but never exceed the model's hard output limit
                     base = _mcfg("max_tokens", 16000)
-                    boosted = min(base * 2, MAX_OUTPUT_BOOST)
+                    output_cap = _mcfg("max_output_tokens", base)
+                    boosted = min(base * 2, MAX_OUTPUT_BOOST, output_cap)
                     state["max_tokens_override"] = boosted
                     print(ts() + "  [warn] reply truncated at max_tokens, boosting output to " + str(boosted) + " and nudging model")
                     new_messages.append(
@@ -1125,15 +1114,19 @@ def main():
                 continue
 
             # model produced a final text reply - make sure the report actually exists
-            # before accepting it, otherwise this whole attempt is wasted
+            # and has meaningful content before accepting it
             report_path = os.path.join(WORKSPACE, "task_report", "report.md")
-            if not os.path.exists(report_path) and report_rescues < MAX_REPORT_RESCUES:
+            try:
+                report_size = os.path.getsize(report_path)
+            except OSError:
+                report_size = 0
+            if report_size < 200 and report_rescues < MAX_REPORT_RESCUES:
                 report_rescues += 1
-                print(ts() + "  [warn] model stopped without task_report/report.md - rescue " + str(report_rescues) + "/" + str(MAX_REPORT_RESCUES))
+                print(ts() + "  [warn] model stopped without adequate task_report/report.md (" + str(report_size) + " bytes) - rescue " + str(report_rescues) + "/" + str(MAX_REPORT_RESCUES))
                 new_messages.append(
                     {
                         "role": "user",
-                        "content": "[harness notice] You ended your turn but task_report/report.md does not exist. Use write_file to create task_report/report.md now (summary, key decisions, uncertainties, success assessment with verification evidence), then reply with one short confirmation sentence.",
+                        "content": "[harness notice] You ended your turn but task_report/report.md is missing or too short. Use write_file to create task_report/report.md now (summary, key decisions, uncertainties, success assessment with verification evidence), then reply with one short confirmation sentence.",
                     }
                 )
                 continue
