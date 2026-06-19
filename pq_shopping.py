@@ -29,7 +29,7 @@ from llm_client import call_llm
 # Setup-time provider options. ds4_flash is excluded because it's the agent
 # model and we want a stronger model designing the research workflow.
 SETUP_PROVIDER_OPTIONS = [
-    {"key": "anthropic", "label": "Claude Opus 4.8"},
+    {"key": "anthropic", "label": "Claude Opus 4.6"},
     {"key": "qwen", "label": "Qwen3.6-Plus"},
     {"key": "glm", "label": "GLM-5.1"},
     {"key": "ds4_pro", "label": "DeepSeek V4 Pro"},
@@ -137,7 +137,8 @@ def build_meta_prompt(what, location, sensitivity):
         "- When a source is low credibility, note that in your summary\n",
         "- For pricing: note whether prices vary by retailer and whether there are deal patterns\n\n",
         "## Inter-Task File Conventions\n\n",
-        "Tasks share a workspace. Use the research/ subdirectory for intermediate notes:\n\n",
+        "Tasks share a workspace. Use the research/ subdirectory for intermediate notes:\n",
+        "**VERY IMPORTANT**: You must somehow write the p.md prompts so the agent makes or updates notes after even finding a little bit of useful information before attempting other tool calls. This avoids the situation where important context is lost if the agent has to compact their context. You decide how to communicate this important skill.\n\n",
         "Task 1 writes TWO things:\n",
         "  research/landscape.md   - full research notes: product map, price tiers, candidate list,\n",
         "                            key decision criteria, sources consulted with URLs\n",
