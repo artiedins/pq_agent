@@ -59,52 +59,12 @@ import urllib.parse
 #   0.8, "top_k": 20}. Omit to fall back on server defaults (generation_config.json
 #   on vLLM, provider defaults on OpenRouter).
 #
-# Three validated model configs:
-#   dsv4-flash-openrouter - cloud fallback via OpenRouter, sampling aligned with local dsv4
-#   dsv4-cold-think       - local vLLM DSV4 Flash with thinking, best benchmark results
-#   qwen36-hot-nothink    - local vLLM Qwen3.6-27B without thinking, best benchmark results
-
-MODEL_REGISTRY = {
-    "dsv4-flash-openrouter": {
-        "provider": "openrouter",
-        "model": "deepseek/deepseek-v4-flash:exacto",
-        "max_tokens": 16000,
-        "max_output_tokens": 32768,
-        # OpenRouter translates {"reasoning": {"effort": "high"}} into the
-        # provider-specific mechanism (chat_template_kwargs for DeepSeek providers).
-        # DSV4 Flash supports effort levels "high" and "xhigh" (maps to max).
-        "reasoning_mode": "effort",
-        # sampling aligned with validated local dsv4-cold-think config.
-        # OpenRouter forwards temperature/top_p/top_k to the underlying provider;
-        # unsupported params are silently ignored, which is safe.
-        "sampling": {"temperature": 0.6, "top_p": 0.95, "top_k": 20},
-    },
-    "dsv4-cold-think": {
-        "provider": "local",
-        "model": "deepseek-v4-flash",
-        "base_url": "http://127.0.0.1:8988",
-        "auth": True,
-        "max_tokens": 16000,
-        "max_output_tokens": 32768,
-        "reasoning_mode": "dsv4_think",
-        "enable_thinking": True,
-        "sampling": {"temperature": 0.6, "top_p": 0.95, "top_k": 20},
-    },
-    "qwen36-hot-nothink": {
-        "provider": "local",
-        "model": "qwen3.6-27b",
-        "base_url": "http://127.0.0.1:8987",
-        "auth": True,
-        "max_tokens": 16000,
-        "max_output_tokens": 32768,
-        "reasoning_mode": "qwen3_think",
-        "enable_thinking": False,
-        "sampling": {"temperature": 1.0, "top_p": 0.95, "top_k": 20},
-    },
-}
 
 
-MODEL_ID = os.environ.get("PQ_MODEL", "dsv4-flash-openrouter")
+MODEL_REGISTRY = {"dsv4-flash": {"provider": "openrouter", "model": "deepseek/deepseek-v4-flash", "max_tokens": 16000, "max_output_tokens": 384000}}
+
+
+MODEL_ID = os.environ.get("PQ_MODEL", "dsv4-flash")
 if MODEL_ID not in MODEL_REGISTRY:
     sys.exit("Error: unknown model '" + MODEL_ID + "'. " "Known models: " + ", ".join(sorted(MODEL_REGISTRY.keys())))
 
@@ -457,23 +417,25 @@ def apply_reasoning(payload, effort):
     # - "qwen3_think":  vLLM Qwen3.x {"chat_template_kwargs": {"enable_thinking": <enable_thinking>}}
     # - "disabled":     OpenRouter {"reasoning": {"enabled": false}}
     # - "always_on" / "native_think": send nothing (server or model controls thinking)
+
+    # LETS OVERRIDE FOR NOW
+    # DO NOT ADD ANYTHING FOR BEST INTERNAL BENCHMARKS ON DEEPSEEK V4 FLASH ON OPENROUTER
+    return
+
     rmode = _cfg("reasoning_mode", "effort")
+
     if rmode == "dsv4_think":
-        payload["chat_template_kwargs"] = {
-            "thinking": _cfg("enable_thinking", True),
-            "reasoning_effort": effort or "high",
-        }
+        payload["chat_template_kwargs"] = {"thinking": _cfg("enable_thinking", True), "reasoning_effort": effort or "high"}
     elif rmode == "qwen3_think":
         payload["chat_template_kwargs"] = {"enable_thinking": _cfg("enable_thinking", True)}
     elif rmode == "effort_none":
-        # DSV4 on OpenRouter defaults to thinking when no reasoning param is sent;
-        # effort: "none" is the only way to explicitly disable it via OpenRouter
         payload["reasoning"] = {"effort": "none"}
     elif rmode == "effort" and effort:
         payload["reasoning"] = {"effort": effort}
     elif rmode == "disabled":
         payload["reasoning"] = {"enabled": False}
-    # "always_on" and "native_think": no reasoning param needed
+    elif rmode == "medium":
+        payload["reasoning"] = {"effort": "medium"}
 
 
 def _get_workspace_snapshot():
