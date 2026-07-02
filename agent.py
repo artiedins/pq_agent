@@ -67,7 +67,7 @@ import urllib.parse
 MODEL_REGISTRY = {
     "dsv4-flash-openrouter": {
         "provider": "openrouter",
-        "model": "deepseek/deepseek-v4-flash",
+        "model": "deepseek/deepseek-v4-flash:exacto",
         "max_tokens": 16000,
         "max_output_tokens": 32768,
         # OpenRouter translates {"reasoning": {"effort": "high"}} into the
