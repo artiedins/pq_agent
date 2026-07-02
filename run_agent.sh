@@ -3,17 +3,22 @@
 # run_agent.sh - launch agent.py inside a bubblewrap sandbox
 #
 # usage: bash run_agent.sh [project_dir]
+#        PQ_MODEL=qwopus-coder PQ_PLAYWRIGHT=0 bash run_agent.sh [project_dir]
 #
 # if project_dir is omitted, the current working directory is used.
+#
+# env vars (the only three the agent needs):
+#   PQ_MODEL      - which model to use
+#   PQ_API_KEY    - single API key for any model that needs auth
+#   PQ_PLAYWRIGHT - 1 to enable web search via headed Chrome, 0 to disable
 #
 # the agent code lives here (read-only inside sandbox at /agent)
 # the project dir is where the agent reads and writes (read-write at /workspace)
 #
 # protects: $HOME entirely invisible, only project dir is writable
 # .pq is shadowed with an empty tmpfs so the agent cannot see harness files
-# allows: full network (playwright needs it), playwright browser cache read-only
-#
-# OPENROUTER_API_KEY is the only LLM key needed inside the sandbox.
+# allows: full network (playwright needs it, local models need localhost)
+# playwright browser cache read-only
 
 set -euo pipefail
 
@@ -29,8 +34,6 @@ else
     exit 1
 fi
 
-: "${OPENROUTER_API_KEY:?OPENROUTER_API_KEY must be set in the environment}"
-
 PW_CACHE="${HOME}/.cache/ms-playwright"
 
 if ! command -v bwrap &>/dev/null; then
@@ -38,8 +41,23 @@ if ! command -v bwrap &>/dev/null; then
     exit 1
 fi
 
+# build the list of env vars to pass into the sandbox.
+# only the three PQ_* vars are needed; agent.py handles defaults and validation.
+ENV_ARGS=()
+if [ -n "${PQ_MODEL:-}" ]; then
+    ENV_ARGS+=(--setenv PQ_MODEL "$PQ_MODEL")
+fi
+if [ -n "${PQ_API_KEY:-}" ]; then
+    ENV_ARGS+=(--setenv PQ_API_KEY "$PQ_API_KEY")
+fi
+if [ -n "${PQ_PLAYWRIGHT:-}" ]; then
+    ENV_ARGS+=(--setenv PQ_PLAYWRIGHT "$PQ_PLAYWRIGHT")
+fi
+
 echo "agent dir  : $AGENT_DIR"
 echo "project dir: $PROJECT_DIR"
+echo "model      : ${PQ_MODEL:-ds-v4-flash (default)}"
+echo "playwright : ${PQ_PLAYWRIGHT:-1 (default)}"
 echo ""
 
 exec bwrap \
@@ -73,9 +91,9 @@ exec bwrap \
   --setenv PATH /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
   --setenv HOME /tmp \
   --setenv TMPDIR /tmp \
-  --setenv OPENROUTER_API_KEY "$OPENROUTER_API_KEY" \
   --setenv PLAYWRIGHT_BROWSERS_PATH /pw-cache \
   --setenv AGENT_DIR /agent \
+  "${ENV_ARGS[@]}" \
   --chdir /workspace \
   -- \
-  python3 /agent/agent.py
+  python3 -u /agent/agent.py

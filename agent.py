@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+
 import os
 import sys
 import json
@@ -8,6 +10,8 @@ import tempfile
 import requests
 import time
 import random
+import re
+import shutil
 import tiktoken
 import urllib.parse
 
@@ -23,59 +27,182 @@ import urllib.parse
 # - Yes if __name__ == "__main__": main()
 
 
-ALL_MODELS = {
-    "kimi-k2.7-code": "moonshotai/kimi-k2.7-code",
-    "minimax-m3": "minimax/minimax-m3",
-    "ds-v4-flash": "deepseek/deepseek-v4-flash",
-    "glm-5.2": "z-ai/glm-5.2",
+# Model registry: each entry defines provider, model string, and per-model defaults.
+#
+# Env vars (the only three you need to set):
+#   PQ_MODEL      - selects the active model
+#   PQ_API_KEY    - single API key used for any model that needs auth
+#   PQ_PLAYWRIGHT - 1 to enable headed-Chrome web search, 0 to disable
+#
+# provider:
+#   "openrouter" - cloud via OpenRouter API, requires PQ_API_KEY
+#   "local"      - llama.cpp / SGLang / any OpenAI-compatible server
+#
+# auth:
+#   true  - PQ_API_KEY is required (sent as Bearer token)
+#   false - no auth needed (default for local models)
+#
+# reasoning_mode:
+#   "effort"       - send {"reasoning": {"effort": ...}} in payload (OpenRouter)
+#   "always_on"    - model thinks internally, no reasoning param sent (Kimi K2.7)
+#   "disabled"     - send {"reasoning": {"enabled": false}}
+#   "native_think" - server-controlled thinking, returns reasoning_content natively
+#   "effort_none"  - explicitly send {"reasoning": {"effort": "none"}} to disable thinking
+#   "dsv4_think"   - DSV4 per-request thinking via chat_template_kwargs. Reads the
+#                    per-model "enable_thinking" bool (default True) plus
+#                    REASONING_EFFORT for reasoning_effort.
+#   "qwen3_think"  - Qwen3.x per-request thinking via chat_template_kwargs. Reads
+#                    the per-model "enable_thinking" bool (default True).
+#
+# sampling (optional dict):
+#   Merged directly into the request payload, e.g. {"temperature": 0.7, "top_p":
+#   0.8, "top_k": 20}. Omit to fall back on server defaults (generation_config.json
+#   on vLLM, provider defaults on OpenRouter).
+#
+# Three validated model configs:
+#   dsv4-flash-openrouter - cloud fallback via OpenRouter, sampling aligned with local dsv4
+#   dsv4-cold-think       - local vLLM DSV4 Flash with thinking, best benchmark results
+#   qwen36-hot-nothink    - local vLLM Qwen3.6-27B without thinking, best benchmark results
+
+MODEL_REGISTRY = {
+    "dsv4-flash-openrouter": {
+        "provider": "openrouter",
+        "model": "deepseek/deepseek-v4-flash",
+        "max_tokens": 16000,
+        "max_output_tokens": 32768,
+        # OpenRouter translates {"reasoning": {"effort": "high"}} into the
+        # provider-specific mechanism (chat_template_kwargs for DeepSeek providers).
+        # DSV4 Flash supports effort levels "high" and "xhigh" (maps to max).
+        "reasoning_mode": "effort",
+        # sampling aligned with validated local dsv4-cold-think config.
+        # OpenRouter forwards temperature/top_p/top_k to the underlying provider;
+        # unsupported params are silently ignored, which is safe.
+        "sampling": {"temperature": 0.6, "top_p": 0.95, "top_k": 20},
+    },
+    "dsv4-cold-think": {
+        "provider": "local",
+        "model": "deepseek-v4-flash",
+        "base_url": "http://127.0.0.1:8988",
+        "auth": True,
+        "max_tokens": 16000,
+        "max_output_tokens": 32768,
+        "reasoning_mode": "dsv4_think",
+        "enable_thinking": True,
+        "sampling": {"temperature": 0.6, "top_p": 0.95, "top_k": 20},
+    },
+    "qwen36-hot-nothink": {
+        "provider": "local",
+        "model": "qwen3.6-27b",
+        "base_url": "http://127.0.0.1:8987",
+        "auth": True,
+        "max_tokens": 16000,
+        "max_output_tokens": 32768,
+        "reasoning_mode": "qwen3_think",
+        "enable_thinking": False,
+        "sampling": {"temperature": 1.0, "top_p": 0.95, "top_k": 20},
+    },
 }
 
 
-MODEL_ID = "ds-v4-flash"
-
-# NOTE: WE ALWAYS WANT TO APPEND :exacto, I the user accept any consequences of this decision
-MODEL = ALL_MODELS[MODEL_ID] + ":exacto"
-
-OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+MODEL_ID = os.environ.get("PQ_MODEL", "dsv4-flash-openrouter")
+if MODEL_ID not in MODEL_REGISTRY:
+    sys.exit("Error: unknown model '" + MODEL_ID + "'. " "Known models: " + ", ".join(sorted(MODEL_REGISTRY.keys())))
 
 
-MODEL_OVERRIDES = {
-    "kimi-k2.7-code": {"max_tokens": 16000, "max_output_tokens": 16384, "reasoning_mode": "always_on"},
-    "minimax-m3": {"max_tokens": 16000, "max_output_tokens": 131072, "reasoning_mode": "effort"},
-    "ds-v4-flash": {"max_tokens": 16000, "max_output_tokens": 131072, "reasoning_mode": "effort"},
-    "glm-5.2": {"max_tokens": 16000, "max_output_tokens": 131072, "reasoning_mode": "effort"},
-}
+def _cfg(key, default=None):
+    return MODEL_REGISTRY[MODEL_ID].get(key, default)
 
 
-def _mcfg(key, default=None):
-    return MODEL_OVERRIDES.get(MODEL_ID, {}).get(key, default)
+_PROVIDER = _cfg("provider")
+
+# derive provider-specific globals: API endpoint, auth headers, model string.
+# PQ_API_KEY is the single auth credential for any model that needs one.
+_needs_auth = (_PROVIDER == "openrouter") or _cfg("auth", False)
+
+if _needs_auth:
+    _API_KEY = os.environ.get("PQ_API_KEY")
+    if not _API_KEY:
+        sys.exit("Error: PQ_API_KEY is required for model '" + MODEL_ID + "'.")
+else:
+    _API_KEY = None
+
+if _PROVIDER == "openrouter":
+    _API_URL = "https://openrouter.ai/api/v1/chat/completions"
+    _API_HEADERS = {
+        "Authorization": "Bearer " + _API_KEY,
+        "Content-Type": "application/json",
+        "X-Title": "pq-agent",
+        "HTTP-Referer": "https://github.com/artiedins/pq_agent",
+    }
+
+    _MODEL_STRING = str(_cfg("model"))
+
+elif _PROVIDER == "local":
+    _API_URL = _cfg("base_url", "http://127.0.0.1:8080") + "/v1/chat/completions"
+    if _API_KEY:
+        _API_HEADERS = {
+            "Authorization": "Bearer " + _API_KEY,
+            "Content-Type": "application/json",
+        }
+    else:
+        _API_HEADERS = {"Content-Type": "application/json"}
+    _MODEL_STRING = _cfg("model")
+else:
+    sys.exit("Error: unknown provider '" + _PROVIDER + "' for model '" + MODEL_ID + "'.")
 
 
 # Web/browser configuration.
-# ENABLE_PLAYWRIGHT controls whether the headed-Chrome MCP subsystem loads at all.
-# Web search is DuckDuckGo scraped through that headed browser - there is no
-# keyless search API with a real index, so the browser is the only search path.
-# Set this to False on a host with no playwright/chrome: the MCP server is not
-# started and the web tools (search_web, navigate, extract) are not offered, so the
+# PQ_PLAYWRIGHT controls whether the headed-Chrome MCP subsystem loads at all.
+# Set to 0 on a host with no playwright/chrome: the MCP server is not started
+# and the web tools (search_web, navigate, extract) are not offered, so the
 # harness runs file/shell-only with no web access.
-ENABLE_PLAYWRIGHT = True
+ENABLE_PLAYWRIGHT = os.environ.get("PQ_PLAYWRIGHT", "1") in ("1", "true", "yes")
 
 
-# Single reasoning effort applied to every agent turn. For always-on models (Kimi
-# K2.7 Code) this is ignored - the model thinks internally regardless. For effort
-# models (DeepSeek V4 Flash, MiniMax M3) only "high"/"xhigh" are documented, so keep
-# to those, or set to None to omit the param. Compaction keeps its own effort below.
+# Single reasoning effort applied to every agent turn.
+#
+# FINAL DECISION on per-turn effort: keep uniform "high" for all turns.
+# DSV4 Flash only supports off/high/max (no granularity for "easy" turns), so
+# per-turn adjustment would mean toggling thinking entirely on/off. The local
+# DSV4 config was validated with thinking always on, and the risk of regressions
+# from disabling it on "easy" turns outweighs the cost savings. Qwen3.6 runs
+# with thinking off always, so per-turn effort is irrelevant there. If a future
+# model supports fine-grained effort levels, revisit this decision.
 REASONING_EFFORT = "high"
 REASONING_EFFORT_COMPACTION = "high"
 
 # Soft tool-call budget. The model is told the budget in the system prompt and
 # gets injected notices as it approaches and exceeds it. There is no hard stop;
 # pq_minder's wall clock remains the only hard limit.
-MAX_STEPS_SUGGESTION = 80
-WRAPUP_WARN_AT = 60
+MAX_STEPS_SUGGESTION = 165
+WRAPUP_WARN_AT = 150
+
+# Context-pressure escalation, independent of the tool-call budget above. Once a
+# session has compacted COMPACTION_PRESSURE_THRESHOLD times it is losing fidelity
+# on every further compaction, so when it refills context past these fractions of
+# MAX_CONTEXT_LENGTH we fire the same wrap-up / finish notices that the tool-call
+# budget would. These conditions are OR'ed with WRAPUP_WARN_AT / MAX_STEPS_SUGGESTION.
+COMPACTION_PRESSURE_THRESHOLD = 2
+CTX_WRAPUP_FRACTION = 0.75
+CTX_FINISH_FRACTION = 0.90
+# pre-compaction warning fires once regardless of compaction count, giving the
+# model a chance to write findings to files before compaction hits
+CTX_PRECOMPACT_FRACTION = 0.80
+
+# Conservative context cap, also the compaction trigger point (see chat()). Long
+# context quality degrades well before nominal limits, and compaction itself is a
+# fragile operation - bigger headroom = fewer compaction events = fewer crashes.
+# Lives at module scope so the main loop can measure context fill against it for
+# the context-pressure escalation above.
+MAX_CONTEXT_LENGTH = 150000
 
 # Playwright page extracts front-load the useful part, so we head-truncate them.
 MAX_PLAYWRIGHT_RESULT_TOKENS = 9000
+
+# File reads are head-truncated: the beginning of a file (imports, class defs,
+# function signatures) is the most structurally useful part. Same budget as
+# playwright results.
+MAX_FILE_READ_TOKENS = 16000
 
 # Command output is the opposite: the payoff (final error, traceback, exit summary)
 # is usually at the bottom, so we keep both ends and elide the noisy middle. This
@@ -86,37 +213,40 @@ MAX_COMMAND_RESULT_TOKENS = 9000
 # If the model ends its turn without having written task_report/report.md we
 # nudge it instead of exiting, up to this many times, so a forgetful final turn
 # doesn't burn an entire pq_minder attempt.
-MAX_REPORT_RESCUES = 3
+MAX_REPORT_RESCUES = 16
 
 # Adaptive output boost: on truncation, max_tokens is doubled up to this cap. At
 # DS V4 Flash rates ($0.18/M output), 32000 reserves ~$0.006 per request through
 # OpenRouter - negligible.
 MAX_OUTPUT_BOOST = 32000
 
-# Timeout for API requests to OpenRouter. Thinking models (Kimi always-on,
-# DS V4 with high/xhigh effort) can take well over 60s to first token on long
-# prompts. Set generously to avoid killing in-flight computation on retry.
+# Timeout for API requests to the model server. Thinking models (Kimi always-on,
+# DS V4 with high/xhigh effort, local models with thinking enabled) can take well
+# over 60s to first token on long prompts. Set generously to avoid killing
+# in-flight computation on retry.
 API_REQUEST_TIMEOUT = 300
 
 # Timeout for shell commands run by the model. Needs to be long enough for
 # pip install on a cold cache, compilation with C extensions, and test suites.
 RUN_COMMAND_TIMEOUT = 120
 
+# Fixed max_tokens for compaction summary responses. Hardcoded to 16K regardless
+# of model config to keep summaries bounded. If the model hits this limit the
+# partial summary is used as-is rather than erroring out.
+COMPACTION_MAX_TOKENS = 16000
+
 AGENT_DIR = os.environ.get("AGENT_DIR", os.path.dirname(os.path.abspath(__file__)))
 WORKSPACE = os.path.abspath(os.getcwd())
 
-OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
-if not OPENROUTER_API_KEY:
-    sys.exit("Error: OPENROUTER_API_KEY environment variable is not set.")
 
-HEADERS = {
-    "Authorization": "Bearer " + OPENROUTER_API_KEY,
-    "Content-Type": "application/json",
-    "X-Title": "pq-agent",
-    "HTTP-Referer": "https://github.com/artiedins/pq_agent",
-}
-
-
+# FINAL DECISION on tokenizer: cl100k_base (GPT-4) does not match the native
+# tokenizers for DeepSeek V4 Flash or Qwen3.6-27B, so local estimates can be
+# off by ~20-40%. This is acceptable because the primary compaction trigger uses
+# state["last_post_tokens"] (API-reported real token count), not this estimator.
+# The local estimator is only used for the new_prompt_tokens delta in chat() and
+# the very first turn before any API response. Switching to a model-matched
+# tokenizer would require the heavy `transformers` package and per-model tokenizer
+# downloads, which is not worth the marginal accuracy gain.
 _enc = tiktoken.get_encoding("cl100k_base")
 
 
@@ -132,6 +262,17 @@ def truncate_playwright_text(text):
         return text
     head = _enc.decode(toks[:MAX_PLAYWRIGHT_RESULT_TOKENS])
     return head + "\n**USER AGENT HARNESS NOTICE:** This content has been trimmed due to excessive length. Please use this if you can, otherwise find another way to achieve your goal.\n"
+
+
+def truncate_file_text(text):
+    # head-only truncation for file reads: the beginning of a file (imports,
+    # class definitions, structure) is the most informative part. Unlike command
+    # output where the tail matters, files are best understood top-down.
+    toks = _enc.encode(text)
+    if len(toks) <= MAX_FILE_READ_TOKENS:
+        return text, False
+    head = _enc.decode(toks[:MAX_FILE_READ_TOKENS])
+    return head, True
 
 
 def truncate_command_text(text):
@@ -164,6 +305,8 @@ def est_messages_tokens(messages):
         for key, val in msg.items():
             if val is None:
                 continue
+            if key in ("reasoning", "reasoning_content", "reasoning_details"):
+                continue
             if isinstance(val, str):
                 tokens += len(_enc.encode(val))
             else:
@@ -181,7 +324,7 @@ def post_with_retry(payload):
         if attempt > 0:
             time.sleep(backoff_delay(attempt))
         try:
-            resp = requests.post(OPENROUTER_URL, headers=HEADERS, json=payload, timeout=API_REQUEST_TIMEOUT)
+            resp = requests.post(_API_URL, headers=_API_HEADERS, json=payload, timeout=API_REQUEST_TIMEOUT)
         except requests.exceptions.Timeout:
             if attempt < 8:
                 print(ts() + "  [error] request timed out, retrying (attempt " + str(attempt + 1) + "/8)...")
@@ -189,12 +332,14 @@ def post_with_retry(payload):
             raise
         except requests.exceptions.ConnectionError as e:
             # covers ChunkedEncodingError, broken pipes, reset connections.
-            # these are transient network faults, not OpenRouter account errors.
+            # these are transient network faults, not account errors.
+            # for local models this also covers "server not running yet".
             if attempt < 8:
                 print(ts() + "  [error] connection error, retrying (attempt " + str(attempt + 1) + "/8): " + str(e)[:120])
                 continue
             raise
-        # retry all 5xx, not just 503 - OpenRouter throws 502/520/524 regularly
+        # retry all 5xx, not just 503 - OpenRouter throws 502/520/524 regularly,
+        # and local servers can 500 on edge cases
         if (resp.status_code == 429 or resp.status_code >= 500) and attempt < 8:
             print(ts() + "  [error] " + str(resp.status_code) + " transient error, retrying (attempt " + str(attempt + 1) + "/8)...")
             continue
@@ -232,14 +377,14 @@ def post_with_retry(payload):
             msg = err.get("message", "unknown error")
             # 4xx-class errors from the error body are permanent (bad request,
             # auth, billing) - surface them immediately so the user sees the
-            # raw OpenRouter message. Provider errors (5xx) and content filter
+            # raw error message. Provider errors (5xx) and content filter
             # issues after generation are retryable.
             if isinstance(code, int) and 400 <= code < 500 and code != 429:
-                raise RuntimeError("OpenRouter error " + str(code) + ": " + msg)
+                raise RuntimeError("API error " + str(code) + ": " + msg)
             if attempt < 8:
                 print(ts() + "  [error] response has error instead of choices (code=" + str(code) + "), retrying (attempt " + str(attempt + 1) + "/8): " + msg[:120])
                 continue
-            raise RuntimeError("OpenRouter error after retries: " + str(code) + ": " + msg)
+            raise RuntimeError("API error after retries: " + str(code) + ": " + msg)
         break
     return resp
 
@@ -253,9 +398,9 @@ def post_compaction(payload):
         # defensive fallback: if the server rejects the reasoning param, retry without it.
         # with the round-trip working this should rarely fire, but keeping it as a safety
         # net for future provider quirks. the warning will be visible in logs.
-        if e.response.status_code == 400 and "reasoning" in payload:
+        if e.response.status_code == 400 and ("reasoning" in payload or "chat_template_kwargs" in payload):
             print(ts() + "  [warn] reasoning param rejected, retrying without it...")
-            payload = {k: v for k, v in payload.items() if k != "reasoning"}
+            payload = {k: v for k, v in payload.items() if k not in ("reasoning", "chat_template_kwargs")}
             resp = post_with_retry(payload)
             resp.raise_for_status()
             return resp
@@ -272,7 +417,10 @@ def extract_compaction_summary(raw_msg):
     if content.lower() in ("none", "yes"):
         content = ""
 
-    # gather reasoning from all OpenRouter shapes
+    # gather reasoning from all known response shapes:
+    # - OpenRouter: reasoning, reasoning_content, reasoning_details
+    # - llama.cpp:  reasoning_content (with --reasoning-format deepseek)
+    # - DSV4 vLLM:  reasoning_content (via --reasoning-parser deepseek_v4)
     reasoning = raw_msg.get("reasoning") or raw_msg.get("reasoning_content") or ""
     if isinstance(reasoning, str):
         reasoning = reasoning.strip()
@@ -300,64 +448,105 @@ def extract_compaction_summary(raw_msg):
     return summary.strip() or None
 
 
-def build_reasoning_param(effort):
-    # construct the reasoning dict for the payload based on per-model config.
-    # returns None when no reasoning param should be sent.
-    rmode = _mcfg("reasoning_mode", "effort")
-    if rmode == "always_on":
-        # model always thinks internally; sending effort is unnecessary and
-        # some providers reject it. omit the param entirely.
-        return None
-    if rmode == "disabled":
-        # model performs best without thinking in agentic loops
-        return {"enabled": False}
-    # default "effort" mode
-    if effort:
-        return {"effort": effort}
-    return None
+def apply_reasoning(payload, effort):
+    # inject the appropriate reasoning control into the payload based on per-model
+    # config. mutates payload in place. handles six mechanisms:
+    # - "effort":       OpenRouter {"reasoning": {"effort": ...}}
+    # - "effort_none":  OpenRouter {"reasoning": {"effort": "none"}} (explicit thinking off)
+    # - "dsv4_think":   vLLM DSV4 {"chat_template_kwargs": {"thinking": <enable_thinking>, ...}}
+    # - "qwen3_think":  vLLM Qwen3.x {"chat_template_kwargs": {"enable_thinking": <enable_thinking>}}
+    # - "disabled":     OpenRouter {"reasoning": {"enabled": false}}
+    # - "always_on" / "native_think": send nothing (server or model controls thinking)
+    rmode = _cfg("reasoning_mode", "effort")
+    if rmode == "dsv4_think":
+        payload["chat_template_kwargs"] = {
+            "thinking": _cfg("enable_thinking", True),
+            "reasoning_effort": effort or "high",
+        }
+    elif rmode == "qwen3_think":
+        payload["chat_template_kwargs"] = {"enable_thinking": _cfg("enable_thinking", True)}
+    elif rmode == "effort_none":
+        # DSV4 on OpenRouter defaults to thinking when no reasoning param is sent;
+        # effort: "none" is the only way to explicitly disable it via OpenRouter
+        payload["reasoning"] = {"effort": "none"}
+    elif rmode == "effort" and effort:
+        payload["reasoning"] = {"effort": effort}
+    elif rmode == "disabled":
+        payload["reasoning"] = {"enabled": False}
+    # "always_on" and "native_think": no reasoning param needed
+
+
+def _get_workspace_snapshot():
+    # filesystem snapshot for compaction context. excludes dotfiles/dot-dirs
+    # (e.g. .git, .pq, .env) which are either harness internals or irrelevant.
+    try:
+        snap = subprocess.run(
+            "find . -not -path '*/.*' -type f | sort | head -200",
+            shell=True,
+            cwd=WORKSPACE,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        return snap.stdout.strip() or "(empty workspace)"
+    except Exception:
+        return "(could not generate file listing)"
 
 
 def chat(messages, tools, new_messages, state, session_messages):
-    # 150K is a conservative cap. Long-context quality degrades well before
-    # nominal limits, and compaction itself is a fragile operation - bigger
-    # headroom = fewer compaction events = fewer crashes.
-    MAX_CONTEXT_LENGTH = 150000
-
+    # MAX_CONTEXT_LENGTH (module scope) is the conservative cap and compaction
+    # trigger point. Long-context quality degrades well before nominal limits,
+    # and compaction itself is fragile - bigger headroom = fewer compaction
+    # events = fewer crashes.
     new_prompt_tokens = est_messages_tokens(new_messages)
     pre_prompt_total_context = state["last_post_tokens"] + new_prompt_tokens
 
     if pre_prompt_total_context > MAX_CONTEXT_LENGTH:
         print(ts() + "PERFORM COMPACTION", flush=True)
         state["compaction_count"] += 1
+        file_listing = _get_workspace_snapshot()
         compaction_prompt = (
-            "The agent context limit was reached and this session is being compacted. "
-            "The conversation above is the full committed session history. "
-            "Write a compact plain-text summary covering:\n"
-            "1. What actions were taken and whether they succeeded or failed.\n"
-            "2. Current state of any modified files (exact filenames, key content or structure).\n"
-            "3. Any discovered facts relevant to completing the task (e.g. specific data values found).\n"
-            "4. Immediate next step.\n"
-            "5. Preserve exact file paths, function signatures, variable names, and data values. "
-            "Vague descriptions like 'modified the solver' are not helpful for resuming work.\n"
-            "Include any prior compaction summaries in condensed form.\n"
-            "Do NOT summarize the system prompt or initial task instructions - those are provided fresh.\n"
-            "Be terse. If this summary exceeds 9000 tokens it will be clipped.\n"
-            "Minimize thinking and output summary content.\n"
+            "CONTEXT COMPACTION:\n"
+            "We hit the context limit and need to condense all messages and findings before continuing work.\n"
+            "Rules: No tool calls (they will be ignored). Make one regular reply.\n"
+            "Your target is yourself - as if you suddenly lost access to this session, what info would you need to continue work without interruption or backtracking?\n"
+            "Do NOT summarize the system prompt or initial task instructions - those will be provided again.\n"
+            "\nCurrent files in workspace:\n" + file_listing + "\n"
+            "\nFill in this template precisely:\n"
+            "\n## Actions Taken\n"
+            "[List each action, whether it succeeded or failed, and the outcome]\n"
+            "\n## Files Modified\n"
+            "[Exact filenames and current state of each. Note any in-progress work.]\n"
+            "\n## Key Facts Discovered\n"
+            "[Specific data values, error messages, measurements, or findings relevant to the task]\n"
+            "\n## What Failed and Why\n"
+            "[Approaches that did not work so your future self does not repeat them]\n"
+            "\n## Immediate Next Step\n"
+            "[Exactly what to do next to continue without backtracking]\n"
+            "\n## Prior Compaction Summaries\n"
+            "[Condense any earlier compaction summaries here]\n"
+            "\nBe precise: preserve exact file paths, function signatures, variable names, and data values that are not captured in files on disk.\n"
         )
-        max_tok = _mcfg("max_tokens", 16000)
         compaction_payload = {
-            "model": MODEL,
-            "max_tokens": max_tok,
+            "model": _MODEL_STRING,
+            "max_tokens": COMPACTION_MAX_TOKENS,
             "messages": messages + new_messages + [{"role": "user", "content": compaction_prompt}],
         }
-        rparam = build_reasoning_param(REASONING_EFFORT_COMPACTION)
-        if rparam:
-            compaction_payload["reasoning"] = rparam
+        apply_reasoning(compaction_payload, REASONING_EFFORT_COMPACTION)
         new_messages.clear()
 
         resp_json = post_compaction(compaction_payload).json()
-        raw_msg = resp_json["choices"][0]["message"]
+        choice = resp_json["choices"][0]
+        raw_msg = choice["message"]
+        finish = choice.get("finish_reason")
         summary = extract_compaction_summary(raw_msg)
+
+        if finish == "length":
+            # compaction response was truncated at COMPACTION_MAX_TOKENS. use
+            # whatever we got rather than erroring - a partial summary is better
+            # than crashing the run. the good stuff may be cut off but the user
+            # chose not to change the compaction prompt for now.
+            print(ts() + "  [warn] compaction summary truncated at " + str(COMPACTION_MAX_TOKENS) + " max_tokens; using partial summary")
 
         print()
         print("-" * 80)
@@ -371,20 +560,14 @@ def chat(messages, tools, new_messages, state, session_messages):
         if not summary:
             raise Exception("compaction returned no usable summary")
 
-        # enforce the clip promised in the compaction prompt
-        toks = _enc.encode(summary)
-        if len(toks) > 9000:
-            summary = _enc.decode(toks[:9000], errors="replace") + "\n[summary clipped at 9000 tokens]"
-
         summary_msg = {"role": "user", "content": "[context compacted] Session summary:\n" + summary}
 
         # post-compaction message list is system + user summary only - no
         # assistant messages survive, so there is no reasoning_content /
         # reasoning_details state that needs to be preserved. the next API call
         # starts a fresh assistant turn from the summary context. this is safe
-        # for all three backends (Kimi, MiniMax, DeepSeek) because the
-        # reasoning passback requirement only applies to continuing from a
-        # prior assistant turn, not starting fresh.
+        # for all backends because the reasoning passback requirement only
+        # applies to continuing from a prior assistant turn, not starting fresh.
         new_session = list(session_messages) + [summary_msg]
         messages.clear()
         messages += new_session
@@ -397,17 +580,18 @@ def chat(messages, tools, new_messages, state, session_messages):
     messages += new_messages
     new_messages.clear()
 
-    max_tok = state.get("max_tokens_override") or _mcfg("max_tokens", 16000)
+    max_tok = state.get("max_tokens_override") or _cfg("max_tokens", 16000)
     payload = {
-        "model": MODEL,
+        "model": _MODEL_STRING,
         "tools": tools,
         "tool_choice": "auto",
         "max_tokens": max_tok,
         "messages": messages,
     }
-    rparam = build_reasoning_param(REASONING_EFFORT)
-    if rparam:
-        payload["reasoning"] = rparam
+    sampling = _cfg("sampling")
+    if sampling:
+        payload.update(sampling)
+    apply_reasoning(payload, REASONING_EFFORT)
 
     data = post_with_retry(payload).json()
 
@@ -524,10 +708,14 @@ def call_playwright(mcp, name, arguments):
             print(ts() + "  [mcp timeout] attempt " + str(attempt + 1) + "/9 on " + ctx[:80] + ": " + str(e))
 
 
-def safe_path(filename):
+def safe_path(filename, write=False):
+    # resolves filename relative to WORKSPACE. for reads (write=False), any
+    # path is allowed - the bubblewrap/docker container is the security boundary.
+    # for writes (write=True), restrict to the workspace to prevent accidental
+    # modification of system files (e.g. /usr/lib/) mid-task.
     target = os.path.abspath(os.path.join(WORKSPACE, filename))
-    if not target.startswith(WORKSPACE):
-        raise ValueError("path '" + filename + "' resolves outside workspace")
+    if write and not target.startswith(WORKSPACE):
+        raise ValueError("path '" + filename + "' resolves outside workspace - writes are restricted to the workspace directory")
     return target
 
 
@@ -542,12 +730,20 @@ def tool_write_file(filename, content):
         if ext not in (".md", ".jpg", ".jpeg", ".png"):
             return "Error: task_report/ only accepts .md, .jpg, and .png files. Got: " + ext
 
-    target = safe_path(filename)
-    parent = os.path.dirname(target)
-    if parent:
-        os.makedirs(parent, exist_ok=True)
-    with open(target, "w", encoding="utf-8") as f:
-        f.write(content)
+    try:
+        target = safe_path(filename, write=True)
+    except ValueError as e:
+        return "Error: " + str(e)
+
+    try:
+        parent = os.path.dirname(target)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(target, "w", encoding="utf-8") as f:
+            f.write(content)
+    except (IsADirectoryError, PermissionError, OSError) as e:
+        return "Error writing file '" + filename + "': " + str(e)
+
     lines = content.splitlines()
     rel = os.path.relpath(target, WORKSPACE)
     print(ts() + "  [tool call] write_file: " + rel + " (" + str(len(lines)) + " lines)")
@@ -556,23 +752,47 @@ def tool_write_file(filename, content):
 
 def tool_read_file(filename):
     target = safe_path(filename)
+    if os.path.isdir(target):
+        return "Error: '" + filename + "' is a directory, not a file. Use run_command('ls -la " + filename + "') to list its contents."
     if not os.path.exists(target):
         return "Error: file not found: " + filename
-    with open(target, "r", encoding="utf-8") as f:
-        lines = f.read().splitlines()
-    rel = os.path.relpath(target, WORKSPACE)
+
+    try:
+        with open(target, "r", encoding="utf-8", errors="replace") as f:
+            content = f.read()
+    except (PermissionError, OSError) as e:
+        return "Error reading file '" + filename + "': " + str(e)
+
+    lines = content.splitlines()
+    rel = os.path.relpath(target, WORKSPACE) if target.startswith(WORKSPACE) else target
     print(ts() + "  [tool call] read_file: " + rel + " (" + str(len(lines)) + " lines)")
     # plain numbered lines (cat -n style). The number+tab prefix is for reference
     # only; str_replace matches against the line text without it.
-    return "\n".join("{:>5}\t{}".format(i, l.rstrip()) for i, l in enumerate(lines, 1))
+    numbered = "\n".join("{:>5}\t{}".format(i, l.rstrip()) for i, l in enumerate(lines, 1))
+    truncated, was_truncated = truncate_file_text(numbered)
+    if was_truncated:
+        truncated += (
+            "\n**USER AGENT HARNESS NOTICE:** File truncated at ~" + str(MAX_FILE_READ_TOKENS) + " tokens. Use run_command(\"sed -n 'START,ENDp' " + filename + '") or grep for targeted reads.\n'
+        )
+    return truncated
 
 
 def tool_str_replace(filename, old_str, new_str):
-    target = safe_path(filename)
+    try:
+        target = safe_path(filename, write=True)
+    except ValueError as e:
+        return "Error: " + str(e)
+
+    if os.path.isdir(target):
+        return "Error: '" + filename + "' is a directory, not a file."
     if not os.path.exists(target):
         return "Error: file not found: " + filename + " - use write_file to create it first"
-    with open(target, "r", encoding="utf-8") as f:
-        content = f.read()
+
+    try:
+        with open(target, "r", encoding="utf-8", errors="replace") as f:
+            content = f.read()
+    except (PermissionError, OSError) as e:
+        return "Error reading file '" + filename + "': " + str(e)
 
     count = content.count(old_str)
     if count == 0:
@@ -585,8 +805,11 @@ def tool_str_replace(filename, old_str, new_str):
         return "Error: old_str appears " + str(count) + " times in " + filename + " - include more surrounding lines so it matches exactly once."
 
     new_content = content.replace(old_str, new_str, 1)
-    with open(target, "w", encoding="utf-8") as f:
-        f.write(new_content)
+    try:
+        with open(target, "w", encoding="utf-8") as f:
+            f.write(new_content)
+    except (PermissionError, OSError) as e:
+        return "Error writing file '" + filename + "': " + str(e)
 
     rel = os.path.relpath(target, WORKSPACE)
     n_lines = len(new_content.splitlines())
@@ -595,11 +818,10 @@ def tool_str_replace(filename, old_str, new_str):
 
 
 def tool_run_command(command):
-    # scrub the API key from the child environment; commands the model runs
-    # have no legitimate need for it. note this is best-effort (same-user
-    # processes can still read /proc), but it stops accidental leaks via env
-    # dumps in debug output that would then flow back into the conversation.
-    child_env = {k: v for k, v in os.environ.items() if k != "OPENROUTER_API_KEY"}
+    # scrub API keys from the child environment; commands the model runs
+    # have no legitimate need for them. catches PQ_API_KEY and any other
+    # env var ending in _API_KEY.
+    child_env = {k: v for k, v in os.environ.items() if not k.endswith("_API_KEY")}
     # file-backed output instead of pipes. pipes block on close, so a
     # backgrounded child ("python3 -m http.server &") keeps communicate()
     # stuck for the full timeout even though the shell exited instantly.
@@ -653,11 +875,9 @@ def tool_run_command(command):
 
 
 def tool_search_web(mcp, query):
-    # DDG via the headed browser: encode the query, navigate DDG plain HTML, extract
-    # markdown. Collapsing navigate+extract into one call removes the URL-encoding and
-    # sequencing failure modes that trip up small models. This is the only search
+    # This is the only search
     # backend; the tool is only offered when ENABLE_PLAYWRIGHT is True.
-    url = "https://html.duckduckgo.com/html/?q=" + urllib.parse.quote_plus(query)
+    url = "https://search.brave.com/search?q=" + urllib.parse.quote_plus(query)
     call_playwright(mcp, "playwright_navigate", {"url": url})
     text = call_playwright(mcp, "playwright_extract_content", {})
     print(ts() + "[tool call] search_web: " + query[:80] + " | " + str(len(text)) + " chars")
@@ -668,6 +888,17 @@ def tool_search_web(mcp, query):
 
 
 def dispatch_tool(mcp, name, arguments):
+    # general-purpose safety net: nothing the model does via tool calls should
+    # crash the harness. Infrastructure errors (API down, auth failed) propagate
+    # from post_with_retry/chat, not from here.
+    try:
+        return _dispatch_tool_inner(mcp, name, arguments)
+    except Exception as e:
+        print(ts() + "  [tool call] " + name + ": UNHANDLED ERROR " + type(e).__name__ + ": " + str(e)[:200])
+        return "Error: " + type(e).__name__ + ": " + str(e) + " - please try a different approach."
+
+
+def _dispatch_tool_inner(mcp, name, arguments):
     if name == "search_web":
         return tool_search_web(mcp, arguments["query"])
 
@@ -683,7 +914,12 @@ def dispatch_tool(mcp, name, arguments):
         return text
 
     if name == "write_file":
-        return tool_write_file(arguments["filename"], arguments["content"])
+        fn = arguments.get("filename") or arguments.get("path") or arguments.get("file")
+        ct = arguments.get("content") or arguments.get("text") or arguments.get("data")
+        if not fn or ct is None:
+            print(ts() + "  [tool call] write_file: MISSING PARAMETER (got keys: " + str(list(arguments.keys())) + ")")
+            return "Error: write_file requires 'filename' and 'content' - DO NOT FORGET THE FILENAME ARG AGAIN! Got keys: " + str(list(arguments.keys()))
+        return tool_write_file(fn, ct)
     if name == "read_file":
         return tool_read_file(arguments["filename"])
     if name == "str_replace":
@@ -728,11 +964,13 @@ def make_tools():
                 "type": "function",
                 "function": {
                     "name": "search_web",
-                    "description": "Search the web and get results back as text/markdown. Provide a plain text query e.g. 'python csv parsing example'. Use this for ALL web searches - do not build search URLs yourself.",
+                    "strict": True,
+                    "description": "Search the web via Brave and get results back as text/markdown. Results may be less comprehensive than Google - for deeper research, navigate directly to known URLs (docs sites, Stack Overflow, Reddit). Provide a plain text query e.g. 'python csv parsing example'. Use this for ALL web searches - do not build search URLs yourself.",
                     "parameters": {
                         "type": "object",
                         "properties": {"query": {"type": "string", "description": "Plain text search query"}},
                         "required": ["query"],
+                        "additionalProperties": False,
                     },
                 },
             }
@@ -742,11 +980,13 @@ def make_tools():
                 "type": "function",
                 "function": {
                     "name": "playwright_navigate",
+                    "strict": True,
                     "description": "Navigate the browser to a specific URL and return the page content as markdown. Use this for visiting known URLs (e.g. links found in search results). For searches use the search_web tool instead.",
                     "parameters": {
                         "type": "object",
                         "properties": {"url": {"type": "string"}},
                         "required": ["url"],
+                        "additionalProperties": False,
                     },
                 },
             }
@@ -775,28 +1015,33 @@ def make_tools():
             "type": "function",
             "function": {
                 "name": "write_file",
-                "description": "Create or overwrite a file with the given content. Use a relative path e.g. 'solution.py'. You MUST use this tool to create new files - do not write file content in your reply. Also the best choice when rewriting most or all of a file (under about 200 lines).",
+                "strict": True,
+                "description": "Create or overwrite a file with the given content. ALWAYS include a filename argument. Use a relative path e.g. 'analysis.py'. You MUST use this tool to create new files - do not write file content in your reply. Also the best choice when rewriting most or all of a file.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "filename": {"type": "string"},
+                        "filename": {"type": "string", "description": "Relative path, e.g. 'analysis.py'. ALWAYS provide this."},
                         "content": {"type": "string"},
                     },
                     "required": ["filename", "content"],
+                    "additionalProperties": False,
                 },
             },
         }
     )
+
     tools.append(
         {
             "type": "function",
             "function": {
                 "name": "read_file",
+                "strict": True,
                 "description": "Read a file. Returns each line prefixed with its line number and a tab, e.g. '    3\\tsome text here'. The line numbers are for reference only - when using str_replace, supply the exact line text WITHOUT the leading number+tab. You MUST call read_file before editing a file with str_replace.",
                 "parameters": {
                     "type": "object",
                     "properties": {"filename": {"type": "string"}},
                     "required": ["filename"],
+                    "additionalProperties": False,
                 },
             },
         }
@@ -806,6 +1051,7 @@ def make_tools():
             "type": "function",
             "function": {
                 "name": "str_replace",
+                "strict": True,
                 "description": "Edit a file by replacing one exact occurrence of old_str with new_str. old_str must match the file content exactly (including whitespace and indentation, but WITHOUT the line-number+tab prefix shown by read_file) and must appear exactly once - include enough surrounding lines to make it unique. For creating a file or rewriting most of it, use write_file instead. Call read_file first to see current content.",
                 "parameters": {
                     "type": "object",
@@ -815,6 +1061,7 @@ def make_tools():
                         "new_str": {"type": "string", "description": "Replacement text"},
                     },
                     "required": ["filename", "old_str", "new_str"],
+                    "additionalProperties": False,
                 },
             },
         }
@@ -824,6 +1071,7 @@ def make_tools():
             "type": "function",
             "function": {
                 "name": "run_command",
+                "strict": True,
                 "description": "Run a shell command in the workspace and return its output. Timeout is " + str(RUN_COMMAND_TIMEOUT) + " seconds.",
                 "parameters": {
                     "type": "object",
@@ -831,6 +1079,7 @@ def make_tools():
                         "command": {"type": "string", "description": "Shell command to run e.g. 'python3 solution.py'"},
                     },
                     "required": ["command"],
+                    "additionalProperties": False,
                 },
             },
         }
@@ -843,7 +1092,7 @@ def make_system_prompt():
     if ENABLE_PLAYWRIGHT:
         intro_tools = "browser, shell, and file tools"
         web_block = (
-            "3. For web searches use the search_web tool with a plain text query.\n"
+            "5. For web searches use the search_web tool with a plain text query.\n"
             "   - Web research tool: a headed, stateful Chrome via playwright that returns pages as markdown; "
             "prefer it over curl/wget from the command line unless absolutely necessary.\n"
             "   - Use playwright_navigate to open a known URL and playwright_extract_content to read the current page.\n"
@@ -858,15 +1107,27 @@ def make_system_prompt():
         web_block = ""
     return (
         "You are an autonomous agent with " + intro_tools + ".\n"
+        "\nAgent Contract:\n"
+        "1. Work hard to complete the task and all system requirements.\n"
+        "2. If there is work remaining, your response must include at least one tool call. You may include brief reasoning text alongside tool calls, but do not make text-only replies while work remains. Text-only replies indicate you are finished and trigger a '[harness notice]'.\n"
+        "3. Follow tool call API calling conventions and formatting PRECISELY - no extra XML (<tool_call> etc.) or whitespace.\n"
+        "4. The ONLY exception to rule 2: when asked to summarize the session for context compaction, respond with a precisely crafted regular reply. Tool calls will not work past context compaction limits.\n"
+        "5. Every file tool (write_file, read_file, str_replace) needs the 'filename' argument naming the file to act on. Include it in the same tool call as the other arguments - for write_file, send 'filename' alongside 'content', not content alone.\n"
         "\nTool rules:\n"
-        "1. Always use tools for file operations and commands - never output file contents in your reply.\n"
+        "1. Always use tools for file operations and commands. Never output file contents in your reply.\n"
         "2. To edit a file: call read_file first, then pick the right tool:\n"
-        "   - str_replace: for targeted edits (replace an exact, unique snippet, WITHOUT read_file's line-number prefix).\n"
-        "   - write_file: for creating a file or rewriting most or all of it.\n" + web_block + "\nVerification:\n"
+        "   - str_replace: for a small, targeted change to part of a file. Match an exact, unique snippet (WITHOUT read_file's line-number prefix).\n"
+        "   - write_file: for a new file, or when replacing most or all of an existing one.\n"
+        "3. Code organization: prefer fewer, well-named files over many small ones. Iterate on an existing script (overwrite it with write_file) rather than creating numbered variants like analyze2.py, analyze3.py. Each new file adds to context; reusing one file keeps context lean.\n"
+        "4. To list directory contents, use run_command with 'ls -la <path>'. To read a file outside the workspace, use read_file with the full path.\n"
+        + web_block
+        + "\nError recovery: If a tool returns an error, read the error message and retry with corrected arguments. Tool errors are recoverable and will not crash the harness.\n"
+        "\nResource budget: You have a soft budget of approximately " + str(MAX_STEPS_SUGGESTION) + " tool calls. Plan before executing and combine operations when practical.\n"
+        "\nVerification Report:\n"
         "Before writing your report, verify your work by actually running it: execute your code, re-read final files, "
-        "re-check computed values. Include the real observed output in your report. "
+        "re-check computed values. Include any relevant real observed output in your report. "
         "A report that claims success without demonstrated verification is incomplete.\n"
-        "\nWhen the task is complete, use write_file to create task_report/report.md containing:\n"
+        "\nWhen the task is complete, create task_report/report.md containing:\n"
         "1. A step-by-step summary of what you did.\n"
         "2. Key decisions and why you made them.\n"
         "3. Anything you are uncertain about.\n"
@@ -886,6 +1147,7 @@ def write_stats(state, start_time):
     ec = state["edit_counts"]
     with open(stats_path, "w", encoding="utf-8") as f:
         f.write("model_id: " + MODEL_ID + "\n")
+        f.write("provider: " + _PROVIDER + "\n")
         f.write("final_context_tokens: " + str(state["last_post_tokens"]) + "\n")
         f.write("compaction_count: " + str(state["compaction_count"]) + "\n")
         f.write("elapsed_minutes: " + "{:.2f}".format(elapsed_minutes) + "\n")
@@ -900,10 +1162,28 @@ def write_stats(state, start_time):
 
 
 def main():
+    # startup: archive previous task_report then wipe it
+    task_report_dir = os.path.join(WORKSPACE, "task_report")
+    report_path = os.path.join(task_report_dir, "report.md")
+    previous_sessions_dir = os.path.join(WORKSPACE, "previous_sessions")
+    if os.path.isdir(task_report_dir):
+        if os.path.isfile(report_path):
+            os.makedirs(previous_sessions_dir, exist_ok=True)
+            i = 0
+            while i < 1000:
+                candidate = os.path.join(previous_sessions_dir, "{:03d}_report.md".format(i))
+                if not os.path.exists(candidate):
+                    shutil.copy2(report_path, candidate)
+                    print(ts() + "Archived previous report to " + os.path.relpath(candidate, WORKSPACE))
+                    break
+                i += 1
+        shutil.rmtree(task_report_dir)
+        print(ts() + "Cleared previous task_report.")
+
     start_time = time.time()
 
-    print(ts() + "Agent model: " + MODEL, flush=True)
-    rmode = _mcfg("reasoning_mode", "effort")
+    print(ts() + "Agent model: " + MODEL_ID + " (" + _PROVIDER + ") -> " + _MODEL_STRING, flush=True)
+    rmode = _cfg("reasoning_mode", "effort")
     if rmode != "effort":
         print(ts() + "Reasoning mode: " + rmode, flush=True)
 
@@ -945,8 +1225,11 @@ def main():
     print(ts() + "Starting agent loop...\n")
 
     tool_calls_done = 0
-    warned_wrapup = False
-    warned_over = False
+    warned_wrapup_calls = False
+    warned_over_calls = False
+    warned_wrapup_ctx = False
+    warned_over_ctx = False
+    warned_precompact = False
     report_rescues = 0
 
     try:
@@ -955,17 +1238,48 @@ def main():
             choice = response["choices"][0]
             msg = choice["message"]
             finish = choice["finish_reason"]
-            # CRITICAL: msg may include reasoning_details / reasoning / reasoning_content fields
-            # when thinking mode is on. Appending the dict verbatim preserves them so they
-            # round-trip on the next request. Do NOT strip these fields - DeepSeek 400s if a
-            # prior tool-call turn's reasoning state is missing on the follow-up. MiniMax and
-            # Kimi K2.7 Code also require preserved reasoning across turns.
+
+            # debug to catch bad tool-calling behavior
+            tc_count = len(msg.get("tool_calls") or [])
+            content_preview = (msg.get("content") or "")[:150].replace("\n", "\\n")
+            print(ts() + "  [resp] tool_calls=" + str(tc_count) + " finish=" + str(finish) + " content=" + repr(content_preview))
+
+            # CRITICAL: msg may include reasoning_details / reasoning / reasoning_content
+            # fields when thinking mode is on. Appending the dict verbatim preserves them
+            # so they round-trip on the next request. Do NOT strip these fields:
+            # - OpenRouter DeepSeek 400s if a prior tool-call turn's reasoning state is
+            #   missing on the follow-up. MiniMax and Kimi K2.7 Code also require it.
+            # - llama.cpp tolerates these fields in round-tripped messages (ignores them
+            #   when generating its own reasoning).
+            # - DSV4 vLLM: reasoning_content round-trips correctly through the OpenAI-
+            #   compatible API (same field name as DeepSeek R1).
             new_messages.append(msg)
 
             # branch on the presence of tool_calls rather than finish_reason: some
             # providers report tool calls under finish_reason "stop", and a "length"
             # finish can still carry complete earlier tool calls
             tool_calls = msg.get("tool_calls") or []
+
+            # rescue tool calls that the model emitted as raw hermes XML in content
+            # (known vLLM issue: reasoning parser can swallow tool calls inside <think>)
+            if not tool_calls:
+                content = msg.get("content") or ""
+                if "<tool_call>" in content:
+                    for m in re.finditer(r"<tool_call>\s*(\{.*?\})\s*(?:</tool_call>|$)", content, re.DOTALL):
+                        try:
+                            parsed = json.loads(m.group(1))
+                            name = parsed.get("name")
+                            args = parsed.get("arguments", {})
+                            if isinstance(args, str):
+                                args = json.loads(args)
+                            if name:
+                                tool_calls.append({"function": {"name": name, "arguments": json.dumps(args)}, "id": "rescued-" + str(len(tool_calls)), "type": "function"})
+                        except (ValueError, TypeError):
+                            continue
+                    if tool_calls:
+                        msg["tool_calls"] = tool_calls
+                        msg["content"] = None
+                        print(ts() + "  [warn] rescued " + str(len(tool_calls)) + " inline tool call(s) from content")
 
             if tool_calls:
                 # model produced parseable tool calls - drop any output boost
@@ -976,7 +1290,8 @@ def main():
                     # two layers of cheap-model error recovery:
                     # layer 1: malformed JSON in tool call arguments
                     # layer 2: valid JSON but wrong/missing parameter keys
-                    # both return the error as a tool result so the model self-corrects
+                    # both return the error as a tool result so the model self-corrects.
+                    # layer 3 (in dispatch_tool): general except for anything else
                     try:
                         fn_args = json.loads(tc["function"]["arguments"])
                     except (ValueError, TypeError) as e:
@@ -985,8 +1300,10 @@ def main():
                     else:
                         try:
                             tool_result = dispatch_tool(mcp, fn_name, fn_args)
+
                         except KeyError as e:
                             print(ts() + "  [tool call] " + fn_name + ": MISSING PARAMETER " + str(e))
+                            print(ts() + "    got keys: " + str(list(fn_args.keys())))
                             tool_result = "Error: tool call missing required parameter " + str(e) + ". Check the tool definition and re-issue with the correct parameter names."
                         except TypeError as e:
                             print(ts() + "  [tool call] " + fn_name + ": BAD PARAMETER TYPE")
@@ -1003,29 +1320,93 @@ def main():
                     )
                     tool_calls_done += 1
 
-                # soft budget notices, each injected at most once
-                if not warned_wrapup and tool_calls_done >= WRAPUP_WARN_AT:
-                    warned_wrapup = True
+                # soft budget notices, each injected at most once. Two independent
+                # pressures can trigger each notice: the tool-call count, and (once
+                # the session has compacted COMPACTION_PRESSURE_THRESHOLD times) the
+                # raw context fill. last_post_tokens is the API-reported prompt_tokens
+                # of the most recent request - the freshest real measure of context.
+                print("TCC", tool_calls_done, flush=True)
+                ctx_tokens = state["last_post_tokens"]
+                ctx_frac = (ctx_tokens / MAX_CONTEXT_LENGTH) if MAX_CONTEXT_LENGTH else 0.0
+                ctx_pressure = state["compaction_count"] >= COMPACTION_PRESSURE_THRESHOLD
+
+                if tool_calls_done > 250:
+                    print("-- STRONGEST WARNING TO WRAP UP ---", flush=True)
+                    reason = "You have used " + str(tool_calls_done) + " tool calls, way past the upper limit allowed for this task."
                     new_messages.append(
                         {
                             "role": "user",
-                            "content": "[harness notice] You have used "
-                            + str(tool_calls_done)
-                            + " of a suggested "
-                            + str(MAX_STEPS_SUGGESTION)
-                            + " tool calls. Start wrapping up: verify what you have built and write task_report/report.md soon.",
+                            "content": "[harness notice] " + reason + " Follow system instructions to write task_report/report.md immediately.",
                         }
                     )
-                if not warned_over and tool_calls_done >= MAX_STEPS_SUGGESTION:
-                    warned_over = True
+
+                if ctx_frac < 0.5:
+                    warned_wrapup_ctx = False
+                    warned_over_ctx = False
+                    warned_precompact = False
+
+                # pre-compaction warning: fires once regardless of compaction count,
+                # giving the model a chance to write findings to files before compaction
+                if not warned_precompact and ctx_frac >= CTX_PRECOMPACT_FRACTION:
+                    warned_precompact = True
+                    print("-- PRE-COMPACTION WARNING ---", flush=True)
                     new_messages.append(
                         {
                             "role": "user",
-                            "content": "[harness notice] You have exceeded the suggested budget of "
-                            + str(MAX_STEPS_SUGGESTION)
-                            + " tool calls. Finish now: verify what you have, write task_report/report.md, and reply with your completion confirmation.",
+                            "content": "[harness notice] Context is " + "{:.0f}".format(ctx_frac * 100) + "% full. "
+                            "Consider writing important findings or notes to files now, as context compaction may happen soon. "
+                            "Information in files survives compaction; information only in message history may be compressed.",
                         }
                     )
+
+                steps_wrapup = tool_calls_done >= WRAPUP_WARN_AT
+                ctx_wrapup = ctx_pressure and ctx_frac >= CTX_WRAPUP_FRACTION
+
+                if not warned_wrapup_calls and steps_wrapup:
+                    warned_wrapup_calls = True
+                    print("-- WARNING TO WRAP UP ---", flush=True)
+                    reason = "You have used " + str(tool_calls_done) + " of a suggested " + str(MAX_STEPS_SUGGESTION) + " tool calls."
+                    new_messages.append(
+                        {
+                            "role": "user",
+                            "content": "[harness notice] " + reason + " Start wrapping up: verify what you have built and write task_report/report.md soon.",
+                        }
+                    )
+                if not warned_wrapup_ctx and ctx_wrapup:
+                    warned_wrapup_ctx = True
+                    print("-- WARNING TO WRAP UP ---", flush=True)
+                    reason = "Context is " + "{:.0f}".format(ctx_frac * 100) + "% full after " + str(state["compaction_count"]) + " compactions."
+                    new_messages.append(
+                        {
+                            "role": "user",
+                            "content": "[harness notice] " + reason + " Start wrapping up: verify what you have built and write task_report/report.md soon.",
+                        }
+                    )
+
+                steps_finish = tool_calls_done >= MAX_STEPS_SUGGESTION
+                ctx_finish = ctx_pressure and ctx_frac >= CTX_FINISH_FRACTION
+
+                if not warned_over_calls and steps_finish:
+                    warned_over_calls = True
+                    print("-- REQUEST TO FINISH ---", flush=True)
+                    reason = "You have exceeded the suggested budget of " + str(MAX_STEPS_SUGGESTION) + " tool calls."
+                    new_messages.append(
+                        {
+                            "role": "user",
+                            "content": "[harness notice] " + reason + " Finish now: verify what you have, write task_report/report.md, and reply with your completion confirmation.",
+                        }
+                    )
+                if not warned_over_ctx and ctx_finish:
+                    warned_over_ctx = True
+                    print("-- REQUEST TO FINISH ---", flush=True)
+                    reason = "Context is " + "{:.0f}".format(ctx_frac * 100) + "% full after " + str(state["compaction_count"]) + " compactions, and another compaction would lose fidelity."
+                    new_messages.append(
+                        {
+                            "role": "user",
+                            "content": "[harness notice] " + reason + " Finish now: verify what you have, write task_report/report.md, and reply with your completion confirmation.",
+                        }
+                    )
+
                 continue
 
             if finish == "length":
@@ -1034,8 +1415,8 @@ def main():
                 # continue / re-issue. If it was a giant file write, the inline tip
                 # nudges it to split the write rather than retrying the whole thing.
                 if "max_tokens_override" not in state:
-                    base = _mcfg("max_tokens", 16000)
-                    output_cap = _mcfg("max_output_tokens", base)
+                    base = _cfg("max_tokens", 16000)
+                    output_cap = _cfg("max_output_tokens", base)
                     boosted = min(base * 2, MAX_OUTPUT_BOOST, output_cap)
                     state["max_tokens_override"] = boosted
                     print(ts() + "  [warn] reply truncated at max_tokens, boosting output to " + str(boosted))
@@ -1063,7 +1444,7 @@ def main():
                 new_messages.append(
                     {
                         "role": "user",
-                        "content": "[harness notice] You ended your turn but task_report/report.md is missing or too short. Use write_file to create task_report/report.md now (summary, key decisions, uncertainties, success assessment with verification evidence), then reply with one short confirmation sentence.",
+                        "content": "[harness notice] You ended your turn but task_report/report.md is missing or too short. Use write_file to create task_report/report.md now if you are truly finished (summary, key decisions, uncertainties, success assessment with verification evidence), then reply with one short confirmation sentence. Otherwise make proper tool calls to keep working.",
                     }
                 )
                 continue

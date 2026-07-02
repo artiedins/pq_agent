@@ -19,9 +19,7 @@ import sys
 # Paths are relative to the current working directory.
 
 
-REVIEW_FILES = [
-    "descent.py",
-    "test_descent.py",
+REVIEW_FILES = sorted([f for f in os.listdir('.') if f.endswith('.py') and os.path.isfile(f)]) + [
     "task_report/report.md",
     "task_report/stats.yaml",
 ]
