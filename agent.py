@@ -14,6 +14,7 @@ import re
 import shutil
 import tiktoken
 import urllib.parse
+from flowmark import reformat_file
 
 # Code style:
 # - No type hinting
@@ -27,41 +28,7 @@ import urllib.parse
 # - Yes if __name__ == "__main__": main()
 
 
-# Model registry: each entry defines provider, model string, and per-model defaults.
-#
-# Env vars (the only three you need to set):
-#   PQ_MODEL      - selects the active model
-#   PQ_API_KEY    - single API key used for any model that needs auth
-#   PQ_PLAYWRIGHT - 1 to enable headed-Chrome web search, 0 to disable
-#
-# provider:
-#   "openrouter" - cloud via OpenRouter API, requires PQ_API_KEY
-#   "local"      - llama.cpp / SGLang / any OpenAI-compatible server
-#
-# auth:
-#   true  - PQ_API_KEY is required (sent as Bearer token)
-#   false - no auth needed (default for local models)
-#
-# reasoning_mode:
-#   "effort"       - send {"reasoning": {"effort": ...}} in payload (OpenRouter)
-#   "always_on"    - model thinks internally, no reasoning param sent (Kimi K2.7)
-#   "disabled"     - send {"reasoning": {"enabled": false}}
-#   "native_think" - server-controlled thinking, returns reasoning_content natively
-#   "effort_none"  - explicitly send {"reasoning": {"effort": "none"}} to disable thinking
-#   "dsv4_think"   - DSV4 per-request thinking via chat_template_kwargs. Reads the
-#                    per-model "enable_thinking" bool (default True) plus
-#                    REASONING_EFFORT for reasoning_effort.
-#   "qwen3_think"  - Qwen3.x per-request thinking via chat_template_kwargs. Reads
-#                    the per-model "enable_thinking" bool (default True).
-#
-# sampling (optional dict):
-#   Merged directly into the request payload, e.g. {"temperature": 0.7, "top_p":
-#   0.8, "top_k": 20}. Omit to fall back on server defaults (generation_config.json
-#   on vLLM, provider defaults on OpenRouter).
-#
-
-
-MODEL_REGISTRY = {"dsv4-flash": {"provider": "openrouter", "model": "deepseek/deepseek-v4-flash", "max_tokens": 16000, "max_output_tokens": 384000}}
+MODEL_REGISTRY = {"dsv4-flash": {"provider": "openrouter", "model": "deepseek/deepseek-v4-flash", "max_tokens": 16000, "max_output_tokens": 384000, "reasoning_mode": "none"}}
 
 
 MODEL_ID = os.environ.get("PQ_MODEL", "dsv4-flash")
@@ -135,15 +102,13 @@ REASONING_EFFORT_COMPACTION = "high"
 # gets injected notices as it approaches and exceeds it. There is no hard stop;
 # pq_minder's wall clock remains the only hard limit.
 MAX_STEPS_SUGGESTION = 165
-WRAPUP_WARN_AT = 150
 
 # Context-pressure escalation, independent of the tool-call budget above. Once a
 # session has compacted COMPACTION_PRESSURE_THRESHOLD times it is losing fidelity
-# on every further compaction, so when it refills context past these fractions of
-# MAX_CONTEXT_LENGTH we fire the same wrap-up / finish notices that the tool-call
-# budget would. These conditions are OR'ed with WRAPUP_WARN_AT / MAX_STEPS_SUGGESTION.
+# on every further compaction, so when it refills context past CTX_FINISH_FRACTION
+# of MAX_CONTEXT_LENGTH we fire finish notices. CTX_PRECOMPACT_FRACTION fires a
+# pre-compaction warning once regardless of compaction count.
 COMPACTION_PRESSURE_THRESHOLD = 2
-CTX_WRAPUP_FRACTION = 0.75
 CTX_FINISH_FRACTION = 0.90
 # pre-compaction warning fires once regardless of compaction count, giving the
 # model a chance to write findings to files before compaction hits
@@ -173,7 +138,7 @@ MAX_COMMAND_RESULT_TOKENS = 9000
 # If the model ends its turn without having written task_report/report.md we
 # nudge it instead of exiting, up to this many times, so a forgetful final turn
 # doesn't burn an entire pq_minder attempt.
-MAX_REPORT_RESCUES = 16
+MAX_REPORT_RESCUES = 8
 
 # Adaptive output boost: on truncation, max_tokens is doubled up to this cap. At
 # DS V4 Flash rates ($0.18/M output), 32000 reserves ~$0.006 per request through
@@ -197,6 +162,11 @@ COMPACTION_MAX_TOKENS = 16000
 
 AGENT_DIR = os.environ.get("AGENT_DIR", os.path.dirname(os.path.abspath(__file__)))
 WORKSPACE = os.path.abspath(os.getcwd())
+
+# background process registry - module-level because threading through every
+# call site would add complexity for no gain
+PROCS = {}
+PROC_SEQ = {"n": 0}
 
 
 # FINAL DECISION on tokenizer: cl100k_base (GPT-4) does not match the native
@@ -410,21 +380,20 @@ def extract_compaction_summary(raw_msg):
 
 def apply_reasoning(payload, effort):
     # inject the appropriate reasoning control into the payload based on per-model
-    # config. mutates payload in place. handles six mechanisms:
-    # - "effort":       OpenRouter {"reasoning": {"effort": ...}}
-    # - "effort_none":  OpenRouter {"reasoning": {"effort": "none"}} (explicit thinking off)
-    # - "dsv4_think":   vLLM DSV4 {"chat_template_kwargs": {"thinking": <enable_thinking>, ...}}
-    # - "qwen3_think":  vLLM Qwen3.x {"chat_template_kwargs": {"enable_thinking": <enable_thinking>}}
-    # - "disabled":     OpenRouter {"reasoning": {"enabled": false}}
+    # config. mutates payload in place. handles seven mechanisms:
+    # - "none":        send nothing at all (payload untouched)
+    # - "effort":      OpenRouter {"reasoning": {"effort": ...}}
+    # - "effort_none": OpenRouter {"reasoning": {"effort": "none"}} (explicit thinking off)
+    # - "dsv4_think":  vLLM DSV4 {"chat_template_kwargs": {"thinking": <enable_thinking>, ...}}
+    # - "qwen3_think": vLLM Qwen3.x {"chat_template_kwargs": {"enable_thinking": <enable_thinking>}}
+    # - "disabled":    OpenRouter {"reasoning": {"enabled": false}}
     # - "always_on" / "native_think": send nothing (server or model controls thinking)
-
-    # LETS OVERRIDE FOR NOW
-    # DO NOT ADD ANYTHING FOR BEST INTERNAL BENCHMARKS ON DEEPSEEK V4 FLASH ON OPENROUTER
-    return
 
     rmode = _cfg("reasoning_mode", "effort")
 
-    if rmode == "dsv4_think":
+    if rmode == "none":
+        return
+    elif rmode == "dsv4_think":
         payload["chat_template_kwargs"] = {"thinking": _cfg("enable_thinking", True), "reasoning_effort": effort or "high"}
     elif rmode == "qwen3_think":
         payload["chat_template_kwargs"] = {"enable_thinking": _cfg("enable_thinking", True)}
@@ -434,8 +403,6 @@ def apply_reasoning(payload, effort):
         payload["reasoning"] = {"effort": effort}
     elif rmode == "disabled":
         payload["reasoning"] = {"enabled": False}
-    elif rmode == "medium":
-        payload["reasoning"] = {"effort": "medium"}
 
 
 def _get_workspace_snapshot():
@@ -712,7 +679,7 @@ def tool_write_file(filename, content):
     return "Written " + str(os.stat(target).st_size) + " bytes to " + rel
 
 
-def tool_read_file(filename):
+def tool_read_file(filename, start_line=None, end_line=None):
     target = safe_path(filename)
     if os.path.isdir(target):
         return "Error: '" + filename + "' is a directory, not a file. Use run_command('ls -la " + filename + "') to list its contents."
@@ -726,15 +693,37 @@ def tool_read_file(filename):
         return "Error reading file '" + filename + "': " + str(e)
 
     lines = content.splitlines()
+    total_lines = len(lines)
     rel = os.path.relpath(target, WORKSPACE) if target.startswith(WORKSPACE) else target
-    print(ts() + "  [tool call] read_file: " + rel + " (" + str(len(lines)) + " lines)")
+
+    # apply optional line range
+    if start_line is not None:
+        start_line = max(1, int(start_line))
+        if start_line > total_lines:
+            return "Error: file has only " + str(total_lines) + " lines (requested start_line=" + str(start_line) + ")"
+        if end_line is not None:
+            end_line = min(int(end_line), total_lines)
+        else:
+            end_line = total_lines
+        lines = lines[start_line - 1 : end_line]
+        first_num = start_line
+        range_tag = " [" + str(start_line) + "-" + str(end_line) + "]"
+    else:
+        first_num = 1
+        range_tag = ""
+
+    print(ts() + "  [tool call] read_file: " + rel + range_tag + " (" + str(len(lines)) + " lines)")
     # plain numbered lines (cat -n style). The number+tab prefix is for reference
     # only; str_replace matches against the line text without it.
-    numbered = "\n".join("{:>5}\t{}".format(i, l.rstrip()) for i, l in enumerate(lines, 1))
+    numbered = "\n".join("{:>5}\t{}".format(i, l.rstrip()) for i, l in enumerate(lines, first_num))
     truncated, was_truncated = truncate_file_text(numbered)
     if was_truncated:
         truncated += (
-            "\n**USER AGENT HARNESS NOTICE:** File truncated at ~" + str(MAX_FILE_READ_TOKENS) + " tokens. Use run_command(\"sed -n 'START,ENDp' " + filename + '") or grep for targeted reads.\n'
+            "\n**USER AGENT HARNESS NOTICE:** File truncated at ~"
+            + str(MAX_FILE_READ_TOKENS)
+            + " tokens. Use read_file with start_line/end_line or run_command(\"sed -n 'START,ENDp' "
+            + filename
+            + '") for targeted reads.\n'
         )
     return truncated
 
@@ -836,6 +825,68 @@ def tool_run_command(command):
     return output + "\n[exit code: " + str(proc.returncode) + "]"
 
 
+def tool_start_process(command):
+    # launch a long-running command in the background, returning a handle
+    # immediately. mirrors run_command's env scrubbing, temp files, and
+    # process group isolation.
+    child_env = {k: v for k, v in os.environ.items() if not k.endswith("_API_KEY")}
+    out_f = tempfile.TemporaryFile()
+    err_f = tempfile.TemporaryFile()
+    proc = subprocess.Popen(
+        command,
+        shell=True,
+        cwd=WORKSPACE,
+        stdout=out_f,
+        stderr=err_f,
+        env=child_env,
+        start_new_session=True,
+    )
+    PROC_SEQ["n"] += 1
+    handle = "proc-" + str(PROC_SEQ["n"])
+    PROCS[handle] = {"proc": proc, "out_f": out_f, "err_f": err_f, "command": command, "start": time.time()}
+    print(ts() + "  [tool call] start_process: " + handle + " (pid " + str(proc.pid) + ") | " + command[:80])
+    return "Started " + handle + " (pid " + str(proc.pid) + "): " + command + ". Use process_status to check on it and kill_process to stop it."
+
+
+def tool_process_status(handle, tail_lines=40):
+    tail_lines = int(tail_lines)
+    if handle not in PROCS:
+        known = ", ".join(sorted(PROCS.keys())) if PROCS else "(none)"
+        return "Error: unknown handle '" + handle + "'. Known handles: " + known
+    entry = PROCS[handle]
+    proc = entry["proc"]
+    elapsed = int(time.time() - entry["start"])
+    rc = proc.poll()
+    if rc is None:
+        state_str = "running (elapsed " + str(elapsed) + "s)"
+    else:
+        state_str = "exited with code " + str(rc) + " (ran for " + str(elapsed) + "s)"
+    entry["out_f"].seek(0)
+    entry["err_f"].seek(0)
+    output = entry["out_f"].read().decode("utf-8", "replace") + entry["err_f"].read().decode("utf-8", "replace")
+    tail = output.splitlines()[-tail_lines:]
+    print(ts() + "  [tool call] process_status: " + handle + " | " + state_str)
+    return handle + ": " + state_str + "\n--- last " + str(len(tail)) + " lines of output ---\n" + "\n".join(tail)
+
+
+def tool_kill_process(handle):
+    if handle not in PROCS:
+        known = ", ".join(sorted(PROCS.keys())) if PROCS else "(none)"
+        return "Error: unknown handle '" + handle + "'. Known handles: " + known
+    entry = PROCS[handle]
+    proc = entry["proc"]
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except OSError:
+        pass
+    proc.wait()
+    entry["out_f"].close()
+    entry["err_f"].close()
+    del PROCS[handle]
+    print(ts() + "  [tool call] kill_process: " + handle)
+    return "Killed " + handle + "."
+
+
 def tool_search_web(mcp, query):
     # This is the only search
     # backend; the tool is only offered when ENABLE_PLAYWRIGHT is True.
@@ -883,11 +934,17 @@ def _dispatch_tool_inner(mcp, name, arguments):
             return "Error: write_file requires 'filename' and 'content' - DO NOT FORGET THE FILENAME ARG AGAIN! Got keys: " + str(list(arguments.keys()))
         return tool_write_file(fn, ct)
     if name == "read_file":
-        return tool_read_file(arguments["filename"])
+        return tool_read_file(arguments["filename"], arguments.get("start_line"), arguments.get("end_line"))
     if name == "str_replace":
         return tool_str_replace(arguments["filename"], arguments["old_str"], arguments["new_str"])
     if name == "run_command":
         return tool_run_command(arguments["command"])
+    if name == "start_process":
+        return tool_start_process(arguments["command"])
+    if name == "process_status":
+        return tool_process_status(arguments["handle"], arguments.get("tail_lines", 40))
+    if name == "kill_process":
+        return tool_kill_process(arguments["handle"])
 
     return "Unknown tool: " + name
 
@@ -997,11 +1054,14 @@ def make_tools():
             "type": "function",
             "function": {
                 "name": "read_file",
-                "strict": True,
-                "description": "Read a file. Returns each line prefixed with its line number and a tab, e.g. '    3\\tsome text here'. The line numbers are for reference only - when using str_replace, supply the exact line text WITHOUT the leading number+tab. You MUST call read_file before editing a file with str_replace.",
+                "description": "Read a file. Returns each line prefixed with its line number and a tab, e.g. '    3\\tsome text here'. The line numbers are for reference only - when using str_replace, supply the exact line text WITHOUT the leading number+tab. You MUST call read_file before editing a file with str_replace. For large files, pass start_line and end_line to read a specific range; line numbers in the output are the true file line numbers.",
                 "parameters": {
                     "type": "object",
-                    "properties": {"filename": {"type": "string"}},
+                    "properties": {
+                        "filename": {"type": "string"},
+                        "start_line": {"type": "integer", "description": "Optional. First line to read, 1-indexed inclusive."},
+                        "end_line": {"type": "integer", "description": "Optional. Last line to read, 1-indexed inclusive."},
+                    },
                     "required": ["filename"],
                     "additionalProperties": False,
                 },
@@ -1034,13 +1094,69 @@ def make_tools():
             "function": {
                 "name": "run_command",
                 "strict": True,
-                "description": "Run a shell command in the workspace and return its output. Timeout is " + str(RUN_COMMAND_TIMEOUT) + " seconds.",
+                "description": "Run a shell command in the workspace and return its output. Timeout is "
+                + str(RUN_COMMAND_TIMEOUT)
+                + " seconds. For commands that may run longer, use start_process instead.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "command": {"type": "string", "description": "Shell command to run e.g. 'python3 solution.py'"},
                     },
                     "required": ["command"],
+                    "additionalProperties": False,
+                },
+            },
+        }
+    )
+    tools.append(
+        {
+            "type": "function",
+            "function": {
+                "name": "start_process",
+                "strict": True,
+                "description": "Start a long-running command in the background and return a handle immediately. Use for anything that may exceed the run_command timeout: builds, servers, long test suites. Check on it with process_status and stop it with kill_process.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": {"type": "string", "description": "Shell command to run in the background"},
+                    },
+                    "required": ["command"],
+                    "additionalProperties": False,
+                },
+            },
+        }
+    )
+    tools.append(
+        {
+            "type": "function",
+            "function": {
+                "name": "process_status",
+                "description": "Check on a background process started with start_process. Returns whether it is running or exited, plus the last N lines of output.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "handle": {"type": "string", "description": "Handle returned by start_process, e.g. 'proc-1'"},
+                        "tail_lines": {"type": "integer", "description": "Number of output lines to return from the end. Default 40."},
+                    },
+                    "required": ["handle"],
+                    "additionalProperties": False,
+                },
+            },
+        }
+    )
+    tools.append(
+        {
+            "type": "function",
+            "function": {
+                "name": "kill_process",
+                "strict": True,
+                "description": "Kill a background process and clean up its resources.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "handle": {"type": "string", "description": "Handle returned by start_process, e.g. 'proc-1'"},
+                    },
+                    "required": ["handle"],
                     "additionalProperties": False,
                 },
             },
@@ -1084,7 +1200,9 @@ def make_system_prompt():
         "4. To list directory contents, use run_command with 'ls -la <path>'. To read a file outside the workspace, use read_file with the full path.\n"
         + web_block
         + "\nError recovery: If a tool returns an error, read the error message and retry with corrected arguments. Tool errors are recoverable and will not crash the harness.\n"
-        "\nResource budget: You have a soft budget of approximately " + str(MAX_STEPS_SUGGESTION) + " tool calls. Plan before executing and combine operations when practical.\n"
+        "\nResource budget: You have a soft budget of approximately "
+        + str(MAX_STEPS_SUGGESTION)
+        + " tool calls. A status line showing context fill and tool call count is appended to tool results each turn - use it to pace yourself.\n"
         "\nVerification Report:\n"
         "Before writing your report, verify your work by actually running it: execute your code, re-read final files, "
         "re-check computed values. Include any relevant real observed output in your report. "
@@ -1099,6 +1217,11 @@ def make_system_prompt():
         "7. Markdown or images in task_report/ are only for evaluation and will be deleted after your work is evaluated.\n"
         "After writing task_report/report.md, reply with one short sentence confirming completion.\n"
     )
+
+
+def make_status_line(state, tool_calls_done):
+    ctx_pct = int(100 * state["last_post_tokens"] / MAX_CONTEXT_LENGTH) if MAX_CONTEXT_LENGTH else 0
+    return "[status] ctx " + str(ctx_pct) + "% | tool calls " + str(tool_calls_done)
 
 
 def write_stats(state, start_time):
@@ -1187,9 +1310,7 @@ def main():
     print(ts() + "Starting agent loop...\n")
 
     tool_calls_done = 0
-    warned_wrapup_calls = False
     warned_over_calls = False
-    warned_wrapup_ctx = False
     warned_over_ctx = False
     warned_precompact = False
     report_rescues = 0
@@ -1282,11 +1403,11 @@ def main():
                     )
                     tool_calls_done += 1
 
-                # soft budget notices, each injected at most once. Two independent
-                # pressures can trigger each notice: the tool-call count, and (once
-                # the session has compacted COMPACTION_PRESSURE_THRESHOLD times) the
-                # raw context fill. last_post_tokens is the API-reported prompt_tokens
-                # of the most recent request - the freshest real measure of context.
+                # append per-turn telemetry to the last tool result
+                status = make_status_line(state, tool_calls_done)
+                new_messages[-1]["content"] = new_messages[-1]["content"] + "\n\n" + status
+
+                # soft budget notices
                 print("TCC", tool_calls_done, flush=True)
                 ctx_tokens = state["last_post_tokens"]
                 ctx_frac = (ctx_tokens / MAX_CONTEXT_LENGTH) if MAX_CONTEXT_LENGTH else 0.0
@@ -1303,7 +1424,6 @@ def main():
                     )
 
                 if ctx_frac < 0.5:
-                    warned_wrapup_ctx = False
                     warned_over_ctx = False
                     warned_precompact = False
 
@@ -1316,32 +1436,8 @@ def main():
                         {
                             "role": "user",
                             "content": "[harness notice] Context is " + "{:.0f}".format(ctx_frac * 100) + "% full. "
-                            "Consider writing important findings or notes to files now, as context compaction may happen soon. "
+                            "Consider updating NOTES.md and writing important findings to files now, as context compaction may happen soon. "
                             "Information in files survives compaction; information only in message history may be compressed.",
-                        }
-                    )
-
-                steps_wrapup = tool_calls_done >= WRAPUP_WARN_AT
-                ctx_wrapup = ctx_pressure and ctx_frac >= CTX_WRAPUP_FRACTION
-
-                if not warned_wrapup_calls and steps_wrapup:
-                    warned_wrapup_calls = True
-                    print("-- WARNING TO WRAP UP ---", flush=True)
-                    reason = "You have used " + str(tool_calls_done) + " of a suggested " + str(MAX_STEPS_SUGGESTION) + " tool calls."
-                    new_messages.append(
-                        {
-                            "role": "user",
-                            "content": "[harness notice] " + reason + " Start wrapping up: verify what you have built and write task_report/report.md soon.",
-                        }
-                    )
-                if not warned_wrapup_ctx and ctx_wrapup:
-                    warned_wrapup_ctx = True
-                    print("-- WARNING TO WRAP UP ---", flush=True)
-                    reason = "Context is " + "{:.0f}".format(ctx_frac * 100) + "% full after " + str(state["compaction_count"]) + " compactions."
-                    new_messages.append(
-                        {
-                            "role": "user",
-                            "content": "[harness notice] " + reason + " Start wrapping up: verify what you have built and write task_report/report.md soon.",
                         }
                     )
 
@@ -1422,12 +1518,33 @@ def main():
             write_stats(state, start_time)
         except Exception as e:
             print(ts() + "[warn] failed to write stats: " + str(e))
+        # kill any surviving background processes
+        for h in list(PROCS.keys()):
+            try:
+                entry = PROCS[h]
+                try:
+                    os.killpg(entry["proc"].pid, signal.SIGKILL)
+                except OSError:
+                    pass
+                entry["proc"].wait()
+                entry["out_f"].close()
+                entry["err_f"].close()
+            except Exception:
+                pass
+        PROCS.clear()
         try:
             if mcp is not None:
                 mcp["proc"].stdin.close()
                 mcp["proc"].terminate()
         except Exception:
             pass
+
+        report_path = os.path.join(WORKSPACE, "task_report", "report.md")
+        if os.path.isfile(report_path):
+            try:
+                reformat_file(path=report_path, output=None, inplace=True, width=100, nobackup=True)
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":
