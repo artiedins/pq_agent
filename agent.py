@@ -16,18 +16,6 @@ import tiktoken
 import urllib.parse
 from flowmark import reformat_file
 
-# Code style:
-# - No type hinting
-# - No doc strings
-# - No triple quoted multi-line strings
-# - No comments with repeated characters for visual page breaks like # ---
-# - No non-ascii characters
-# - No command line argument processing
-# - No global variables unless making them local increases complexity
-# - Yes strategic inline comments enhancing rapid code comprehension by real humans
-# - Yes if __name__ == "__main__": main()
-
-
 MODEL_REGISTRY = {"dsv4-flash": {"provider": "openrouter", "model": "deepseek/deepseek-v4-flash", "max_tokens": 16000, "max_output_tokens": 384000, "reasoning_mode": "none"}}
 
 
@@ -1015,6 +1003,7 @@ def make_tools():
                 "type": "function",
                 "function": {
                     "name": "playwright_extract_content",
+                    "strict": True,
                     "description": "Extract the current browser page as clean markdown.",
                     "parameters": {
                         "type": "object",
@@ -1025,6 +1014,7 @@ def make_tools():
                             }
                         },
                         "required": [],
+                        "additionalProperties": False,
                     },
                 },
             }
@@ -1054,6 +1044,7 @@ def make_tools():
             "type": "function",
             "function": {
                 "name": "read_file",
+                "strict": True,
                 "description": "Read a file. Returns each line prefixed with its line number and a tab, e.g. '    3\\tsome text here'. The line numbers are for reference only - when using str_replace, supply the exact line text WITHOUT the leading number+tab. You MUST call read_file before editing a file with str_replace. For large files, pass start_line and end_line to read a specific range; line numbers in the output are the true file line numbers.",
                 "parameters": {
                     "type": "object",
@@ -1131,6 +1122,7 @@ def make_tools():
             "type": "function",
             "function": {
                 "name": "process_status",
+                "strict": True,
                 "description": "Check on a background process started with start_process. Returns whether it is running or exited, plus the last N lines of output.",
                 "parameters": {
                     "type": "object",
@@ -1170,15 +1162,13 @@ def make_system_prompt():
     if ENABLE_PLAYWRIGHT:
         intro_tools = "browser, shell, and file tools"
         web_block = (
-            "5. For web searches use the search_web tool with a plain text query.\n"
+            "3. For web searches use the search_web tool with a plain text query.\n"
             "   - Web research tool: a headed, stateful Chrome via playwright that returns pages as markdown; "
             "prefer it over curl/wget from the command line unless absolutely necessary.\n"
             "   - Use playwright_navigate to open a known URL and playwright_extract_content to read the current page.\n"
-            "   - Web research notes: write any possibly useful info to file(s) immediately before doing any other work, "
-            "as these notes could be useful if we do context compaction.\n"
             "\nResearch workflow:\n"
-            "- For each search or web retrieval, write notes to file(s) BEFORE doing anything else with the result. Compaction can happen mid-research; the notes survive it.\n"
-            "- Prefer primary sources and real user discussions. Reddit is especially valuable - our headed browser can access it while most AI chatbots cannot, giving us unique 'alpha' - so specifically target these kinds of 'walled gardens'.\n"
+            "- For each search or web retrieval, write any remotely useful info to NOTES.md BEFORE doing anything else with the result. Lossy context compaction can happen mid-research; the notes survive it.\n"
+            "- Prefer primary sources and real user discussions. Sites like Reddit and Hacker News are especially valuable - our headed browser can access it while most AI chatbots cannot, giving us unique 'alpha' - so specifically target these kinds of 'walled gardens'.\n"
         )
     else:
         intro_tools = "shell and file tools"
@@ -1196,13 +1186,16 @@ def make_system_prompt():
         "2. To edit a file: call read_file first, then pick the right tool:\n"
         "   - str_replace: for a small, targeted change to part of a file. Match an exact, unique snippet (WITHOUT read_file's line-number prefix).\n"
         "   - write_file: for a new file, or when replacing most or all of an existing one.\n"
-        "3. Code organization: prefer fewer, well-named files over many small ones. Iterate on an existing script (overwrite it with write_file) rather than creating numbered variants like analyze2.py, analyze3.py. Each new file adds to context; reusing one file keeps context lean.\n"
-        "4. To list directory contents, use run_command with 'ls -la <path>'. To read a file outside the workspace, use read_file with the full path.\n"
         + web_block
         + "\nError recovery: If a tool returns an error, read the error message and retry with corrected arguments. Tool errors are recoverable and will not crash the harness.\n"
         "\nResource budget: You have a soft budget of approximately "
         + str(MAX_STEPS_SUGGESTION)
         + " tool calls. A status line showing context fill and tool call count is appended to tool results each turn - use it to pace yourself.\n"
+        "\nCoding Rules:\n"
+        "- For python code, no type hints, docstrings, triple-quoted strings, decorative separators (# ----), or module-level globals except trivial constants. No CLI argument parsing without explicit user permission. Inline comments explain why, not what. Start files with shebang line; end with `if __name__ ... main()`.\n"
+        "- For comments, write reasons, not paraphrases. High leverage comments capture real-world discoveries that static analysis could not find - saves re-debugging later, and document decisions made with the user to avoid having to re-ask the same question.\n"
+        "- For tasks like hyperparameter tuning or experimenting across multiple dimensions: place relevant knobs in one dataclass, int codes for categories (document inline), log actual runtime values, since defaults may be replaced with random search values dynamically at run time.\n"
+        "- Prefer fewer, well-named files over many small ones. Iterate on one script rather than creating analyze1.py, analyze2.py siblings.\n"
         "\nVerification Report:\n"
         "Before writing your report, verify your work by actually running it: execute your code, re-read final files, "
         "re-check computed values. Include any relevant real observed output in your report. "
@@ -1215,7 +1208,7 @@ def make_system_prompt():
         "5. Your assessment of whether the task succeeded, including the verification evidence you observed.\n"
         "6. You may create or copy images (.jpg or .png, and no larger than 1200 pixels please) to task_report/ if the task requires those for evaluation.\n"
         "7. Markdown or images in task_report/ are only for evaluation and will be deleted after your work is evaluated.\n"
-        "After writing task_report/report.md, reply with one short sentence confirming completion.\n"
+        "\nAfter writing task_report/report.md, reply with one short sentence confirming completion.\n"
     )
 
 
