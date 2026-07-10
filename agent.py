@@ -15,11 +15,44 @@ import shutil
 import tiktoken
 import urllib.parse
 from flowmark import reformat_file
+import setproctitle
 
-MODEL_REGISTRY = {"dsv4-flash": {"provider": "openrouter", "model": "deepseek/deepseek-v4-flash", "max_tokens": 16000, "max_output_tokens": 384000, "reasoning_mode": "none"}}
+MODEL_REGISTRY = {
+    "dsv4-cold-think": {
+        "provider": "local",
+        "model": "deepseek-v4-flash",
+        "base_url": "http://10.24.120.29:8988",
+        "auth": True,
+        "max_tokens": 16000,
+        "max_output_tokens": 32768,
+        "reasoning_mode": "dsv4_think",
+        "enable_thinking": True,
+        "sampling": {"temperature": 0.6, "top_p": 0.95, "top_k": 20},
+    },
+    "qwen36-hot-nothink": {
+        "provider": "local",
+        "model": "qwen3.6-27b",
+        "base_url": "http://10.24.120.29:8987",
+        "auth": True,
+        "max_tokens": 16000,
+        "max_output_tokens": 32768,
+        "reasoning_mode": "qwen3_think",
+        "enable_thinking": False,
+        "sampling": {"temperature": 1.0, "top_p": 0.95, "top_k": 20},
+    },
+}
 
 
-MODEL_ID = os.environ.get("PQ_MODEL", "dsv4-flash")
+# Allow overriding base_url for all local providers via VLLM_BASE_URL env var.
+# This lets the vLLM server address be configured at container runtime without
+# editing MODEL_REGISTRY. If unset, the hardcoded per-model URLs are used.
+_VLLM_BASE_URL = os.environ.get("VLLM_BASE_URL")
+if _VLLM_BASE_URL:
+    for _entry in MODEL_REGISTRY.values():
+        if _entry.get("provider") == "local":
+            _entry["base_url"] = _VLLM_BASE_URL
+
+MODEL_ID = os.environ.get("PQ_MODEL", "dsv4-cold-think")
 if MODEL_ID not in MODEL_REGISTRY:
     sys.exit("Error: unknown model '" + MODEL_ID + "'. " "Known models: " + ", ".join(sorted(MODEL_REGISTRY.keys())))
 
@@ -1158,7 +1191,6 @@ def make_tools():
 
 
 def make_system_prompt():
-    # four concerns: tool rules, work budget, verification, and finishing protocol
     if ENABLE_PLAYWRIGHT:
         intro_tools = "browser, shell, and file tools"
         web_block = (
@@ -1169,6 +1201,7 @@ def make_system_prompt():
             "\nResearch workflow:\n"
             "- For each search or web retrieval, write any remotely useful info to NOTES.md BEFORE doing anything else with the result. Lossy context compaction can happen mid-research; the notes survive it.\n"
             "- Prefer primary sources and real user discussions. Sites like Reddit and Hacker News are especially valuable - our headed browser can access it while most AI chatbots cannot, giving us unique 'alpha' - so specifically target these kinds of 'walled gardens'.\n"
+            "- When the deliverable is **writing**, harvest specifics: exact numbers, dates, names, prices, and short verbatim quotes (each with its URL) into NOTES.md. Quality writing is specific - 'the spill was large' cannot be upgraded at writing time.\n"
         )
     else:
         intro_tools = "shell and file tools"
@@ -1193,12 +1226,25 @@ def make_system_prompt():
         + " tool calls. A status line showing context fill and tool call count is appended to tool results each turn - use it to pace yourself.\n"
         "\nCoding Rules:\n"
         "- For python code, no type hints, docstrings, triple-quoted strings, decorative separators (# ----), or module-level globals except trivial constants. No CLI argument parsing without explicit user permission. Inline comments explain why, not what. Start files with shebang line; end with `if __name__ ... main()`.\n"
-        "- For comments, write reasons, not paraphrases. High leverage comments capture real-world discoveries that static analysis could not find - saves re-debugging later, and document decisions made with the user to avoid having to re-ask the same question.\n"
+        "- For comments, write reasons, not paraphrases. High leverage comments capture real-world discoveries that static analysis cannot find and saves re-debugging later, and document decisions made with the user to avoid having to re-ask the same question.\n"
         "- For tasks like hyperparameter tuning or experimenting across multiple dimensions: place relevant knobs in one dataclass, int codes for categories (document inline), log actual runtime values, since defaults may be replaced with random search values dynamically at run time.\n"
         "- Prefer fewer, well-named files over many small ones. Iterate on one script rather than creating analyze1.py, analyze2.py siblings.\n"
+        "\nWriting Rules (when deliverables are: documentation, proposals, presentations, blog posts, tweets). task_report/report.md stays plain and functional:\n"
+        "- Workflow: harvest specifics to NOTES.md; write the piece's thesis as ONE sentence at the top of NOTES.md (cannot state it = not ready, collect more; a piece that merely 'covers' its topic has failed); draft to file; read_file the draft and run both passes below; write_file the final. Skipping the passes is shipping code you never ran.\n"
+        "- Write from a position: the author has done the work, holds a view, and says so. Balanced coverage with no view is the primary failure mode of AI writing slop.\n"
+        "- Specifics make quality writing: the number, the name, the date, the quote - never the category. Each 'significant'/'various'/'numerous' is a defect: use the datum, or state that it is missing. Never pave a missing fact with adjectives.\n"
+        "- Show, don't rate: delete evaluative framing ('importantly', 'crucial', 'fascinating', 'it is worth noting') and present the fact that earned the adjective. If the fact cannot carry the sentence, get a better fact.\n"
+        "- Claims carry their grounds: 'X, because <evidence>', never 'some might argue'. Hedge only genuine uncertainty, naming what is unknown and what would resolve it.\n"
+        "- Banned patterns, each occurrence a bug: negative parallelism ('it's not X, it's Y'); rhetorical-question transitions ('The kicker?'); synonym triples; self-narration ('In this section', 'In conclusion'); paragraph-opening 'Moreover'/'Furthermore'/'Additionally'; no em dashes ('—' or '-' used in an em dash situation); no headings, bold, or bullets in pieces under 600 words, unless intended for a presentation.\n"
+        "- First sentence carries a specific fact, claim, or question - no background, no throat-clearing.\n"
+        "- Rhythm: long sentences dense with information; a short sentence is a payoff after a long build, a few per piece at most.\n"
+        "- Quote primary sources when the source is better writing than a paraphrase (deadpan, damning, or exact material); keep quotes short and attributed.\n"
+        "- Forms of writing: documentation serves a reader mid-task - exact commands, paths, expected output, zero preamble. A proposal makes a case for funding - think Heilmeier Catechism. A tweet is one thought, no hashtags, no emoji. A blog post may use first person, must hold a view, may digress once if the digression pays. Presentations must include notes for recommended visualizations that make claims obvious without narration.\n"
+        "- Pass 1 (hunt): fix every banned pattern, evaluative adjective, and vague quantifier above. Pass 2 (cut): delete any paragraph whose loss costs the reader nothing; target 15% shrinkage draft-to-final.\n"
         "\nVerification Report:\n"
         "Before writing your report, verify your work by actually running it: execute your code, re-read final files, "
         "re-check computed values. Include any relevant real observed output in your report. "
+        "For **writing** of all kinds, verification means the two passes in the Writing Rules. "
         "A report that claims success without demonstrated verification is incomplete.\n"
         "\nWhen the task is complete, create task_report/report.md containing:\n"
         "1. A step-by-step summary of what you did.\n"
@@ -1240,6 +1286,8 @@ def write_stats(state, start_time):
 
 
 def main():
+    setproctitle.setproctitle("agent")
+
     # startup: archive previous task_report then wipe it
     task_report_dir = os.path.join(WORKSPACE, "task_report")
     report_path = os.path.join(task_report_dir, "report.md")
