@@ -15,44 +15,11 @@ import shutil
 import tiktoken
 import urllib.parse
 from flowmark import reformat_file
-import setproctitle
 
-MODEL_REGISTRY = {
-    "dsv4-cold-think": {
-        "provider": "local",
-        "model": "deepseek-v4-flash",
-        "base_url": "http://10.24.120.29:8988",
-        "auth": True,
-        "max_tokens": 16000,
-        "max_output_tokens": 32768,
-        "reasoning_mode": "dsv4_think",
-        "enable_thinking": True,
-        "sampling": {"temperature": 0.6, "top_p": 0.95, "top_k": 20},
-    },
-    "qwen36-hot-nothink": {
-        "provider": "local",
-        "model": "qwen3.6-27b",
-        "base_url": "http://10.24.120.29:8987",
-        "auth": True,
-        "max_tokens": 16000,
-        "max_output_tokens": 32768,
-        "reasoning_mode": "qwen3_think",
-        "enable_thinking": False,
-        "sampling": {"temperature": 1.0, "top_p": 0.95, "top_k": 20},
-    },
-}
+MODEL_REGISTRY = {"dsv4-flash": {"provider": "openrouter", "model": "deepseek/deepseek-v4-flash", "max_tokens": 16000, "max_output_tokens": 384000, "reasoning_mode": "none"}}
 
 
-# Allow overriding base_url for all local providers via VLLM_BASE_URL env var.
-# This lets the vLLM server address be configured at container runtime without
-# editing MODEL_REGISTRY. If unset, the hardcoded per-model URLs are used.
-_VLLM_BASE_URL = os.environ.get("VLLM_BASE_URL")
-if _VLLM_BASE_URL:
-    for _entry in MODEL_REGISTRY.values():
-        if _entry.get("provider") == "local":
-            _entry["base_url"] = _VLLM_BASE_URL
-
-MODEL_ID = os.environ.get("PQ_MODEL", "dsv4-cold-think")
+MODEL_ID = os.environ.get("PQ_MODEL", "dsv4-flash")
 if MODEL_ID not in MODEL_REGISTRY:
     sys.exit("Error: unknown model '" + MODEL_ID + "'. " "Known models: " + ", ".join(sorted(MODEL_REGISTRY.keys())))
 
@@ -1286,8 +1253,6 @@ def write_stats(state, start_time):
 
 
 def main():
-    setproctitle.setproctitle("agent")
-
     # startup: archive previous task_report then wipe it
     task_report_dir = os.path.join(WORKSPACE, "task_report")
     report_path = os.path.join(task_report_dir, "report.md")
