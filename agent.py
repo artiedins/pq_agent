@@ -915,16 +915,25 @@ def _dispatch_tool_inner(mcp, name, arguments):
         return text
 
     if name == "write_file":
-        fn = arguments.get("filename") or arguments.get("path") or arguments.get("file")
-        ct = arguments.get("content") or arguments.get("text") or arguments.get("data")
+        fn = arguments.get("filename")
+        ct = arguments.get("content")
         if not fn or ct is None:
             print(ts() + "  [tool call] write_file: MISSING PARAMETER (got keys: " + str(list(arguments.keys())) + ")")
-            return "Error: write_file requires 'filename' and 'content' - DO NOT FORGET THE FILENAME ARG AGAIN! Got keys: " + str(list(arguments.keys()))
+            return "Error: write_file requires 'filename' and 'content'. Please always send these parameters or you waste tool calls. Got keys: " + str(list(arguments.keys()))
         return tool_write_file(fn, ct)
+
     if name == "read_file":
         return tool_read_file(arguments["filename"], arguments.get("start_line"), arguments.get("end_line"))
+
     if name == "str_replace":
-        return tool_str_replace(arguments["filename"], arguments["old_str"], arguments["new_str"])
+        fn = arguments.get("filename")
+        ostr = arguments.get("old_str")
+        nstr = arguments.get("new_str")
+        if not fn or ostr is None or nstr is None:
+            print(ts() + "  [tool call] str_replace: MISSING PARAMETER (got keys: " + str(list(arguments.keys())) + ")")
+            return "Error: str_replace requires 'filename' and 'old_str' and 'new_str'. Please always send these parameters or you waste tool calls. Got keys: " + str(list(arguments.keys()))
+        return tool_str_replace(fn, ostr, nstr)
+
     if name == "run_command":
         return tool_run_command(arguments["command"])
     if name == "start_process":
