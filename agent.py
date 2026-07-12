@@ -878,7 +878,9 @@ def tool_kill_process(handle):
 def tool_search_web(mcp, query):
     # This is the only search
     # backend; the tool is only offered when ENABLE_PLAYWRIGHT is True.
-    url = "https://search.brave.com/search?q=" + urllib.parse.quote_plus(query)
+    # url = "https://search.brave.com/search?q=" + urllib.parse.quote_plus(query)
+    ### THE & AMPERSAND IS ON PURPOSE - THIS URL SYNTAX ERROR SEEMS TO NOT TRIGGER DDG.
+    url = "https://html.duckduckgo.com/html&q=" + urllib.parse.quote_plus(query)
     call_playwright(mcp, "playwright_navigate", {"url": url})
     text = call_playwright(mcp, "playwright_extract_content", {})
     print(ts() + "[tool call] search_web: " + query[:80] + " | " + str(len(text)) + " chars")
