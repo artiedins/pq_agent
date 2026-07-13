@@ -3,12 +3,12 @@
 # run_agent.sh - launch agent.py inside a bubblewrap sandbox
 #
 # usage: bash run_agent.sh [project_dir]
-#        PQ_MODEL=qwopus-coder PQ_PLAYWRIGHT=0 bash run_agent.sh [project_dir]
+#        PQ_MODEL=glm52 PQ_PLAYWRIGHT=0 bash run_agent.sh [project_dir]
 #
 # if project_dir is omitted, the current working directory is used.
 #
 # env vars (the only three the agent needs):
-#   PQ_MODEL      - which model to use
+#   PQ_MODEL      - which model to use (default: dsv4-flash)
 #   PQ_API_KEY    - single API key for any model that needs auth
 #   PQ_PLAYWRIGHT - 1 to enable web search via headed Chrome, 0 to disable
 #
@@ -56,7 +56,7 @@ fi
 
 echo "agent dir  : $AGENT_DIR"
 echo "project dir: $PROJECT_DIR"
-echo "model      : ${PQ_MODEL:-ds-v4-flash (default)}"
+echo "model      : ${PQ_MODEL:-dsv4-flash (default)}"
 echo "playwright : ${PQ_PLAYWRIGHT:-1 (default)}"
 echo ""
 
