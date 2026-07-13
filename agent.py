@@ -29,30 +29,19 @@ from flowmark import reformat_file
 #   "effort" -> OpenRouter {"reasoning": {"effort": REASONING_EFFORT}}
 # all OpenRouter models below that support configurable reasoning use "effort".
 MODEL_REGISTRY = {
-    # DeepSeek V4 Flash: 384K max output, no thinking support via OR
-    "dsv4-flash": {"provider": "openrouter", "model": "deepseek/deepseek-v4-flash", "max_tokens": 16000, "max_output_tokens": 384000, "reasoning_mode": "none"},
-    # GPT-5.6 Luna: 128K max output, reasoning effort via OR (user requires high)
-    "gpt56-luna-pro": {"provider": "openrouter", "model": "openai/gpt-5.6-luna-pro", "max_tokens": 16000, "max_output_tokens": 128000, "reasoning_mode": "effort"},
-    # Grok 4.5: no published output cap (500K = context), reasoning always-on
-    # defaulting high; explicit effort ensures OR providers don't downgrade
     "grok45": {"provider": "openrouter", "model": "x-ai/grok-4.5", "max_tokens": 16000, "max_output_tokens": 500000, "reasoning_mode": "effort"},
-    # MiMo-V2.5: 131K max output, reasoning via OR thinkingFormat
-    "mimo25": {"provider": "openrouter", "model": "xiaomi/mimo-v2.5", "max_tokens": 16000, "max_output_tokens": 131072, "reasoning_mode": "effort"},
-    # MiniMax M3: 512K max output, MiniMax strongly recommends preserving
-    # reasoning between turns (our msg round-trip already handles this)
-    "m3": {"provider": "openrouter", "model": "minimax/minimax-m3", "max_tokens": 16000, "max_output_tokens": 512000, "reasoning_mode": "effort"},
-    # GLM-5.2: 131K max output, supports high/xhigh effort; leading open-weight
-    # reasoning model, designed for agentic coding
-    "glm52": {"provider": "openrouter", "model": "z-ai/glm-5.2", "max_tokens": 16000, "max_output_tokens": 131072, "reasoning_mode": "effort"},
-    # Hy3 (free): 262K max output, 256K context, supports disabled/low/high;
-    # free through July 21 2026, standard pricing after
-    "hy3": {"provider": "openrouter", "model": "tencent/hy3", "max_tokens": 16000, "max_output_tokens": 262144, "reasoning_mode": "effort"},
-    # this entry has not been checked for correctness
-    "kimi27": {"provider": "openrouter", "model": "moonshotai/kimi-k2.7-code", "max_tokens": 16000, "max_output_tokens": 32000, "reasoning_mode": "effort"},
+    "dsv4-nitro": {
+        "provider": "openrouter",
+        "model": "deepseek/deepseek-v4-flash:nitro",
+        "max_tokens": 16000,
+        "max_output_tokens": 131072,
+        "reasoning_mode": "effort",
+        "sampling": {"temperature": 0.7, "provider": {"quantizations": ["fp8"]}},
+    },
 }
 
 
-MODEL_ID = os.environ.get("PQ_MODEL", "dsv4-flash")
+MODEL_ID = os.environ.get("PQ_MODEL", "dsv4-nitro")
 if MODEL_ID not in MODEL_REGISTRY:
     sys.exit("Error: unknown model '" + MODEL_ID + "'. " "Known models: " + ", ".join(sorted(MODEL_REGISTRY.keys())))
 
