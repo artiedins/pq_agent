@@ -82,6 +82,8 @@ exec bwrap \
   `# shadow .pq with empty tmpfs so agent cannot read harness files` \
   --tmpfs /workspace/.pq \
   --ro-bind-try "$PW_CACHE" /pw-cache \
+  `# HF caches commonly used by huggingface_hub / transformers` \
+   --ro-bind-try "${HOME}/.cache/huggingface" /hf-cache \
   --unshare-pid \
   --unshare-ipc \
   --unshare-uts \
@@ -93,7 +95,13 @@ exec bwrap \
   --setenv TMPDIR /tmp \
   --setenv PLAYWRIGHT_BROWSERS_PATH /pw-cache \
   --setenv AGENT_DIR /agent \
+  --setenv HF_HOME /hf-cache \
+  --setenv HUGGINGFACE_HUB_CACHE /hf-cache/hub \
+  --setenv TRANSFORMERS_CACHE /hf-cache/hub \
+  --setenv HF_HUB_OFFLINE 1 \
+  --setenv HF_MODULES_CACHE /tmp/hf_modules \
   "${ENV_ARGS[@]}" \
   --chdir /workspace \
   -- \
   python3 -u /agent/agent.py
+
