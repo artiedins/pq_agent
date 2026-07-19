@@ -1,22 +1,46 @@
 #!/usr/bin/env python3
 
-# review_results.py -- Automated reviewer for the sound-change cascade task.
+# review_results_or.py -- Automated reviewer for the sound-change cascade task.
 #
-# Runs from the agent's working directory (which contains train.tsv, apply.py,
-# rules.json, ordering.txt, and the agent's solution code).  This script lives
-# in the parent directory alongside hidden_test.tsv.
+# Same role as review_results.py, but calls OpenRouter directly (no llm_client,
+# no Anthropic). Auth is PQ_API_KEY. Switch model with MODEL= at the top.
 #
 # Usage (from the agent's workdir):
-#   python3 ../review_results.py
+#   python3 ../review_results_or.py
 #
-# Requires: ANTHROPIC_API_KEY set in the environment.
+# Requires: PQ_API_KEY set in the environment (OpenRouter API key).
 
 import json
 import os
+import random
 import sys
+import time
 from pathlib import Path
 
-# ── Configuration ────────────────────────────────────────────────────────────
+import requests
+
+# Model selector. Edit this one line; do not use an env var.
+MODEL = "kimi3"
+
+# OpenRouter chat completions. :nitro on each slug sorts by throughput.
+# reasoning is either {"effort": "high"} or None to omit the block entirely
+# (kimi-k3 has no reasoning knob; filling one can change provider defaults).
+# provider is optional extra routing prefs (glm wants fp8 endpoints only).
+MODEL_REGISTRY = {
+    "kimi3": {
+        "model": "moonshotai/kimi-k3:nitro",
+        "reasoning": None,
+        "provider": None,
+    }
+}
+
+if MODEL not in MODEL_REGISTRY:
+    sys.exit("ERROR: unknown MODEL=" + repr(MODEL) + ". Known: " + ", ".join(sorted(MODEL_REGISTRY)))
+
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+MAX_TOKENS = 32000
+MAX_RETRIES = 8
+API_TIMEOUT = 300
 
 RULES_PATH = "rules.json"
 ORDERING_PATH = "ordering.txt"
@@ -26,18 +50,14 @@ TRAIN_PATH = "train.tsv"
 SCRIPT_DIR = Path(os.path.dirname(os.path.abspath(__file__)))
 HIDDEN_PATH = str(SCRIPT_DIR / "hidden_test.tsv")
 
-# Files to send to Claude for code review (if they exist).
+# Files to send for code review (if they exist).
 REPORT_FILES = [
     "task_report/report.md",
     "task_report/stats.yaml",
 ]
 
-# Files to exclude from the "agent code files" scan.  Only apply.py needs
-# excluding: it's the provided engine, not the agent's work.  rules.json and
-# ordering.txt aren't .py files so the glob never picks them up.
+# Only apply.py needs excluding: it's the provided engine, not the agent's work.
 EXCLUDE_FILES = {"apply.py"}
-
-# ── Task prompt (what the agent was given) ───────────────────────────────────
 
 TASK_PROMPT = """\
 An unknown proto-language underwent a cascade of ordered sound changes to \
@@ -64,8 +84,6 @@ Create:
 
 Your goal is to recover the complete rule cascade. If you cannot explain \
 all training pairs, write your best partial solution."""
-
-# ── Expert rubric ────────────────────────────────────────────────────────────
 
 EXPERT_RUBRIC = """\
 You are reviewing an LLM agent's solution to a historical phonology \
@@ -145,17 +163,37 @@ descriptive of the phonological process?
 
 ## CODE QUALITY
 
-- Is the analysis code well-organized and readable?
-- Are there comments explaining the approach?
+The agent worked under a harness system prompt that imposed strict coding \
+rules.  Judge style compliance against those rules (following them is correct, \
+not a defect):
+- Python: no type hints, no docstrings, no triple-quoted strings, no \
+decorative separators (# ----), and no module-level globals except trivial \
+constants.  No CLI argument parsing unless the user explicitly allowed it.
+- Inline comments explain why, not what.  High-leverage comments capture \
+real-world discoveries that static analysis cannot find, and record decisions \
+made with the user so they need not be re-asked.
+- For multi-knob experiments, knobs live in one dataclass with int codes for \
+categories (documented inline); log actual runtime values.
+- Prefer fewer, well-named files over many small siblings; iterate on one \
+script rather than analyze1.py / analyze2.py.
+- Never pipe multi-line scripts through heredocs; write a file and run it so \
+retries are small edits and work survives disk + context compaction.
+- Start files with a shebang; end with if __name__ ... main().
+
+When scoring code quality:
+- Is the analysis code well-organized and readable within those constraints?
+- Are there why-comments capturing discoveries and decisions (not paraphrasing \
+obvious code)?
 - Is there evidence of iteration and debugging?
+- Do not penalize absence of type hints, docstrings, or elaborate comments; \
+that absence is required.  Do not reward violating the harness style for the \
+sake of conventional "best practices."
 
 ## TEST RESULTS
 
 You will be given pytest output from running validation tests.  The tests \
 check: schema validity, ordering references, train accuracy, hidden accuracy, \
 and determinism.  Note which tests pass and fail."""
-
-# ── Scoring instructions ─────────────────────────────────────────────────────
 
 SCORING_INSTRUCTIONS = """\
 Evaluate the solution against these criteria.  For each, output the exact \
@@ -190,8 +228,14 @@ METHODOLOGY (integer 0-15):
 
 CODE QUALITY (integer 0-15):
 
-  code_quality -- Organization, clarity, naming, comments, separation of \
-concerns.  15 = exceptional, 10 = solid, 5 = adequate, 0 = no code files.
+  code_quality -- Organization, clarity, naming, why-comments, separation of \
+concerns, judged *inside* the harness coding rules the agent was required to \
+follow (no type hints, no docstrings, no triple-quoted strings, no decorative \
+separators, few well-named files, why-not-what comments, shebang + \
+if __name__ main).  Reward clean adherence and readable structure under those \
+constraints; do not deduct for missing type hints/docstrings or for sparse \
+narration comments.  15 = exceptional within the harness style, 10 = solid, \
+5 = adequate, 0 = no code files.
 
 OVERALL SCORE:
 
@@ -222,8 +266,6 @@ For the first fields (model_id through str_replace), use values from \
 stats.yaml if it was provided among the files.  If stats.yaml was not \
 provided, use "N/A" for all of them."""
 
-# ── System prompt ────────────────────────────────────────────────────────────
-
 SYSTEM_PROMPT = """\
 You are a senior computational linguist and phonologist conducting a code \
 review.  You evaluate LLM-generated solutions to a historical sound-change \
@@ -231,13 +273,15 @@ recovery task against a precise rubric.  You are rigorous, fair, and \
 calibrated: a solution that discovers the key phonological phenomena and \
 achieves high accuracy scores well even if the code style is imperfect, \
 while a solution with beautiful code that produces wrong outputs scores \
-poorly.  You output exactly the format requested — a short paragraph then \
-a CSV line — with no preamble, headers, or markdown formatting."""
+poorly.  The workers wrote under a harness system prompt with strict \
+Python style constraints (no type hints, no docstrings, no triple-quoted \
+strings, why-not-what comments, few files, etc.); score code quality against \
+those constraints rather than against conventional style guides.  You output \
+exactly the format requested — a short paragraph then a CSV line — with no \
+preamble, headers, or markdown formatting."""
 
-# ── Test runner (embedded from test.py) ──────────────────────────────────────
 
-
-def load_pairs(path: str) -> list[tuple[str, str]]:
+def load_pairs(path):
     pairs = []
     with open(path) as f:
         for line in f:
@@ -250,8 +294,7 @@ def load_pairs(path: str) -> list[tuple[str, str]]:
     return pairs
 
 
-def run_validation(apply_mod) -> dict:
-    """Run all validation checks and return a results dict."""
+def run_validation(apply_mod):
     results = {
         "rules_json_exists": False,
         "ordering_txt_exists": False,
@@ -267,7 +310,6 @@ def run_validation(apply_mod) -> dict:
         "errors": [],
     }
 
-    # Check files exist
     results["rules_json_exists"] = Path(RULES_PATH).exists()
     results["ordering_txt_exists"] = Path(ORDERING_PATH).exists()
 
@@ -275,14 +317,13 @@ def run_validation(apply_mod) -> dict:
         results["errors"].append("Missing rules.json or ordering.txt")
         return results
 
-    # Validate schema
     try:
         with open(RULES_PATH) as f:
             rules = json.load(f)
         assert isinstance(rules, list)
         for i, r in enumerate(rules):
             for field in ("name", "src", "tgt", "left", "right"):
-                assert field in r, f"Rule {i} missing '{field}'"
+                assert field in r, "Rule " + str(i) + " missing '" + field + "'"
             assert isinstance(r["name"], str) and r["name"]
             assert isinstance(r["src"], str) and r["src"]
             assert isinstance(r["tgt"], str)
@@ -290,30 +331,27 @@ def run_validation(apply_mod) -> dict:
             assert isinstance(r["right"], str)
         results["schema_valid"] = True
     except Exception as e:
-        results["errors"].append(f"Schema validation failed: {e}")
+        results["errors"].append("Schema validation failed: " + str(e))
         return results
 
-    # Validate ordering references
     try:
         known = {r["name"] for r in rules}
         with open(ORDERING_PATH) as f:
             names = [l.strip() for l in f if l.strip() and not l.startswith("#")]
         assert names, "ordering.txt is empty"
         unknown = [n for n in names if n not in known]
-        assert not unknown, f"Unknown rule names: {unknown[:5]}"
+        assert not unknown, "Unknown rule names: " + str(unknown[:5])
         results["ordering_valid"] = True
     except Exception as e:
-        results["errors"].append(f"Ordering validation failed: {e}")
+        results["errors"].append("Ordering validation failed: " + str(e))
         return results
 
-    # Load ordered rules
     try:
         ordered = apply_mod.load_rules(RULES_PATH, ORDERING_PATH)
     except Exception as e:
-        results["errors"].append(f"Failed to load rules: {e}")
+        results["errors"].append("Failed to load rules: " + str(e))
         return results
 
-    # Train accuracy
     train_pairs = load_pairs(TRAIN_PATH)
     results["train_total"] = len(train_pairs)
     for proto, expected in train_pairs:
@@ -324,9 +362,8 @@ def run_validation(apply_mod) -> dict:
             else:
                 results["train_failures"].append((proto, expected, got))
         except Exception as e:
-            results["train_failures"].append((proto, expected, f"ERROR: {e}"))
+            results["train_failures"].append((proto, expected, "ERROR: " + str(e)))
 
-    # Hidden accuracy
     if Path(HIDDEN_PATH).exists():
         hidden_pairs = load_pairs(HIDDEN_PATH)
         results["hidden_total"] = len(hidden_pairs)
@@ -338,13 +375,10 @@ def run_validation(apply_mod) -> dict:
                 else:
                     results["hidden_failures"].append((proto, expected, got))
             except Exception as e:
-                results["hidden_failures"].append(
-                    (proto, expected, f"ERROR: {e}")
-                )
+                results["hidden_failures"].append((proto, expected, "ERROR: " + str(e)))
     else:
-        results["errors"].append(f"Hidden test file not found: {HIDDEN_PATH}")
+        results["errors"].append("Hidden test file not found: " + HIDDEN_PATH)
 
-    # Determinism check
     for proto, _ in train_pairs[:20]:
         r1 = apply_mod.apply_cascade(proto, ordered)
         r2 = apply_mod.apply_cascade(proto, ordered)
@@ -355,8 +389,7 @@ def run_validation(apply_mod) -> dict:
     return results
 
 
-def format_test_report(results: dict) -> str:
-    """Format validation results as a human-readable report."""
+def format_test_report(results):
     lines = ["## Validation Results\n"]
 
     checks = [
@@ -367,47 +400,47 @@ def format_test_report(results: dict) -> str:
         ("Deterministic", results["deterministic"]),
     ]
     for label, ok in checks:
-        lines.append(f"  {'PASS' if ok else 'FAIL'}  {label}")
+        lines.append("  " + ("PASS" if ok else "FAIL") + "  " + label)
 
     lines.append("")
     tc = results["train_correct"]
     tt = results["train_total"]
-    lines.append(f"  Train accuracy:  {tc}/{tt} ({100*tc/tt:.1f}%)" if tt else "  Train accuracy:  N/A")
+    if tt:
+        lines.append("  Train accuracy:  " + str(tc) + "/" + str(tt) + " (" + "{:.1f}".format(100 * tc / tt) + "%)")
+    else:
+        lines.append("  Train accuracy:  N/A")
 
     hc = results["hidden_correct"]
     ht = results["hidden_total"]
-    lines.append(f"  Hidden accuracy: {hc}/{ht} ({100*hc/ht:.1f}%)" if ht else "  Hidden accuracy: N/A")
+    if ht:
+        lines.append("  Hidden accuracy: " + str(hc) + "/" + str(ht) + " (" + "{:.1f}".format(100 * hc / ht) + "%)")
+    else:
+        lines.append("  Hidden accuracy: N/A")
 
     if results["errors"]:
         lines.append("\n  Errors:")
         for e in results["errors"]:
-            lines.append(f"    - {e}")
+            lines.append("    - " + e)
 
-    # Show sample failures (up to 10 from each set)
     if results["train_failures"]:
-        lines.append(f"\n  Sample train failures ({len(results['train_failures'])} total):")
+        lines.append("\n  Sample train failures (" + str(len(results["train_failures"])) + " total):")
         for proto, expected, got in results["train_failures"][:10]:
-            lines.append(f"    {proto!r} -> expected {expected!r}, got {got!r}")
+            lines.append("    " + repr(proto) + " -> expected " + repr(expected) + ", got " + repr(got))
 
     if results["hidden_failures"]:
-        lines.append(f"\n  Sample hidden failures ({len(results['hidden_failures'])} total):")
+        lines.append("\n  Sample hidden failures (" + str(len(results["hidden_failures"])) + " total):")
         for proto, expected, got in results["hidden_failures"][:10]:
-            lines.append(f"    {proto!r} -> expected {expected!r}, got {got!r}")
+            lines.append("    " + repr(proto) + " -> expected " + repr(expected) + ", got " + repr(got))
 
     return "\n".join(lines)
 
 
-# ── File collection ──────────────────────────────────────────────────────────
-
-
-def collect_agent_code_files() -> dict[str, str]:
-    """Collect all .py files the agent created (excluding infrastructure)."""
+def collect_agent_code_files():
     contents = {}
     for p in sorted(Path(".").rglob("*.py")):
         if p.name in EXCLUDE_FILES:
             continue
         name = str(p)
-        # skip __pycache__, .venv, etc.
         if any(part.startswith(".") or part == "__pycache__" for part in p.parts):
             continue
         try:
@@ -417,33 +450,29 @@ def collect_agent_code_files() -> dict[str, str]:
     return contents
 
 
-def collect_report_files() -> dict[str, str]:
-    """Collect report.md and stats.yaml if they exist."""
+def collect_report_files():
     contents = {}
     for path in REPORT_FILES:
         try:
             contents[path] = Path(path).read_text()
         except (FileNotFoundError, IsADirectoryError):
-            print(f"[WARN] Not found, skipping: {path}", file=sys.stderr)
+            print("[WARN] Not found, skipping: " + path, file=sys.stderr)
     return contents
 
 
-def collect_rules_summary() -> str:
-    """Return a summary of the rules (without full JSON, which can be huge)."""
+def collect_rules_summary():
     try:
         with open(RULES_PATH) as f:
             rules = json.load(f)
         with open(ORDERING_PATH) as f:
             ordering = [l.strip() for l in f if l.strip() and not l.startswith("#")]
 
-        lines = [f"Total rules defined: {len(rules)}"]
-        lines.append(f"Total rules in ordering: {len(ordering)}")
+        lines = ["Total rules defined: " + str(len(rules))]
+        lines.append("Total rules in ordering: " + str(len(ordering)))
 
-        # Count context usage
         ctx_rules = sum(1 for r in rules if r.get("left") or r.get("right"))
-        lines.append(f"Rules with context conditions: {ctx_rules}/{len(rules)}")
+        lines.append("Rules with context conditions: " + str(ctx_rules) + "/" + str(len(rules)))
 
-        # Show all rules in ordering (compact format)
         lines.append("\nOrdered rule cascade:")
         rules_by_name = {r["name"]: r for r in rules}
         for name in ordering:
@@ -454,36 +483,28 @@ def collect_rules_summary() -> str:
             right = r.get("right", "")
             ctx = ""
             if left or right:
-                ctx = f" / {left or '∅'} _ {right or '∅'}"
-            lines.append(f"  {name}: {src} → {tgt}{ctx}")
+                ctx = " / " + (left or "∅") + " _ " + (right or "∅")
+            lines.append("  " + name + ": " + src + " → " + tgt + ctx)
 
         return "\n".join(lines)
     except Exception as e:
-        return f"Could not summarize rules: {e}"
+        return "Could not summarize rules: " + str(e)
 
 
-# ── Prompt assembly ──────────────────────────────────────────────────────────
-
-
-def build_files_block(contents: dict[str, str]) -> str:
+def build_files_block(contents):
     lines = []
     for path, text in contents.items():
         ext = os.path.splitext(path)[1].lstrip(".")
         lang = {"py": "python", "md": "markdown", "yaml": "yaml"}.get(ext, "")
-        lines.append(f"### {path}")
-        lines.append(f"```{lang}")
+        lines.append("### " + path)
+        lines.append("```" + lang)
         lines.append(text.rstrip())
         lines.append("```")
         lines.append("")
     return "\n".join(lines)
 
 
-def build_user_prompt(
-    test_report: str,
-    rules_summary: str,
-    code_files: dict[str, str],
-    report_files: dict[str, str],
-) -> str:
+def build_user_prompt(test_report, rules_summary, code_files, report_files):
     parts = [
         "## TASK PROMPT (this is what the agent was asked to solve)\n\n",
         TASK_PROMPT,
@@ -512,63 +533,156 @@ def build_user_prompt(
     return "".join(parts)
 
 
-# ── Main ─────────────────────────────────────────────────────────────────────
+def _sleep_with_jitter(attempt):
+    delay = random.uniform(2 ** (attempt - 1), 2**attempt)
+    print(
+        "  [retry " + str(attempt) + "/" + str(MAX_RETRIES - 1) + "] waiting " + "{:.1f}".format(delay) + "s...",
+        file=sys.stderr,
+    )
+    time.sleep(delay)
+
+
+def call_openrouter(messages):
+    api_key = os.environ.get("PQ_API_KEY")
+    if not api_key:
+        sys.exit("ERROR: PQ_API_KEY is not set (OpenRouter API key required)")
+
+    cfg = MODEL_REGISTRY[MODEL]
+    model_slug = cfg["model"]
+    headers = {
+        "Authorization": "Bearer " + api_key,
+        "Content-Type": "application/json",
+        "X-Title": "review-results-or",
+        "HTTP-Referer": "https://github.com/artiedins/pq_agent",
+    }
+
+    payload = {
+        "model": model_slug,
+        "messages": messages,
+        "max_tokens": MAX_TOKENS,
+    }
+    # Only attach reasoning when configured. kimi-k3 intentionally omits it.
+    if cfg["reasoning"] is not None:
+        payload["reasoning"] = cfg["reasoning"]
+    if cfg["provider"] is not None:
+        payload["provider"] = cfg["provider"]
+
+    reason_desc = "none" if cfg["reasoning"] is None else str(cfg["reasoning"])
+    prov_desc = "default" if cfg["provider"] is None else str(cfg["provider"])
+    print(
+        "# calling " + model_slug + " via openrouter (reasoning=" + reason_desc + ", provider=" + prov_desc + ")...",
+        file=sys.stderr,
+    )
+
+    data = None
+    for attempt in range(MAX_RETRIES):
+        if attempt > 0:
+            _sleep_with_jitter(attempt)
+        try:
+            resp = requests.post(OPENROUTER_URL, headers=headers, json=payload, timeout=API_TIMEOUT)
+        except requests.exceptions.Timeout:
+            if attempt < MAX_RETRIES - 1:
+                print("  [error] request timed out, retrying...", file=sys.stderr)
+                continue
+            raise
+        except requests.exceptions.ConnectionError as e:
+            if attempt < MAX_RETRIES - 1:
+                print("  [error] connection error, retrying: " + str(e)[:120], file=sys.stderr)
+                continue
+            raise
+
+        if (resp.status_code == 429 or resp.status_code >= 500) and attempt < MAX_RETRIES - 1:
+            print("  [error] " + str(resp.status_code) + " transient error, retrying...", file=sys.stderr)
+            continue
+
+        if not resp.ok:
+            body_preview = resp.text[:300].replace("\n", " ").strip()
+            print("[error] status=" + str(resp.status_code) + " body=" + body_preview, file=sys.stderr)
+            resp.raise_for_status()
+
+        try:
+            data = resp.json()
+        except ValueError as e:
+            if attempt < MAX_RETRIES - 1:
+                print("  [error] response body not valid JSON, retrying: " + str(e), file=sys.stderr)
+                continue
+            raise
+
+        # OpenRouter sometimes returns 200 with an error object and no choices.
+        if "choices" not in data and "error" in data:
+            err = data["error"]
+            code = err.get("code", 0)
+            msg = err.get("message", "unknown error")
+            if isinstance(code, int) and 400 <= code < 500 and code != 429:
+                raise RuntimeError("API error " + str(code) + ": " + msg)
+            if attempt < MAX_RETRIES - 1:
+                print(
+                    "  [error] response error instead of choices (code=" + str(code) + "), retrying: " + msg[:120],
+                    file=sys.stderr,
+                )
+                continue
+            raise RuntimeError("API error after retries: " + str(code) + ": " + msg)
+
+        choices = data.get("choices")
+        if not (isinstance(choices, list) and choices and isinstance(choices[0], dict) and isinstance(choices[0].get("message"), dict)):
+            if attempt < MAX_RETRIES - 1:
+                print("  [error] response missing choices[0].message, retrying...", file=sys.stderr)
+                continue
+            raise RuntimeError("API response missing choices[0].message after retries")
+        break
+
+    if data is None:
+        raise RuntimeError("call_openrouter: exhausted retries")
+
+    choice = data["choices"][0]
+    msg = choice["message"]
+    text = (msg.get("content") or "").strip()
+    usage_raw = data.get("usage") or {}
+    usage = {
+        "prompt_tokens": usage_raw.get("prompt_tokens", 0),
+        "completion_tokens": usage_raw.get("completion_tokens", 0),
+    }
+    print(
+        "# prompt_tokens=" + str(usage["prompt_tokens"]) + " completion_tokens=" + str(usage["completion_tokens"]),
+        file=sys.stderr,
+    )
+    if choice.get("finish_reason") == "length":
+        print("# WARNING: hit max_tokens; output likely truncated", file=sys.stderr)
+    return text, usage
 
 
 def main():
-    # Import llm_client from the same directory as this script.
-    sys.path.insert(0, str(SCRIPT_DIR))
-    try:
-        import llm_client
-    except ImportError:
-        sys.exit(
-            "ERROR: could not import llm_client.  "
-            "Ensure llm_client.py is in " + str(SCRIPT_DIR)
-        )
-
-    # Import apply.py from the agent's working directory.
     sys.path.insert(0, os.getcwd())
     try:
         import apply as apply_mod
     except ImportError:
-        sys.exit(
-            "ERROR: could not import apply.py from " + os.getcwd()
-        )
+        sys.exit("ERROR: could not import apply.py from " + os.getcwd())
 
-    # Run validation.
+    print("[INFO] MODEL=" + MODEL + " (" + MODEL_REGISTRY[MODEL]["model"] + ")", file=sys.stderr)
     print("[INFO] Running validation tests...", file=sys.stderr)
     results = run_validation(apply_mod)
     test_report = format_test_report(results)
     print(test_report, file=sys.stderr)
 
-    # Summarize rules.
     rules_summary = collect_rules_summary()
-
-    # Collect files.
     code_files = collect_agent_code_files()
     report_files = collect_report_files()
 
     found = sorted(list(code_files.keys()) + list(report_files.keys()))
     print(
-        f"[INFO] Reviewing {len(found)} file(s): {', '.join(found)}",
+        "[INFO] Reviewing " + str(len(found)) + " file(s): " + ", ".join(found),
         file=sys.stderr,
     )
 
-    # Build the prompt.
-    user_prompt = build_user_prompt(
-        test_report, rules_summary, code_files, report_files
-    )
+    user_prompt = build_user_prompt(test_report, rules_summary, code_files, report_files)
 
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": user_prompt},
     ]
 
-    # Call Claude.
-    print("[INFO] Sending review request to Claude...", file=sys.stderr)
-    text, usage = llm_client.call_llm_messages(messages, provider="anthropic")
-
-    # Print the review to stdout.
+    print("[INFO] Sending review request to OpenRouter...", file=sys.stderr)
+    text, usage = call_openrouter(messages)
     print(text)
 
 

@@ -28,20 +28,30 @@ from flowmark import reformat_file
 #   "none"   -> send nothing (model has no thinking, or always-on with no knob)
 #   "effort" -> OpenRouter {"reasoning": {"effort": REASONING_EFFORT}}
 # all OpenRouter models below that support configurable reasoning use "effort".
+
+
 MODEL_REGISTRY = {
-    "grok45": {"provider": "openrouter", "model": "x-ai/grok-4.5", "max_tokens": 16000, "max_output_tokens": 500000, "reasoning_mode": "effort"},
-    "dsv4-nitro": {
+    "kimi3": {"provider": "openrouter", "model": "moonshotai/kimi-k3:nitro", "max_tokens": 16000, "max_output_tokens": 100000, "reasoning_mode": "none"},
+    "glm52": {
+        "provider": "openrouter",
+        "model": "z-ai/glm-5.2:nitro",
+        "max_tokens": 16000,
+        "max_output_tokens": 65000,
+        "reasoning_mode": "effort",
+        "sampling": {"provider": {"quantizations": ["fp8"]}},
+    },
+    "dsv4": {
         "provider": "openrouter",
         "model": "deepseek/deepseek-v4-flash:nitro",
         "max_tokens": 16000,
-        "max_output_tokens": 131072,
+        "max_output_tokens": 100000,
         "reasoning_mode": "effort",
         "sampling": {"temperature": 0.7, "provider": {"quantizations": ["fp8"]}},
     },
 }
 
 
-MODEL_ID = os.environ.get("PQ_MODEL", "dsv4-nitro")
+MODEL_ID = os.environ.get("PQ_MODEL", "dsv4")
 if MODEL_ID not in MODEL_REGISTRY:
     sys.exit("Error: unknown model '" + MODEL_ID + "'. " "Known models: " + ", ".join(sorted(MODEL_REGISTRY.keys())))
 
@@ -478,6 +488,8 @@ def apply_reasoning(payload, effort):
         payload["reasoning"] = {"effort": "none"}
     elif rmode == "effort" and effort:
         payload["reasoning"] = {"effort": effort}
+    elif rmode == "low":
+        payload["reasoning"] = {"effort": "low"}
     elif rmode == "disabled":
         payload["reasoning"] = {"enabled": False}
 
