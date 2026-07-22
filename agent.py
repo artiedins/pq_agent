@@ -31,19 +31,13 @@ from flowmark import reformat_file
 
 
 MODEL_REGISTRY = {
-    "kimi3": {"provider": "openrouter", "model": "moonshotai/kimi-k3:nitro", "max_tokens": 16000, "max_output_tokens": 100000, "reasoning_mode": "none"},
-    "glm52": {
-        "provider": "openrouter",
-        "model": "z-ai/glm-5.2:nitro",
-        "max_tokens": 16000,
-        "max_output_tokens": 65000,
-        "reasoning_mode": "effort",
-        "sampling": {"provider": {"quantizations": ["fp8"]}},
-    },
+    "kimi3": {"provider": "openrouter", "model": "moonshotai/kimi-k3:nitro", "max_tokens": 20000, "max_output_tokens": 100000, "reasoning_mode": "none"},
+    "grok45": {"provider": "openrouter", "model": "x-ai/grok-4.5:nitro", "max_tokens": 20000, "max_output_tokens": 65000, "reasoning_mode": "effort"},
+    "gem36f": {"provider": "openrouter", "model": "google/gemini-3.6-flash:nitro", "max_tokens": 20000, "max_output_tokens": 65000, "reasoning_mode": "effort"},
     "dsv4": {
         "provider": "openrouter",
         "model": "deepseek/deepseek-v4-flash:nitro",
-        "max_tokens": 16000,
+        "max_tokens": 20000,
         "max_output_tokens": 100000,
         "reasoning_mode": "effort",
         "sampling": {"temperature": 0.7, "provider": {"quantizations": ["fp8"]}},
@@ -490,6 +484,8 @@ def apply_reasoning(payload, effort):
         payload["reasoning"] = {"effort": effort}
     elif rmode == "low":
         payload["reasoning"] = {"effort": "low"}
+    elif rmode == "xhigh":
+        payload["reasoning"] = {"effort": "xhigh"}
     elif rmode == "disabled":
         payload["reasoning"] = {"enabled": False}
 
