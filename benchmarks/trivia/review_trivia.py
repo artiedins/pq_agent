@@ -27,13 +27,7 @@ import requests
 # Model selector. Edit this one line; do not use an env var.
 MODEL = "gem36f"
 
-# OpenRouter chat completions. :nitro on each slug sorts by throughput.
-# reasoning is either {"effort": "high"} or None to omit the block entirely
-# (kimi-k3 has no reasoning knob; filling one can change provider defaults).
-# provider is optional extra routing prefs (glm wants fp8 endpoints only).
 MODEL_REGISTRY = {
-    "kimi3": {"model": "moonshotai/kimi-k3:nitro", "reasoning": None, "provider": None},
-    "grok45": {"model": "x-ai/grok-4.5:nitro", "reasoning": {"effort": "high"}, "provider": None},
     "gem36f": {"model": "google/gemini-3.6-flash:nitro", "reasoning": {"effort": "high"}, "provider": None},
 }
 

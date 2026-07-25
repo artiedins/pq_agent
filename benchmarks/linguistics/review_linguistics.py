@@ -20,19 +20,12 @@ from pathlib import Path
 import requests
 
 # Model selector. Edit this one line; do not use an env var.
-MODEL = "kimi3"
+MODEL = "gem36f"
 
-# OpenRouter chat completions. :nitro on each slug sorts by throughput.
-# reasoning is either {"effort": "high"} or None to omit the block entirely
-# (kimi-k3 has no reasoning knob; filling one can change provider defaults).
-# provider is optional extra routing prefs (glm wants fp8 endpoints only).
 MODEL_REGISTRY = {
-    "kimi3": {
-        "model": "moonshotai/kimi-k3:nitro",
-        "reasoning": None,
-        "provider": None,
-    }
+    "gem36f": {"model": "google/gemini-3.6-flash:nitro", "reasoning": {"effort": "high"}, "provider": None},
 }
+
 
 if MODEL not in MODEL_REGISTRY:
     sys.exit("ERROR: unknown MODEL=" + repr(MODEL) + ". Known: " + ", ".join(sorted(MODEL_REGISTRY)))
