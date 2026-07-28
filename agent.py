@@ -32,8 +32,12 @@ from flowmark import reformat_file
 
 MODEL_REGISTRY = {
     "kimi3": {"provider": "openrouter", "model": "moonshotai/kimi-k3:nitro", "max_tokens": 20000, "max_output_tokens": 100000, "reasoning_mode": "effort"},
-    "gem36f": {"provider": "openrouter", "model": "google/gemini-3.6-flash:nitro", "max_tokens": 20000, "max_output_tokens": 65000, "reasoning_mode": "effort"},
-    "grok45": {"provider": "openrouter", "model": "x-ai/grok-4.5:nitro", "max_tokens": 20000, "max_output_tokens": 65000, "reasoning_mode": "effort"},
+    "gem36f": {"provider": "openrouter", "model": "google/gemini-3.6-flash:nitro", "max_tokens": 20000, "max_output_tokens": 100000, "reasoning_mode": "effort"},
+    "grok45": {"provider": "openrouter", "model": "x-ai/grok-4.5:nitro", "max_tokens": 20000, "max_output_tokens": 100000, "reasoning_mode": "effort"},
+    "glm52": {"provider": "openrouter", "model": "z-ai/glm-5.2:nitro", "max_tokens": 20000, "max_output_tokens": 100000, "reasoning_mode": "effort"},
+    "gpt56sol": {"provider": "openrouter", "model": "openai/gpt-5.6-sol:nitro", "max_tokens": 20000, "max_output_tokens": 100000, "reasoning_mode": "effort"},
+    "muse11": {"provider": "openrouter", "model": "meta/muse-spark-1.1:nitro", "max_tokens": 20000, "max_output_tokens": 100000, "reasoning_mode": "effort"},
+    "opus46": {"provider": "openrouter", "model": "anthropic/claude-opus-4.6:nitro", "max_tokens": 20000, "max_output_tokens": 100000, "reasoning_mode": "effort"},
     "dsv4": {
         "provider": "openrouter",
         "model": "deepseek/deepseek-v4-flash:nitro",
