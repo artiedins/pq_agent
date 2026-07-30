@@ -26,8 +26,28 @@ from flowmark import reformat_file
 #
 # reasoning_mode controls what apply_reasoning() sends:
 #   "none"   -> send nothing (model has no thinking, or always-on with no knob)
-#   "effort" -> OpenRouter {"reasoning": {"effort": REASONING_EFFORT}}
-# all OpenRouter models below that support configurable reasoning use "effort".
+#   "effort" -> provider-shaped high thinking (see apply_reasoning)
+#     openrouter:     {"reasoning": {"effort": REASONING_EFFORT}}
+#     opencode-go/zen: top-level {"reasoning_effort": REASONING_EFFORT}
+#                      (OpenCode openai-compatible wire format; nested OR-style
+#                      reasoning.effort 400s on some Go models e.g. kimi-k2.7-code)
+
+
+## NEW
+# qwen/qwen3.7-flash
+# could also check m3 and step3.7-flash
+
+# TIERS
+# --------
+# kimi3 - slow
+# gem36f
+# --------
+# grok45 - faster
+# --------
+# dsv4p
+# glm52 - slow
+# ------
+# dsv4f - faster
 
 
 MODEL_REGISTRY = {
@@ -35,9 +55,14 @@ MODEL_REGISTRY = {
     "gem36f": {"provider": "openrouter", "model": "google/gemini-3.6-flash:nitro", "max_tokens": 20000, "max_output_tokens": 100000, "reasoning_mode": "effort"},
     "grok45": {"provider": "openrouter", "model": "x-ai/grok-4.5:nitro", "max_tokens": 20000, "max_output_tokens": 100000, "reasoning_mode": "effort"},
     "glm52": {"provider": "openrouter", "model": "z-ai/glm-5.2:nitro", "max_tokens": 20000, "max_output_tokens": 100000, "reasoning_mode": "effort"},
-    "gpt56sol": {"provider": "openrouter", "model": "openai/gpt-5.6-sol:nitro", "max_tokens": 20000, "max_output_tokens": 100000, "reasoning_mode": "effort"},
-    "muse11": {"provider": "openrouter", "model": "meta/muse-spark-1.1:nitro", "max_tokens": 20000, "max_output_tokens": 100000, "reasoning_mode": "effort"},
-    "opus46": {"provider": "openrouter", "model": "anthropic/claude-opus-4.6:nitro", "max_tokens": 20000, "max_output_tokens": 100000, "reasoning_mode": "effort"},
+    "dsv4p": {
+        "provider": "openrouter",
+        "model": "deepseek/deepseek-v4-pro:nitro",
+        "max_tokens": 20000,
+        "max_output_tokens": 100000,
+        "reasoning_mode": "effort",
+        "sampling": {"provider": {"quantizations": ["fp8"]}},
+    },
     "dsv4": {
         "provider": "openrouter",
         "model": "deepseek/deepseek-v4-flash:nitro",
@@ -46,10 +71,18 @@ MODEL_REGISTRY = {
         "reasoning_mode": "effort",
         "sampling": {"temperature": 0.7, "provider": {"quantizations": ["fp8"]}},
     },
+    # OpenCode Go (chat/completions path only; skip Anthropic /messages models)
+    "go_kimi3": {"provider": "opencode-go", "model": "kimi-k3", "max_tokens": 20000, "max_output_tokens": 100000, "reasoning_mode": "effort"},
+    "go_grok45": {"provider": "opencode-go", "model": "grok-4.5", "max_tokens": 20000, "max_output_tokens": 100000, "reasoning_mode": "effort"},
+    "go_glm52": {"provider": "opencode-go", "model": "glm-5.2", "max_tokens": 20000, "max_output_tokens": 100000, "reasoning_mode": "effort"},
+    "go_dsv4p": {"provider": "opencode-go", "model": "deepseek-v4-pro", "max_tokens": 20000, "max_output_tokens": 100000, "reasoning_mode": "effort"},
+    "go_dsv4": {"provider": "opencode-go", "model": "deepseek-v4-flash", "max_tokens": 20000, "max_output_tokens": 100000, "reasoning_mode": "effort"},
+    # OpenCode Zen free tier (chat/completions)
+    "zen_dsv4f": {"provider": "opencode-zen", "model": "deepseek-v4-flash-free", "max_tokens": 20000, "max_output_tokens": 100000, "reasoning_mode": "effort"},
 }
 
 
-MODEL_ID = os.environ.get("PQ_MODEL", "dsv4")
+MODEL_ID = os.environ.get("PQ_MODEL", "zen_dsv4f")
 if MODEL_ID not in MODEL_REGISTRY:
     sys.exit("Error: unknown model '" + MODEL_ID + "'. " "Known models: " + ", ".join(sorted(MODEL_REGISTRY.keys())))
 
@@ -61,8 +94,10 @@ def _cfg(key, default=None):
 _PROVIDER = _cfg("provider")
 
 # derive provider-specific globals: API endpoint, auth headers, model string.
-# PQ_API_KEY is the single auth credential for any model that needs one.
-_needs_auth = (_PROVIDER == "openrouter") or _cfg("auth", False)
+# OpenRouter and OpenCode Go/Zen all auth with PQ_API_KEY (Bearer). One name so
+# child-shell scrubbing (_API_KEY suffix) and bwrap passthrough stay consistent;
+# ops just swap which provider's key is in PQ_API_KEY for the run.
+_needs_auth = _PROVIDER in ("openrouter", "opencode-go", "opencode-zen") or _cfg("auth", False)
 
 if _needs_auth:
     _API_KEY = os.environ.get("PQ_API_KEY")
@@ -92,6 +127,23 @@ elif _PROVIDER == "local":
     else:
         _API_HEADERS = {"Content-Type": "application/json"}
     _MODEL_STRING = _cfg("model")
+
+elif _PROVIDER == "opencode-go":
+    _API_URL = "https://opencode.ai/zen/go/v1/chat/completions"
+    _API_HEADERS = {
+        "Authorization": "Bearer " + _API_KEY,
+        "Content-Type": "application/json",
+    }
+    _MODEL_STRING = _cfg("model")
+
+elif _PROVIDER == "opencode-zen":
+    _API_URL = "https://opencode.ai/zen/v1/chat/completions"
+    _API_HEADERS = {
+        "Authorization": "Bearer " + _API_KEY,
+        "Content-Type": "application/json",
+    }
+    _MODEL_STRING = _cfg("model")
+
 else:
     sys.exit("Error: unknown provider '" + _PROVIDER + "' for model '" + MODEL_ID + "'.")
 
@@ -149,7 +201,7 @@ MAX_PLAYWRIGHT_RESULT_TOKENS = 9000
 # File reads are head-truncated: the beginning of a file (imports, class defs,
 # function signatures) is the most structurally useful part. Same budget as
 # playwright results.
-MAX_FILE_READ_TOKENS = 16000
+MAX_FILE_READ_TOKENS = 32000
 
 # Command output is the opposite: the payoff (final error, traceback, exit summary)
 # is usually at the bottom, so we keep both ends and elide the noisy middle. This
@@ -413,9 +465,9 @@ def post_compaction(payload):
         # defensive fallback: if the server rejects the reasoning param, retry without it.
         # with the round-trip working this should rarely fire, but keeping it as a safety
         # net for future provider quirks. the warning will be visible in logs.
-        if e.response.status_code == 400 and ("reasoning" in payload or "chat_template_kwargs" in payload):
+        if e.response.status_code == 400 and ("reasoning" in payload or "reasoning_effort" in payload or "chat_template_kwargs" in payload):
             print(ts() + "  [warn] reasoning param rejected, retrying without it...")
-            payload = {k: v for k, v in payload.items() if k not in ("reasoning", "chat_template_kwargs")}
+            payload = {k: v for k, v in payload.items() if k not in ("reasoning", "reasoning_effort", "chat_template_kwargs")}
             resp = post_with_retry(payload)
             resp.raise_for_status()
             return resp
@@ -467,7 +519,7 @@ def apply_reasoning(payload, effort):
     # inject the appropriate reasoning control into the payload based on per-model
     # config. mutates payload in place. handles seven mechanisms:
     # - "none":        send nothing at all (payload untouched)
-    # - "effort":      OpenRouter {"reasoning": {"effort": ...}}
+    # - "effort":      provider-shaped high thinking (see branch below)
     # - "effort_none": OpenRouter {"reasoning": {"effort": "none"}} (explicit thinking off)
     # - "dsv4_think":  vLLM DSV4 {"chat_template_kwargs": {"thinking": <enable_thinking>, ...}}
     # - "qwen3_think": vLLM Qwen3.x {"chat_template_kwargs": {"enable_thinking": <enable_thinking>}}
@@ -485,7 +537,17 @@ def apply_reasoning(payload, effort):
     elif rmode == "effort_none":
         payload["reasoning"] = {"effort": "none"}
     elif rmode == "effort" and effort:
-        payload["reasoning"] = {"effort": effort}
+        # OpenCode Go/Zen openai-compatible path wants top-level reasoning_effort
+        # (AI SDK reasoningEffort). Nested OpenRouter reasoning.effort is accepted by
+        # many Go models but 400s kimi-k2.7-code; live probes confirmed top-level high
+        # is the universal safe default. Map xhigh->max for DeepSeek/GLM effort sets.
+        if _PROVIDER in ("opencode-go", "opencode-zen"):
+            e = effort
+            if e == "xhigh":
+                e = "max"
+            payload["reasoning_effort"] = e
+        else:
+            payload["reasoning"] = {"effort": effort}
     elif rmode == "low":
         payload["reasoning"] = {"effort": "low"}
     elif rmode == "xhigh":
@@ -1286,7 +1348,7 @@ def make_tools():
                 "function": {
                     "name": "search_web",
                     "strict": True,
-                    "description": "Search the web via DuckDuckGo and get results back as text/markdown. Results may be less comprehensive than Google - for deeper research, navigate directly to known URLs (docs sites, Stack Overflow, Reddit). Provide a plain text query e.g. 'python csv parsing example'. Use this for ALL web searches - do not build search URLs yourself.",
+                    "description": "Search the web via search engine and get results back as text/markdown. For deeper research, navigate directly to known URLs (docs sites, Stack Overflow, Reddit). Provide a plain text query e.g. 'python csv parsing example'. Use this for ALL web searches - do not build search URLs yourself.",
                     "parameters": {
                         "type": "object",
                         "properties": {"query": {"type": "string", "description": "Plain text search query"}},
@@ -1490,11 +1552,13 @@ def make_system_prompt():
     return (
         "You are an autonomous agent with " + intro_tools + ".\n"
         "\nAgent Contract:\n"
-        "1. Work hard to complete the task and all system requirements.\n"
+        "1. Work hard to complete the task, following all system requirements.\n"
         "2. If there is work remaining, your response must include at least one tool call. You may include brief reasoning text alongside tool calls, but do not make text-only replies while work remains. Text-only replies indicate you are finished and trigger a '[harness notice]'.\n"
         "3. Follow tool call API calling conventions and formatting PRECISELY - no extra XML (<tool_call> etc.) or whitespace.\n"
         "4. The ONLY exception to rule 2: when asked to summarize the session for context compaction, respond with a precisely crafted regular reply. Tool calls will not work past context compaction limits.\n"
         "5. Every file tool (write_file, read_file, str_replace) needs the 'filename' argument naming the file to act on. Include it in the same tool call as the other arguments - for write_file, send 'filename' alongside 'content', not content alone.\n"
+        "6. The files p.md and project.md (optional) are loaded into the first user message - you do not need to read them again, and you must never write or edit them.\n"
+        "7. Your task_report/report.md from previous sessions are moved to the previous_sessions directory with chronologically incrementing filenames. Do not write in this directory, but you may read your old reports for more context.\n"
         "\nTool rules:\n"
         "1. Always use tools for file operations and commands. Never output file contents in your reply.\n"
         "2. To edit a file: call read_file first, then pick the right tool:\n"

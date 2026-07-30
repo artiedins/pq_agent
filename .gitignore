@@ -11,6 +11,13 @@ __pycache__/
 # env / secrets - use shell exports instead
 .env
 
+# agent stuff
+NOTES.md
+p.md
+task_report/
+previous_sessions/
+
+
 # editor
 .vscode/
 .idea/

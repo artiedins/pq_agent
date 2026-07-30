@@ -7,10 +7,11 @@
 #
 # if project_dir is omitted, the current working directory is used.
 #
-# env vars (the only three the agent needs):
-#   PQ_MODEL      - which model to use (default: dsv4-flash)
-#   PQ_API_KEY    - single API key for any model that needs auth
-#   PQ_PLAYWRIGHT - 1 to enable web search via headed Chrome, 0 to disable
+# env vars the agent needs:
+#   PQ_MODEL          - which model to use (default: dsv4)
+#   PQ_API_KEY        - API key for OpenRouter or OpenCode (go_*/zen_*); put the
+#                       provider key that matches PQ_MODEL in this one var
+#   PQ_PLAYWRIGHT     - 1 to enable web search via headed Chrome, 0 to disable
 #
 # the agent code lives here (read-only inside sandbox at /agent)
 # the project dir is where the agent reads and writes (read-write at /workspace)
@@ -42,7 +43,7 @@ if ! command -v bwrap &>/dev/null; then
 fi
 
 # build the list of env vars to pass into the sandbox.
-# only the three PQ_* vars are needed; agent.py handles defaults and validation.
+# agent.py handles defaults and validation; bwrap --clearenv strips the rest.
 ENV_ARGS=()
 if [ -n "${PQ_MODEL:-}" ]; then
     ENV_ARGS+=(--setenv PQ_MODEL "$PQ_MODEL")
