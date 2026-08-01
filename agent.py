@@ -66,7 +66,7 @@ MODEL_REGISTRY = {
         "reasoning_mode": "effort",
         "sampling": {"provider": {"quantizations": ["fp8"]}},
     },
-    "dsv4": {
+    "dsv4f": {
         "provider": "openrouter",
         "model": "deepseek/deepseek-v4-flash:nitro",
         "max_tokens": 20000,
@@ -74,14 +74,33 @@ MODEL_REGISTRY = {
         "reasoning_mode": "effort",
         "sampling": {"temperature": 0.7, "provider": {"quantizations": ["fp8"]}},
     },
-    # OpenCode Go (chat/completions path only; skip Anthropic /messages models)
+    "dsv4fn1": {"provider": "openrouter", "model": "deepseek/deepseek-v4-flash-0731:nitro", "max_tokens": 20000, "max_output_tokens": 100000, "reasoning_mode": "effort"},
+    "dsv4fn2": {
+        "provider": "openrouter",
+        "model": "deepseek/deepseek-v4-flash-0731:nitro",
+        "max_tokens": 20000,
+        "max_output_tokens": 100000,
+        "reasoning_mode": "effort",
+        "sampling": {"temperature": 0.7, "provider": {"quantizations": ["fp8"]}},
+    },
+    # OpenCode Go (chat/completions path only). minimax-m3 and qwen3.7-max/plus
+    # are docs-listed as /messages but live probes (2026-08-01) confirmed they
+    # answer chat/completions via gateway conversion, and accept temperature.
     "go_kimi3": {"provider": "opencode-go", "model": "kimi-k3", "max_tokens": 20000, "max_output_tokens": 100000, "reasoning_mode": "effort"},
     "go_grok45": {"provider": "opencode-go", "model": "grok-4.5", "max_tokens": 20000, "max_output_tokens": 100000, "reasoning_mode": "effort"},
     "go_glm52": {"provider": "opencode-go", "model": "glm-5.2", "max_tokens": 20000, "max_output_tokens": 100000, "reasoning_mode": "effort"},
     "go_dsv4p": {"provider": "opencode-go", "model": "deepseek-v4-pro", "max_tokens": 20000, "max_output_tokens": 100000, "reasoning_mode": "effort"},
-    "go_dsv4": {"provider": "opencode-go", "model": "deepseek-v4-flash", "max_tokens": 20000, "max_output_tokens": 100000, "reasoning_mode": "effort"},
+    "go_dsv4f": {"provider": "opencode-go", "model": "deepseek-v4-flash", "max_tokens": 20000, "max_output_tokens": 100000, "reasoning_mode": "effort"},
+    # temperature-0.7 variants (_t07): same model, sampling temperature pinned
+    # via the generic sampling dict (payload.update in chat() applies it to any
+    # provider, so GO/ZEN need no provider-specific handling)
+    "go_dsv4f_t07": {"provider": "opencode-go", "model": "deepseek-v4-flash", "max_tokens": 20000, "max_output_tokens": 100000, "reasoning_mode": "effort", "sampling": {"temperature": 0.7}},
+    "go_minimax3": {"provider": "opencode-go", "model": "minimax-m3", "max_tokens": 20000, "max_output_tokens": 100000, "reasoning_mode": "effort"},
+    "go_qwen37max": {"provider": "opencode-go", "model": "qwen3.7-max", "max_tokens": 20000, "max_output_tokens": 100000, "reasoning_mode": "effort"},
+    "go_qwen37plus": {"provider": "opencode-go", "model": "qwen3.7-plus", "max_tokens": 20000, "max_output_tokens": 100000, "reasoning_mode": "effort"},
     # OpenCode Zen free tier (chat/completions)
     "zen_dsv4f": {"provider": "opencode-zen", "model": "deepseek-v4-flash-free", "max_tokens": 20000, "max_output_tokens": 100000, "reasoning_mode": "effort"},
+    "zen_dsv4f_t07": {"provider": "opencode-zen", "model": "deepseek-v4-flash-free", "max_tokens": 20000, "max_output_tokens": 100000, "reasoning_mode": "effort", "sampling": {"temperature": 0.7}},
 }
 
 
@@ -1886,19 +1905,17 @@ def make_system_prompt():
         "- For tasks like hyperparameter tuning or experimenting across multiple dimensions: place relevant knobs in one dataclass, int codes for categories (document inline), log actual runtime values, since defaults may be replaced with random search values dynamically at run time.\n"
         "- Prefer fewer, well-named files over many small ones. Iterate on one script rather than creating analyze1.py, analyze2.py siblings.\n"
         "- Never pipe multi-line scripts through heredocs (python3 << 'EOF'). Write the script to a file with write_file and run the file: retries become small str_replace edits instead of full re-sends, the working version survives on disk, and it survives context compaction.\n"
-        "\nWriting Rules (when deliverables are: documentation, proposals, presentations, blog posts, tweets). task_report/report.md stays plain and functional:\n"
-        "- Workflow: harvest specifics to NOTES.md; write the piece's thesis as ONE sentence at the top of NOTES.md (cannot state it = not ready, collect more; a piece that merely 'covers' its topic has failed); draft to file; read_file the draft and run both passes below; write_file the final. Skipping the passes is shipping code you never ran.\n"
-        "- Write from a position: the author has done the work, holds a view, and says so. Balanced coverage with no view is the primary failure mode of AI writing slop.\n"
-        "- Specifics make quality writing: the number, the name, the date, the quote - never the category. Each 'significant'/'various'/'numerous' is a defect: use the datum, or state that it is missing. Never pave a missing fact with adjectives.\n"
-        "- Show, don't rate: delete evaluative framing ('importantly', 'crucial', 'fascinating', 'it is worth noting') and present the fact that earned the adjective. If the fact cannot carry the sentence, get a better fact.\n"
-        "- Claims carry their grounds: 'X, because <evidence>', never 'some might argue'. Hedge only genuine uncertainty, naming what is unknown and what would resolve it.\n"
-        "- Banned patterns, each occurrence a bug: negative parallelism ('it's not X, it's Y'); rhetorical-question transitions ('The kicker?'); synonym triples; self-narration ('In this section', 'In conclusion'); paragraph-opening 'Moreover'/'Furthermore'/'Additionally'; no em dashes ('—' or '-' used in an em dash situation); no headings, bold, or bullets in pieces under 600 words, unless intended for a presentation.\n"
-        "- First sentence carries a specific fact, claim, or question - no background, no throat-clearing.\n"
-        "- Rhythm: long sentences dense with information; a short sentence is a payoff after a long build, a few per piece at most.\n"
-        "- Quote primary sources when the source is better writing than a paraphrase (deadpan, damning, or exact material); keep quotes short and attributed.\n"
-        "- Forms of writing: documentation serves a reader mid-task - exact commands, paths, expected output, zero preamble. A proposal makes a case for funding - think Heilmeier Catechism. A tweet is one thought, no hashtags, no emoji. A blog post may use first person, must hold a view, may digress once if the digression pays. Presentations must include notes for recommended visualizations that make claims obvious without narration.\n"
-        "- Pass 1 (hunt): fix every banned pattern, evaluative adjective, and vague quantifier above. Pass 2 (cut): delete any paragraph whose loss costs the reader nothing; target 15% shrinkage draft-to-final.\n"
-        "\nVerification Report:\n"
+        "\nWriting Guide:\n"
+        "Our writing (proposals, research or task reports, presentations, text messages) is only effective when the transmission of technical ideas is frictionless.\n"
+        "Write as tech fellow would communicate to a teammate, with respect for the reader and the content, leaving the reader more capable than before.\n"
+        "- **Consider the audience:** Use any interactions with the reader/user to gauge where they are and hang new knowledge on their existing hooks. Reader-centric writing feels natural but writing that draws attention to the writer or the linguistic style of the text adds friction. A negative example LLMs often use for impact is very short sentences that 'hit hard' but disrupt the flow of information in favor of linguistic fireworks.\n"
+        "- **Prioritize:** Lay out options or variations, then make recommendations, allowing the reader to focus on high value starting points but with the option to explore further.\n"
+        "- **Progressive detail:** Reduce initial friction by starting with perspective, then progress to technical details with later sections avoiding friction-adding repetition or context that could be found in earlier sections. Assume your reader can handle all details necessary to progress in technical understanding, when introduced in the right sequence.\n"
+        "- **Word choice:** If you have the perfect word for a situation, use it even if the reader may need a dictionary. Find opportunities to randomize synonym selection when there is more than one option to avoid the friction over-used, llm-favorite words cause in most readers. Use common language instead of using normally concrete words for abstract flourishes (e.g. prefer 'key idea' instead of 'load bearing idea').\n"
+        "- **Visualizations:** Always suggest visualizations that will crystallize technical ideas faster, and when you can make the visualizations yourself (e.g. single-page html reports), do it.\n"
+        "- **No em dashes:** Recent LLM writing has overused this previously useful punctuation, so now we must ban em dashes ('—'), so find other ways to structure the text.\n"
+        "- **Edit before finishing:** When you finish writing, pause for a beat, then do a second pass to classify parts that sound like what a tech fellow would say and which parts are hard to imagine a human saying out loud, or are not aligned with this writing guide. Look for opportunities to add information while dropping filler so the reader can make the quickest progress.\n"
+        "\nTask Report:\n"
         "Before writing your report, verify your work by actually running it: execute your code, re-read final files, "
         "re-check computed values. Include any relevant real observed output in your report. "
         "For **writing** of all kinds, verification means the two passes in the Writing Rules. "
