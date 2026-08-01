@@ -36,46 +36,11 @@ from flowmark import reformat_file
 #                      reasoning.effort 400s on some Go models e.g. kimi-k2.7-code)
 
 
-## NEW
-# qwen/qwen3.7-flash
-# could also check m3 and step3.7-flash
-
-# TIERS
-# --------
-# kimi3 - slow
-# gem36f
-# --------
-# grok45 - faster
-# --------
-# dsv4p
-# glm52 - slow
-# ------
-# dsv4f - faster
-
-
 MODEL_REGISTRY = {
     "kimi3": {"provider": "openrouter", "model": "moonshotai/kimi-k3:nitro", "max_tokens": 20000, "max_output_tokens": 100000, "reasoning_mode": "effort"},
     "gem36f": {"provider": "openrouter", "model": "google/gemini-3.6-flash:nitro", "max_tokens": 20000, "max_output_tokens": 100000, "reasoning_mode": "effort"},
     "grok45": {"provider": "openrouter", "model": "x-ai/grok-4.5:nitro", "max_tokens": 20000, "max_output_tokens": 100000, "reasoning_mode": "effort"},
-    "glm52": {"provider": "openrouter", "model": "z-ai/glm-5.2:nitro", "max_tokens": 20000, "max_output_tokens": 100000, "reasoning_mode": "effort"},
-    "dsv4p": {
-        "provider": "openrouter",
-        "model": "deepseek/deepseek-v4-pro:nitro",
-        "max_tokens": 20000,
-        "max_output_tokens": 100000,
-        "reasoning_mode": "effort",
-        "sampling": {"provider": {"quantizations": ["fp8"]}},
-    },
     "dsv4f": {
-        "provider": "openrouter",
-        "model": "deepseek/deepseek-v4-flash:nitro",
-        "max_tokens": 20000,
-        "max_output_tokens": 100000,
-        "reasoning_mode": "effort",
-        "sampling": {"temperature": 0.7, "provider": {"quantizations": ["fp8"]}},
-    },
-    "dsv4fn1": {"provider": "openrouter", "model": "deepseek/deepseek-v4-flash-0731:nitro", "max_tokens": 20000, "max_output_tokens": 100000, "reasoning_mode": "effort"},
-    "dsv4fn2": {
         "provider": "openrouter",
         "model": "deepseek/deepseek-v4-flash-0731:nitro",
         "max_tokens": 20000,
@@ -88,23 +53,26 @@ MODEL_REGISTRY = {
     # answer chat/completions via gateway conversion, and accept temperature.
     "go_kimi3": {"provider": "opencode-go", "model": "kimi-k3", "max_tokens": 20000, "max_output_tokens": 100000, "reasoning_mode": "effort"},
     "go_grok45": {"provider": "opencode-go", "model": "grok-4.5", "max_tokens": 20000, "max_output_tokens": 100000, "reasoning_mode": "effort"},
-    "go_glm52": {"provider": "opencode-go", "model": "glm-5.2", "max_tokens": 20000, "max_output_tokens": 100000, "reasoning_mode": "effort"},
-    "go_dsv4p": {"provider": "opencode-go", "model": "deepseek-v4-pro", "max_tokens": 20000, "max_output_tokens": 100000, "reasoning_mode": "effort"},
-    "go_dsv4f": {"provider": "opencode-go", "model": "deepseek-v4-flash", "max_tokens": 20000, "max_output_tokens": 100000, "reasoning_mode": "effort"},
-    # temperature-0.7 variants (_t07): same model, sampling temperature pinned
-    # via the generic sampling dict (payload.update in chat() applies it to any
-    # provider, so GO/ZEN need no provider-specific handling)
-    "go_dsv4f_t07": {"provider": "opencode-go", "model": "deepseek-v4-flash", "max_tokens": 20000, "max_output_tokens": 100000, "reasoning_mode": "effort", "sampling": {"temperature": 0.7}},
-    "go_minimax3": {"provider": "opencode-go", "model": "minimax-m3", "max_tokens": 20000, "max_output_tokens": 100000, "reasoning_mode": "effort"},
-    "go_qwen37max": {"provider": "opencode-go", "model": "qwen3.7-max", "max_tokens": 20000, "max_output_tokens": 100000, "reasoning_mode": "effort"},
-    "go_qwen37plus": {"provider": "opencode-go", "model": "qwen3.7-plus", "max_tokens": 20000, "max_output_tokens": 100000, "reasoning_mode": "effort"},
-    # OpenCode Zen free tier (chat/completions)
-    "zen_dsv4f": {"provider": "opencode-zen", "model": "deepseek-v4-flash-free", "max_tokens": 20000, "max_output_tokens": 100000, "reasoning_mode": "effort"},
-    "zen_dsv4f_t07": {"provider": "opencode-zen", "model": "deepseek-v4-flash-free", "max_tokens": 20000, "max_output_tokens": 100000, "reasoning_mode": "effort", "sampling": {"temperature": 0.7}},
+    "go_dsv4f": {
+        "provider": "opencode-go",
+        "model": "deepseek-v4-flash",
+        "max_tokens": 20000,
+        "max_output_tokens": 100000,
+        "reasoning_mode": "effort",
+        "sampling": {"temperature": 0.7},
+    },
+    "zen_dsv4f": {
+        "provider": "opencode-zen",
+        "model": "deepseek-v4-flash-free",
+        "max_tokens": 20000,
+        "max_output_tokens": 100000,
+        "reasoning_mode": "effort",
+        "sampling": {"temperature": 0.7},
+    },
 }
 
 
-MODEL_ID = os.environ.get("PQ_MODEL", "zen_dsv4f")
+MODEL_ID = os.environ.get("PQ_MODEL", "go_dsv4f")
 if MODEL_ID not in MODEL_REGISTRY:
     sys.exit("Error: unknown model '" + MODEL_ID + "'. " "Known models: " + ", ".join(sorted(MODEL_REGISTRY.keys())))
 
