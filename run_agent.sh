@@ -57,7 +57,7 @@ fi
 
 echo "agent dir  : $AGENT_DIR"
 echo "project dir: $PROJECT_DIR"
-echo "model      : ${PQ_MODEL:-dsv4-flash (default)}"
+echo "model      : ${PQ_MODEL:-(default)}"
 echo "playwright : ${PQ_PLAYWRIGHT:-1 (default)}"
 echo ""
 
