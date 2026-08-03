@@ -20,6 +20,9 @@
 # .pq is shadowed with an empty tmpfs so the agent cannot see harness files
 # allows: full network (playwright needs it, local models need localhost)
 # playwright browser cache read-only
+# sound: binds the host /dev/snd (direct ALSA) and the user session's
+#        PipeWire/PulseAudio sockets (/run/user/UID) so the agent's players
+#        can actually be heard through the machine's speakers/headphones
 
 set -euo pipefail
 
@@ -36,6 +39,14 @@ else
 fi
 
 PW_CACHE="${HOME}/.cache/ms-playwright"
+
+# audio: the logged-in desktop session's runtime dir holds the PipeWire and
+# PulseAudio sockets (plus the dbus session bus). Binding it into the sandbox
+# lets mpv/pactl reach the same sound server the user hears through. Note this
+# also exposes the microphone to the sandbox - acceptable on a home music box.
+# When no desktop session is logged in the dir is absent and --bind-try skips
+# it; mpv then falls back to direct ALSA via the /dev/snd bind below.
+RUNTIME_DIR="/run/user/$(id -u)"
 
 if ! command -v bwrap &>/dev/null; then
     echo "error: bwrap not found. install with: sudo apt install bubblewrap" >&2
@@ -70,11 +81,16 @@ exec bwrap \
   --ro-bind /etc /etc \
   --proc /proc \
   --dev /dev \
+  `# sound: direct ALSA access to the host audio hardware (headphones/speakers)` \
+  --dev-bind-try /dev/snd /dev/snd \
   --tmpfs /dev/shm \
   --tmpfs /tmp \
   --tmpfs /home \
   --tmpfs /root \
   --tmpfs /run \
+  `# sound: host user-session sockets (PipeWire/PulseAudio/dbus); absent when
+   # no desktop session is logged in - mpv then falls back to ALSA` \
+  --bind-try "$RUNTIME_DIR" "$RUNTIME_DIR" \
   --ro-bind-try /run/systemd/resolve /run/systemd/resolve \
   `# agent code is read-only - the agent cannot modify itself` \
   --ro-bind "$AGENT_DIR" /agent \
@@ -85,6 +101,9 @@ exec bwrap \
   --ro-bind-try "$PW_CACHE" /pw-cache \
   `# HF caches commonly used by huggingface_hub / transformers` \
    --ro-bind-try "${HOME}/.cache/huggingface" /hf-cache \
+  `# music library: host ~/Music is bound read-only at /music - the agent plays
+   # from it but can never edit it, and the files stay out of the workdir` \
+  --ro-bind-try "${HOME}/Music" /music \
   --unshare-pid \
   --unshare-ipc \
   --unshare-uts \
@@ -94,6 +113,7 @@ exec bwrap \
   --setenv PATH /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
   --setenv HOME /tmp \
   --setenv TMPDIR /tmp \
+  --setenv XDG_RUNTIME_DIR "$RUNTIME_DIR" \
   --setenv PLAYWRIGHT_BROWSERS_PATH /pw-cache \
   --setenv AGENT_DIR /agent \
   --setenv HF_HOME /hf-cache \
@@ -101,6 +121,7 @@ exec bwrap \
   --setenv TRANSFORMERS_CACHE /hf-cache/hub \
   --setenv HF_HUB_OFFLINE 1 \
   --setenv HF_MODULES_CACHE /tmp/hf_modules \
+  --setenv MUSIC_ROOT /music \
   "${ENV_ARGS[@]}" \
   --chdir /workspace \
   -- \
