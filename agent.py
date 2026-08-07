@@ -40,6 +40,8 @@ MODEL_REGISTRY = {
     "kimi3": {"provider": "openrouter", "model": "moonshotai/kimi-k3:nitro", "max_tokens": 20000, "max_output_tokens": 100000, "reasoning_mode": "effort"},
     "gem36f": {"provider": "openrouter", "model": "google/gemini-3.6-flash:nitro", "max_tokens": 20000, "max_output_tokens": 100000, "reasoning_mode": "effort"},
     "grok45": {"provider": "openrouter", "model": "x-ai/grok-4.5:nitro", "max_tokens": 20000, "max_output_tokens": 100000, "reasoning_mode": "effort"},
+    "muse12": {"provider": "openrouter", "model": "meta/muse-spark-1.2", "max_tokens": 20000, "max_output_tokens": 100000, "reasoning_mode": "none"},
+    "qwen38": {"provider": "openrouter", "model": "qwen/qwen3.8-max:nitro", "max_tokens": 20000, "max_output_tokens": 100000, "reasoning_mode": "effort"},
     "dsv4f": {
         "provider": "openrouter",
         "model": "deepseek/deepseek-v4-flash-0731:nitro",
@@ -145,12 +147,12 @@ else:
 # harness runs file/shell-only with no web access.
 ENABLE_PLAYWRIGHT = os.environ.get("PQ_PLAYWRIGHT", "1") in ("1", "true", "yes")
 
-# When True (default), the compaction request sends the session history as a
-# plain-text transcript ([User]/[Assistant]/[Tool result] labels, tool results
-# capped) instead of the raw message list. Raw assistant/tool pairs read like a
-# live conversation, which tempts the summarizer to continue it instead of
-# summarizing it. Set False to restore the original raw-history behavior.
-USE_SERIALIZED_FOR_COMPACTION = False
+# Compaction input is always the raw history plus the template prompt. A
+# serialized plain-text transcript variant ([User]/[Assistant]/[Tool result]
+# labels, prime-agent style) was added in session 6 behind
+# USE_SERIALIZED_FOR_COMPACTION and removed in session 9: it benchmarked worse
+# than raw history on difficult tasks with several compactions using the
+# preferred models. Do not re-add it without re-benchmarking.
 
 # When True, dump the initial conversation payload to INITIAL_PROMPTS.md and exit
 # without sending anything to the LLM. Useful for debugging prompt construction.
@@ -787,77 +789,6 @@ def apply_reasoning(payload, effort):
         payload["reasoning"] = {"enabled": False}
 
 
-def _cap_text(text, cap):
-    # truncation used by serialize_messages: keep the start of each message and
-    # mark the cut, so a 32K file read or 9K command tail cannot bloat the
-    # compaction request. the summary is what matters, not verbatim tool output.
-    if len(text) <= cap:
-        return text
-    return text[:cap] + "\n[...truncated to fit the compaction request...]"
-
-
-def serialize_messages(history, tool_result_cap=2000):
-    # plain-text rendering of the conversation for the compaction summarizer,
-    # modeled on prime-agent's serializeConversation(). a raw transcript of
-    # assistant/tool message pairs reads like a live conversation, which tempts
-    # the summarizer to keep going instead of summarizing; labeled text with
-    # capped tool results makes "this is history" explicit.
-    # the system prompt is excluded: the fresh session gets it again, and the
-    # summarizer does not need it. reasoning is included (truncated) because
-    # thinking models keep decision rationale there, and the summary should
-    # preserve that.
-    parts = []
-    for m in history:
-        role = m.get("role")
-        if role == "system":
-            continue
-        if role == "user":
-            content = m.get("content")
-            if isinstance(content, str) and content.strip():
-                parts.append("[User]: " + content.strip())
-            continue
-        if role == "assistant":
-            text = m.get("content")
-            text = text if isinstance(text, str) else ""
-            reasoning = m.get("reasoning_content") or m.get("reasoning") or ""
-            if not isinstance(reasoning, str):
-                reasoning = ""
-            details = m.get("reasoning_details") or []
-            detail_parts = []
-            for d in details:
-                if isinstance(d, dict):
-                    t = d.get("text") or d.get("content")
-                    if t:
-                        detail_parts.append(t)
-            detail_text = "\n".join(detail_parts).strip()
-            if detail_text and len(detail_text) >= len(reasoning):
-                reasoning = detail_text
-            if reasoning.strip():
-                parts.append("[Assistant thinking]: " + _cap_text(reasoning.strip(), tool_result_cap))
-            if text.strip():
-                parts.append("[Assistant]: " + text.strip())
-            calls = []
-            for tc in m.get("tool_calls") or []:
-                fn = tc.get("function") or {}
-                name = fn.get("name") or "(unnamed)"
-                try:
-                    args = json.loads(fn.get("arguments") or "{}")
-                except (ValueError, TypeError):
-                    args = {}
-                params = ""
-                if isinstance(args, dict):
-                    params = ", ".join("{}={!r}".format(k, v)[:60] for k, v in list(args.items())[:3])
-                calls.append(name + "(" + params + ")")
-            if calls:
-                parts.append("[Assistant tool calls]: " + "; ".join(calls))
-            continue
-        if role == "tool":
-            content = m.get("content")
-            if isinstance(content, str) and content.strip():
-                parts.append("[Tool result]: " + _cap_text(content.strip(), tool_result_cap))
-    return "\n\n".join(parts)
-
-
 def _touched_block():
     # harness-built file lists for the post-compaction handoff: deterministic
     # and cumulative across compactions, so the fresh session re-orients even
@@ -943,18 +874,11 @@ def chat(messages, tools, new_messages, state, session_messages):
         # degraded fallback below both need it after new_messages is cleared
         full_history = messages + new_messages
         new_messages.clear()
-        if USE_SERIALIZED_FOR_COMPACTION:
-            # plain-text transcript instead of the raw message list: the
-            # summarizer reads history, not a live conversation to continue.
-            # serialization caps each message, so the pretrim below is not
-            # needed, and the raw history stays intact for the degraded
-            # fallback. the system prompt is intentionally not sent: the fresh
-            # session gets it again, and the summary template is self-contained.
-            transcript = serialize_messages(full_history)
-            compaction_input = [{"role": "user", "content": transcript + "\n\n" + compaction_prompt}]
-        else:
-            _pretrim_for_compaction(full_history)
-            compaction_input = full_history + [{"role": "user", "content": compaction_prompt}]
+        # raw history plus the template prompt is the only compaction input
+        # shape; a serialized plain-text transcript variant was removed in
+        # session 9 (see the module-level note above).
+        _pretrim_for_compaction(full_history)
+        compaction_input = full_history + [{"role": "user", "content": compaction_prompt}]
         compaction_payload = {
             "model": _MODEL_STRING,
             "max_tokens": COMPACTION_MAX_TOKENS,
@@ -2024,7 +1948,11 @@ def make_tools():
         }
     )
 
-    # NO STRICT FOR TOOLS THAT HAVE OPTIONAL PARAMETERS
+    # NO STRICT FOR TOOLS THAT HAVE OPTIONAL PARAMETERS: strict-mode providers
+    # (e.g. Meta's API serving muse-spark-1.2 on OpenRouter) reject schemas
+    # whose required list omits any property, and strict mode has no optional
+    # params. run_command below is the other optional-param tool; keep it that
+    # way.
     tools.append(
         {
             "type": "function",
@@ -2069,7 +1997,6 @@ def make_tools():
             "type": "function",
             "function": {
                 "name": "run_command",
-                "strict": True,
                 "description": "Run a shell command in the workspace. By default it waits up to 10s in the foreground; a command still running after that stays managed in the background and its final output is delivered automatically as a later notification (no polling needed). For a slow build or test, pass a larger yield_time_ms (up to 300000) to wait for it to finish in this one call. timeout_ms is an optional hard kill deadline; usually omit it. Always pass a short description (3-8 words, base-form verb) so logs are readable. For multi-line scripts, write them to a file with write_file and run the file - do not pipe scripts through heredocs.",
                 "parameters": {
                     "type": "object",
