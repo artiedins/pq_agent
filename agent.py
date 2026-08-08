@@ -40,8 +40,7 @@ MODEL_REGISTRY = {
     "kimi3": {"provider": "openrouter", "model": "moonshotai/kimi-k3:nitro", "max_tokens": 20000, "max_output_tokens": 100000, "reasoning_mode": "effort"},
     "gem36f": {"provider": "openrouter", "model": "google/gemini-3.6-flash:nitro", "max_tokens": 20000, "max_output_tokens": 100000, "reasoning_mode": "effort"},
     "grok45": {"provider": "openrouter", "model": "x-ai/grok-4.5:nitro", "max_tokens": 20000, "max_output_tokens": 100000, "reasoning_mode": "effort"},
-    "muse12": {"provider": "openrouter", "model": "meta/muse-spark-1.2", "max_tokens": 20000, "max_output_tokens": 100000, "reasoning_mode": "none"},
-    "qwen38": {"provider": "openrouter", "model": "qwen/qwen3.8-max:nitro", "max_tokens": 20000, "max_output_tokens": 100000, "reasoning_mode": "effort"},
+    "muse12": {"provider": "openrouter", "model": "meta/muse-spark-1.2", "max_tokens": 20000, "max_output_tokens": 100000, "reasoning_mode": "effort"},
     "dsv4f": {
         "provider": "openrouter",
         "model": "deepseek/deepseek-v4-flash-0731:nitro",
@@ -55,6 +54,8 @@ MODEL_REGISTRY = {
     # answer chat/completions via gateway conversion, and accept temperature.
     "go_kimi3": {"provider": "opencode-go", "model": "kimi-k3", "max_tokens": 20000, "max_output_tokens": 100000, "reasoning_mode": "effort"},
     "go_grok45": {"provider": "opencode-go", "model": "grok-4.5", "max_tokens": 20000, "max_output_tokens": 100000, "reasoning_mode": "effort"},
+    "go_glm52": {"provider": "opencode-go", "model": "glm-5.2", "max_tokens": 20000, "max_output_tokens": 100000, "reasoning_mode": "effort"},
+    # deepseek-v4-pro, glm-5.2, mimo-v2.5, mimo-v2.5-pro, minimax-m3
     "go_dsv4f": {
         "provider": "opencode-go",
         "model": "deepseek-v4-flash",
@@ -226,6 +227,12 @@ MAX_OUTPUT_BOOST = 32000
 # notice stops falsely claiming the budget was increased and tells the model
 # to split the output instead of re-sending it whole.
 MAX_LENGTH_RESCUES = 6
+
+# finish_reason=error (provider-side generation failure, often a gateway flake
+# on long generations) is retried with the identical turn up to this many
+# times before the harness hands control back to the model with an explicit
+# notice. each retry costs a full generation, so keep the bound small.
+MAX_ERROR_RESCUES = 2
 
 # Timeout for API requests to the model server. Thinking models can take well
 # over 60s to first token on long prompts. Set generously to avoid killing
@@ -1009,12 +1016,30 @@ def chat(messages, tools, new_messages, state, session_messages):
     # crosses the cap - which it may never do, since it only measures deltas.
     # fall back to the local estimate of the full message list instead; the
     # next response with real usage overwrites it.
+    # additionally, distrust reported usage when the turn failed: error-finish
+    # responses have carried a stub/partial prompt count (observed: 26.4k
+    # reported for a ~106k-token prompt), which would collapse the context
+    # estimate and disarm the compaction/finish pressure signals. sanity-band
+    # the reported count against the local estimate too: the estimator is
+    # cl100k_base and can be off by 20-40%, but a reported count outside
+    # 0.5x-2x of it is almost certainly wrong (stub usage, or a provider
+    # counting something other than prompt tokens).
+    est = est_messages_tokens(messages)
+    finish = data["choices"][0].get("finish_reason")
     usage = data.get("usage") or {}
     reported = usage.get("prompt_tokens")
-    if isinstance(reported, int) and reported > 0:
-        state["last_post_tokens"] = reported
+    if finish == "error":
+        if isinstance(reported, int) and reported > 0:
+            print(ts() + "  [warn] finish_reason=error, ignoring reported prompt_tokens (" + str(reported) + "), using estimate " + str(est))
+        state["last_post_tokens"] = est
+    elif isinstance(reported, int) and reported > 0:
+        if est >= 100 and not (0.5 * est <= reported <= 2.0 * est):
+            print(ts() + "  [warn] reported prompt_tokens " + str(reported) + " far from local estimate " + str(est) + ", using estimate")
+            state["last_post_tokens"] = est
+        else:
+            state["last_post_tokens"] = reported
     else:
-        state["last_post_tokens"] = est_messages_tokens(messages)
+        state["last_post_tokens"] = est
 
     return data
 
@@ -2162,23 +2187,29 @@ def make_system_prompt():
         "\nWriting Guide:\n"
         "Our writing (proposals, research or task reports, presentations, text messages) is only effective when the transmission of technical ideas is frictionless.\n"
         "Write to a capable colleague, with respect for the reader and the content, leaving the reader more capable than before.\n"
+        "The examples at the end of this guide carry more weight than the rules: imitate the GOOD versions.\n"
         "- **Consider the audience:** Use any interactions with the reader/user to gauge where they are and hang new knowledge on their existing hooks. Reader-centric writing feels natural but writing that draws attention to the writer or the linguistic style of the text adds friction. A negative example LLMs often use for impact is very short sentences that 'hit hard' but disrupt the flow of information in favor of linguistic fireworks.\n"
         "- **Prioritize:** Lay out options or variations, then make recommendations, allowing the reader to focus on high value starting points but with the option to explore further.\n"
         "- **Progressive detail:** Reduce initial friction by starting with perspective, then progress to technical details without re-introducing context earlier sections already covered. Assume your reader can handle all details necessary to progress in technical understanding when they are introduced in the right sequence.\n"
         "- **Word choice:** Use the perfect word even if the reader may need a dictionary, but reach for the plain word when one exists: 'key idea', not 'load bearing idea'; 'test' or 'check', not 'smoke test'. Vary your synonyms so the prose does not sound machine-generated.\n"
         "- **Skimmable structure:** Readers scan long writing. Lead each section with its point, keep paragraphs short, and use bullets for lists, so the gist survives a quick scan instead of being buried in a dense wall of text.\n"
         "- **Visualizations:** Always suggest visualizations that will crystallize technical ideas faster, and when you can make the visualizations yourself (e.g. single-page html reports), do it.\n"
-        "- **No em dashes:** Recent LLM writing has overused this previously useful punctuation, so now we must ban em dashes ('—'), so find other ways to structure the text.\n"
+        "- **No em dashes:** Recent LLM writing has overused this previously useful punctuation, so we ban the em dash entirely. A comma, a colon, or two separate sentences almost always reads better.\n"
         "- **Edit before finishing:** When you finish writing, pause for a beat, then re-read with fresh eyes: cut anything you cannot imagine a colleague saying out loud, and look for places to add information while dropping filler, so the reader makes the quickest progress.\n"
+        "\nShow, not just tell. These pairs are real failure modes from past sessions; write like the GOOD version:\n"
+        "- **Coined shorthand.** BAD: 'The thesis-neutral-positive, floor-raising dynamic makes the wash-out scenario survivable.' GOOD: 'The position survives either outcome: if the frontier model wins, compute demand rises; if the cheap model wins, token volume rises.' If you invented the label this session, the reader does not have it, so use the plain phrase.\n"
+        "- **Parenthetical piles.** BAD: 'The verification layer (DDOG, NOW/GTLB, plus private harness plays) is the purest expression.' GOOD: 'Datadog, ServiceNow, and GitLab sell review capacity, the scarce resource, so demand for them scales with agent volume rather than token price.' Three or more figures comparing the same thing belong in a small table, not a parenthetical.\n"
+        "- **Telegraphic fragments.** BAD: 'S1b wash-out: capex gap closes with a thud, 2028-2031.' GOOD: 'If adoption disappoints, the capex gap closes through write-downs and canceled power contracts rather than growth, most likely between 2028 and 2031.' Short labels are fine in your own working notes; in delivered prose, say what the thing is.\n"
+        "- **Fireworks over information.** BAD: 'The numbers are brutal. The gap is real. The bet stands.' GOOD: 'The frontier version of the 2030 forecast needs about 115 gigawatts; the cheap-model version needs 3.4.' One specific number carries more force than three punchy fragments.\n"
         "\nTask Report:\n"
         "The report is how the operator syncs with your work; they did not watch the session, so write it for someone who can read only this file and know what happened, what you decided, and why. Keep it skimmable: short paragraphs, bullets for lists, and a bold lead-in for each section, so the outcome and the key decisions survive a quick scan.\n"
         "\nBefore writing it, verify your work by actually running it: execute your code, re-read final files, re-check computed values, and quote real observed output. Label inferences as inferences. For **writing** of all kinds, verification means the two passes in the Writing Rules. A report that claims success without demonstrated verification is incomplete.\n"
         "\nWhen the task is complete, create task_report/report.md containing:\n"
-        "1. **Outcome first.** One short paragraph stating what was delivered and whether it succeeded, then a step-by-step summary of what you did.\n"
+        "1. **Outcome first.** One short paragraph stating what was delivered and whether it succeeded, then a step-by-step summary of what you did. Name the artifact and the verdict, e.g. 'Rewrote the pricing script and re-ran the three scenarios; all outputs match the independent hand check.'\n"
         "2. **Key decisions.** Why you made them, especially where the operator might have chosen differently.\n"
         "3. **Uncertainties.** Anything you are not sure about.\n"
         "4. **Environment and tooling.** Anything about the environment or tool calling you unnecessarily struggled with; this is how the harness gets fixed.\n"
-        "5. **Success assessment.** Whether the task succeeded, with the verification evidence you observed.\n"
+        "5. **Success assessment.** Whether the task succeeded, with the verification evidence you observed. Quote real output, e.g. 'the script prints \"generous world: 337 MW\", matching the hand-derived 340 MW within rounding', not 'the numbers looked right'.\n"
         "6. **Images.** You may create or copy images (.jpg or .png, no larger than 1200 pixels please) to task_report/ if the task requires those for evaluation.\n"
         "7. Markdown or images in task_report/ are only for evaluation and will be deleted after your work is evaluated.\n"
         "\nAfter writing task_report/report.md, reply with one short sentence confirming completion.\n"
@@ -2219,6 +2250,19 @@ def write_stats(state, start_time):
     if total_edits > 0:
         print(ts() + "Edit methods used: write_file=" + str(ec["write_file"]) + " str_replace=" + str(ec["str_replace"]) + " (total=" + str(total_edits) + ")")
     print(ts() + "Stats written to task_report/stats.yaml")
+
+
+def _normalize_assistant_message(msg):
+    # strict upstreams reject an assistant message that has no content key (or
+    # content: null) when it also has no tool_calls - observed as a permanent
+    # 400 ("The content field is a required field.") after a failed generation,
+    # which killed a rescuable run because post_with_retry does not retry 4xx.
+    # normalize in place so every round-tripped assistant message carries a
+    # valid content string; tool-call turns keep their null content, which the
+    # API requires.
+    if not msg.get("tool_calls") and not isinstance(msg.get("content"), str):
+        msg["content"] = ""
+    return msg
 
 
 def write_stub_report(report_path, final_content, rescues):
@@ -2315,6 +2359,7 @@ def main():
     warned_precompact = False
     report_rescues = 0
     length_rescues = 0
+    error_rescues = 0
 
     try:
         while True:
@@ -2342,12 +2387,41 @@ def main():
             #   when generating its own reasoning).
             # - DSV4 vLLM: reasoning_content round-trips correctly through the OpenAI-
             #   compatible API (same field name as DeepSeek R1).
-            new_messages.append(msg)
+            tool_calls = msg.get("tool_calls") or []
+
+            # provider-side generation failure (finish_reason=error) with no
+            # tool calls: the turn produced nothing usable, and the message may
+            # lack a content key entirely - round-tripping it verbatim has 400'd
+            # strict upstreams ("The content field is a required field."), which
+            # post_with_retry treats as permanent and would kill a rescuable run.
+            # bounded retry of the identical turn (these failures are usually
+            # gateway flakes on long generations), then hand control back to the
+            # model with an explicit notice. never treat a failed generation as
+            # a model stop: that could end the run on partial output or fire a
+            # misleading report rescue.
+            if finish == "error" and not tool_calls:
+                if error_rescues < MAX_ERROR_RESCUES:
+                    error_rescues += 1
+                    print(ts() + "  [warn] provider reported finish_reason=error (rescue " + str(error_rescues) + "/" + str(MAX_ERROR_RESCUES) + "), retrying the turn")
+                    continue
+                print(ts() + "  [warn] provider reported finish_reason=error repeatedly, handing control to the model")
+                new_messages.append(
+                    {
+                        "role": "user",
+                        "content": "[harness notice] Your previous turn failed with a provider-side generation error (finish_reason=error) and produced no output; no tool calls were executed. Re-issue the tool call or reply you intended.",
+                    }
+                )
+                continue
+
+            # round-trip guard: some providers return an assistant message with
+            # no content key at all (or content: null) on failed generations.
+            # normalize before appending so a later request can never carry a
+            # content-less assistant message.
+            new_messages.append(_normalize_assistant_message(msg))
 
             # branch on the presence of tool_calls rather than finish_reason: some
             # providers report tool calls under finish_reason "stop", and a "length"
             # finish can still carry complete earlier tool calls
-            tool_calls = msg.get("tool_calls") or []
 
             # rescue tool calls that the model emitted as raw hermes XML in content
             # (known vLLM issue: reasoning parser can swallow tool calls inside
