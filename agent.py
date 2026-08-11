@@ -40,7 +40,8 @@ MODEL_REGISTRY = {
     "kimi3": {"provider": "openrouter", "model": "moonshotai/kimi-k3:nitro", "max_tokens": 20000, "max_output_tokens": 100000, "reasoning_mode": "effort"},
     "gem36f": {"provider": "openrouter", "model": "google/gemini-3.6-flash:nitro", "max_tokens": 20000, "max_output_tokens": 100000, "reasoning_mode": "effort"},
     "grok45": {"provider": "openrouter", "model": "x-ai/grok-4.5:nitro", "max_tokens": 20000, "max_output_tokens": 100000, "reasoning_mode": "effort"},
-    "muse12": {"provider": "openrouter", "model": "meta/muse-spark-1.2", "max_tokens": 20000, "max_output_tokens": 100000, "reasoning_mode": "effort"},
+    "muse12": {"provider": "openrouter", "model": "meta/muse-spark-1.2:nitro", "max_tokens": 20000, "max_output_tokens": 100000, "reasoning_mode": "effort"},
+    "solar4": {"provider": "openrouter", "model": "upstage/solar-pro4:nitro", "max_tokens": 20000, "max_output_tokens": 100000, "reasoning_mode": "effort"},
     "dsv4f": {
         "provider": "openrouter",
         "model": "deepseek/deepseek-v4-flash-0731:nitro",
@@ -251,7 +252,7 @@ MAX_YIELD_MS = 300000
 DEFAULT_TIMEOUT_MS = 600000
 
 # when the model ends a turn text-only while a yielded run_command is still
-# running and no report exists, the harness waits in-process for the next
+# running and no task report exists, the harness waits in-process for the next
 # completion (up to this cap) instead of burning LLM round trips on
 # "still running" notices; the auto-delivery then hands the output over.
 GUARD_WAIT_SECONDS = 30
@@ -2159,7 +2160,7 @@ def make_system_prompt():
         "4. The ONLY exception to rule 2: when asked to summarize the session for context compaction, respond with a precisely crafted regular reply. Tool calls will not work past context compaction limits.\n"
         "5. Every file tool (write_file, read_file, str_replace) needs the 'filename' argument naming the file to act on. Include it in the same tool call as the other arguments - for write_file, send 'filename' alongside 'content', not content alone.\n"
         "6. The files p.md and project.md (optional) are loaded into the first user message - you do not need to read them again, and you must never write or edit them.\n"
-        "7. Your task_report/report.md from previous sessions are moved to the previous_sessions directory with chronologically incrementing filenames. Do not write in this directory, but you may read your old reports for more context.\n"
+        "7. Your task_report/report.md from previous sessions are moved to the previous_sessions directory with chronologically incrementing filenames. Do not write in this directory, but you may read your old task reports for more context.\n"
         "8. Never `pkill -f`/`killall -f` with a pattern that also appears in your command text; use exact PIDs, `pgrep -x`, etc.\n"
         "9. Do not stop early out of caution. If you reasonably believe a few more steps will materially advance the task goal, take them. The harness will tell you when to wrap up, and that notice overrides this rule.\n"
         "\nTool rules:\n"
@@ -2202,10 +2203,10 @@ def make_system_prompt():
         "- **Telegraphic fragments.** BAD: 'S1b wash-out: capex gap closes with a thud, 2028-2031.' GOOD: 'If adoption disappoints, the capex gap closes through write-downs and canceled power contracts rather than growth, most likely between 2028 and 2031.' Short labels are fine in your own working notes; in delivered prose, say what the thing is.\n"
         "- **Fireworks over information.** BAD: 'The numbers are brutal. The gap is real. The bet stands.' GOOD: 'The frontier version of the 2030 forecast needs about 115 gigawatts; the cheap-model version needs 3.4.' One specific number carries more force than three punchy fragments.\n"
         "\nTask Report:\n"
-        "The report is how the operator syncs with your work; they did not watch the session, so write it for someone who can read only this file and know what happened, what you decided, and why. Keep it skimmable: short paragraphs, bullets for lists, and a bold lead-in for each section, so the outcome and the key decisions survive a quick scan.\n"
-        "\nBefore writing it, verify your work by actually running it: execute your code, re-read final files, re-check computed values, and quote real observed output. Label inferences as inferences. For **writing** of all kinds, verification means the two passes in the Writing Rules. A report that claims success without demonstrated verification is incomplete.\n"
+        "The task report is how the operator syncs with your work; they did not watch the session, so write it for someone who can read only this file and know what happened, what you decided, and why. Keep it skimmable: short paragraphs, bullets for lists, and a bold lead-in for each section, so the outcome and the key decisions survive a quick scan.\n"
+        "\nBefore writing it, verify your work by actually running it: execute your code, re-read final files, re-check computed values, and quote real observed output. Label inferences as inferences. For **writing** of all kinds, verification means the two passes in the Writing Rules. A task report that claims success without demonstrated verification is incomplete.\n"
         "\nWhen the task is complete, create task_report/report.md containing:\n"
-        "1. **Outcome first.** One short paragraph stating what was delivered and whether it succeeded, then a step-by-step summary of what you did. Name the artifact and the verdict, e.g. 'Rewrote the pricing script and re-ran the three scenarios; all outputs match the independent hand check.'\n"
+        "1. **Outcome first.** One short paragraph stating what was delivered and whether it succeeded and use this as the place to answer user questions unless directed to write other reports. In explaining what you did, name the artifact and the verdict, e.g. 'Rewrote the pricing script and re-ran the three scenarios; all outputs match the independent hand check.'\n"
         "2. **Key decisions.** Why you made them, especially where the operator might have chosen differently.\n"
         "3. **Uncertainties.** Anything you are not sure about.\n"
         "4. **Environment and tooling.** Anything about the environment or tool calling you unnecessarily struggled with; this is how the harness gets fixed.\n"
