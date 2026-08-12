@@ -613,7 +613,94 @@ def backoff_delay(attempt):
     return random.uniform(2 ** (attempt - 1), 2**attempt)
 
 
+def _repair_tool_call(tc, tc_id):
+    # a tool call that failed dispatch (malformed arguments, missing fields) is
+    # still inside the assistant message already appended to the outgoing
+    # history, and the raw broken arguments string would be round-tripped to the
+    # provider on the next POST. some providers validate historical tool calls
+    # and reject the whole request with a permanent 400 ("Invalid function
+    # arguments") - which used to kill the run because post_with_retry does not
+    # retry 4xx. repair the stored copy in place: the corrective tool result
+    # already told the model to re-issue, so replacing the arguments with an
+    # empty object loses nothing the model needs.
+    if not isinstance(tc, dict):
+        return
+    fn = tc.get("function")
+    if isinstance(fn, dict):
+        fn["arguments"] = "{}"
+    tc["id"] = tc_id
+    tc["type"] = "function"
+
+
+def _sanitize_tool_calls(messages):
+    # defense in depth for round-trip poison that dispatch-time repair misses:
+    # a 400 can be triggered by any historical assistant tool call the provider
+    # rejects - arguments that are not a JSON object, a missing id/type, or a
+    # call with no name. fix what can be fixed in place; drop what cannot (a
+    # nameless call and the tool results paired with it) so assistant/tool
+    # pairing stays consistent. returns the number of entries repaired/dropped,
+    # 0 when the history was already clean.
+    fixed = 0
+    i = 0
+    while i < len(messages):
+        m = messages[i]
+        if m.get("role") == "assistant":
+            tcs = m.get("tool_calls")
+            if isinstance(tcs, list):
+                dropped_ids = set()
+                keep = []
+                for idx, tc in enumerate(tcs):
+                    if not isinstance(tc, dict) or not isinstance(tc.get("function"), dict):
+                        dropped_ids.add(tc.get("id") if isinstance(tc, dict) else None)
+                        fixed += 1
+                        continue
+                    fn = tc["function"]
+                    name = fn.get("name")
+                    raw = fn.get("arguments")
+                    parsed = None
+                    if isinstance(name, str) and name and isinstance(raw, str):
+                        try:
+                            parsed = json.loads(raw)
+                        except (ValueError, TypeError):
+                            parsed = None
+                    if isinstance(parsed, dict):
+                        if not tc.get("id"):
+                            tc["id"] = "fixed-" + str(i) + "-" + str(idx)
+                            fixed += 1
+                        tc.setdefault("type", "function")
+                        keep.append(tc)
+                        continue
+                    fixed += 1
+                    if isinstance(name, str) and name:
+                        fn["arguments"] = "{}"
+                        if not tc.get("id"):
+                            tc["id"] = "fixed-" + str(i) + "-" + str(idx)
+                        tc.setdefault("type", "function")
+                        keep.append(tc)
+                    else:
+                        dropped_ids.add(tc.get("id"))
+                if len(keep) != len(tcs):
+                    if keep:
+                        m["tool_calls"] = keep
+                    else:
+                        m.pop("tool_calls", None)
+                        m["content"] = m.get("content") or ""
+                # tool results for dropped calls immediately follow their
+                # assistant message (the harness appends them in sequence)
+                if dropped_ids:
+                    j = i + 1
+                    while j < len(messages) and messages[j].get("role") == "tool":
+                        if messages[j].get("tool_call_id") in dropped_ids:
+                            del messages[j]
+                            fixed += 1
+                        else:
+                            j += 1
+        i += 1
+    return fixed
+
+
 def post_with_retry(payload):
+    payload_repaired = False
     for attempt in range(9):
         if attempt > 0:
             time.sleep(backoff_delay(attempt))
@@ -648,6 +735,22 @@ def post_with_retry(payload):
             body_preview = resp.text[:300].replace("\n", " ").strip()
             if body_preview:
                 print("  body: " + body_preview)
+            # a 400 complaining about a tool call is poisoned history, not a bad
+            # request: a malformed assistant tool call from an earlier turn was
+            # round-tripped into this payload. dispatch-time repair normally
+            # prevents it, but when one slips through, fix the payload's
+            # messages in place and retry. payload["messages"] IS the caller's
+            # message list, so the repair also propagates to the rest of the
+            # session. if nothing was actually wrong, fall through and raise
+            # like any other 4xx.
+            if resp.status_code == 400 and attempt < 8 and not payload_repaired:
+                body_lower = resp.text.lower()
+                if "function arguments" in body_lower or "tool call" in body_lower or "tool_calls" in body_lower:
+                    msg_list = payload.get("messages")
+                    if isinstance(msg_list, list) and _sanitize_tool_calls(msg_list) > 0:
+                        payload_repaired = True
+                        print(ts() + "  [error] 400 invalid tool call in history, repaired and retrying...")
+                        continue
         resp.raise_for_status()
         # Validate the body parses as JSON before declaring success. OpenRouter
         # occasionally returns 200 OK with truncated or SSE-style bodies (we've
@@ -848,34 +951,22 @@ def chat(messages, tools, new_messages, state, session_messages):
     if pre_prompt_total_context > MAX_CONTEXT_LENGTH:
         print(ts() + "PERFORM COMPACTION", flush=True)
         state["compaction_count"] += 1
-        file_listing = get_state_of_system()
+        # let's try the compaction prompt without state of system
+        # file_listing = get_state_of_system()
 
         compaction_prompt = (
-            "# Context Compaction Summary\n"
-            "\nWe hit the token limit for this session, so your next message must condense it. You cannot make any more tool calls at this time; reply with text only.\n"
-            "For this handoff, consider what a fresh instance of you will see: the original system prompt, the original user prompt, and then the compaction message you are writing right now.\n"
-            "The other messages in this session will be discarded. Your summary must let you build on this session's work without direct access to it.\n"
-            "In general, use precise, information-dense statements without filler prose. Use exact details and values that are not already captured on disk; you may omit details already written to disk.\n"
-            "Do not re-summarize the system prompt or the original task instructions; the fresh instance of the next session gets both of those again.\n"
-            "\nTo help you with your compaction summary, you may fill out the following template:\n"
-            "\n---\n"
-            "\n## Potential Template\n"
-            "\n### 1. Actions taken and outcomes\n"
-            "[What you did, including successes and failures. The point is to avoid wasteful rework in the next session.]\n"
-            "\n### 2. Important files and their status\n"
-            "[Files you have been working on recently, especially anything that is work in progress.]\n"
-            "\n### 3. Key facts and details\n"
-            "[Facts relevant to the task. Use exact strings or numbers wherever a paraphrase would prevent you from working successfully in the fresh session.]\n"
-            "\n### 4. Key decisions made and why\n"
-            "[Decisions made by the user or by you, with the reasons behind them.]\n"
-            "\n### 5. Unresolved questions or risks\n"
-            "[Things that have yet to be discovered, understood, or fixed.]\n"
-            "\n### 6. Immediate next step\n"
-            "[One step with enough information to execute on it without extensive reorientation, like searching the file system.]\n"
-            "\n### 7. Carry-over from previous compaction summaries\n"
-            "[Any details from earlier compaction summaries that remain relevant for future work.]\n" + file_listing + "\n"
-            "\n## Write Session Summary\n"
-            "\nPlease respond with your carefully worded compaction summary of this session.\n"
+            "### Write Context Summary\n"
+            "\nWe've reached the context limit and must take a beat to summarize our work before continuing. This\n"
+            "harness will not permit any further tool calls, so respond with well-written text only. In our new\n"
+            "session, you will get the system prompt, the initial task prompt, and the context summary you are to\n"
+            "write now. Make sure to capture any details from the messages in this session (including the past\n"
+            "context summary if available) that would enable you to continue making progress on this task.\n"
+            "\nHere is a helpful template:\n"
+            "- **Outcome:** Without repeating anything in the system or task prompts, what did you do and how did you do it? What were the results?\n"
+            "- **Decisions:** What were they, what is your plan to make more progress, and why?\n"
+            "- **Uncertainties:** What have you not figured out yet, and what would it take for resolution?\n"
+            "- **Environment:** Has there been any points of friction in working in this environment with this agent harness? How did you fix it or get around it?\n"
+            "- **Continuity:** What were you last doing (with which files?) and what would be the most immediate next step?\n"
         )
 
         # capture the full raw history once: the compaction payload and the
@@ -2185,35 +2276,26 @@ def make_system_prompt():
         "- Capture settings, like hyperparameters in ML experiments, we're going to optimize or tune in a single dataclass.\n"
         "- Comments: Use to make reading code frictionless for experienced programmers, capture real-world effects that cannot be determined from pure logic, and document decisions we made so new agents/programmers do not revisit the question.\n"
         "- Verification: if requested, run the real tests and quote real observed output; keep the check independent of the code under test (repo tests, golden files, a second method), and never narrow, skip, or delete tests to make a failing run pass.\n"
-        "\nWriting Guide:\n"
-        "Our writing (proposals, research or task reports, presentations, text messages) is only effective when the transmission of technical ideas is frictionless.\n"
-        "Write to a capable colleague, with respect for the reader and the content, leaving the reader more capable than before.\n"
-        "The examples at the end of this guide carry more weight than the rules: imitate the GOOD versions.\n"
-        "- **Consider the audience:** Use any interactions with the reader/user to gauge where they are and hang new knowledge on their existing hooks. Reader-centric writing feels natural but writing that draws attention to the writer or the linguistic style of the text adds friction. A negative example LLMs often use for impact is very short sentences that 'hit hard' but disrupt the flow of information in favor of linguistic fireworks.\n"
-        "- **Prioritize:** Lay out options or variations, then make recommendations, allowing the reader to focus on high value starting points but with the option to explore further.\n"
-        "- **Progressive detail:** Reduce initial friction by starting with perspective, then progress to technical details without re-introducing context earlier sections already covered. Assume your reader can handle all details necessary to progress in technical understanding when they are introduced in the right sequence.\n"
-        "- **Word choice:** Use the perfect word even if the reader may need a dictionary, but reach for the plain word when one exists: 'key idea', not 'load bearing idea'; 'test' or 'check', not 'smoke test'. Vary your synonyms so the prose does not sound machine-generated.\n"
-        "- **Skimmable structure:** Readers scan long writing. Lead each section with its point, keep paragraphs short, and use bullets for lists, so the gist survives a quick scan instead of being buried in a dense wall of text.\n"
-        "- **Visualizations:** Always suggest visualizations that will crystallize technical ideas faster, and when you can make the visualizations yourself (e.g. single-page html reports), do it.\n"
-        "- **No em dashes:** Recent LLM writing has overused this previously useful punctuation, so we ban the em dash entirely. A comma, a colon, or two separate sentences almost always reads better.\n"
-        "- **Edit before finishing:** When you finish writing, pause for a beat, then re-read with fresh eyes: cut anything you cannot imagine a colleague saying out loud, and look for places to add information while dropping filler, so the reader makes the quickest progress.\n"
-        "\nShow, not just tell. These pairs are real failure modes from past sessions; write like the GOOD version:\n"
-        "- **Coined shorthand.** BAD: 'The thesis-neutral-positive, floor-raising dynamic makes the wash-out scenario survivable.' GOOD: 'The position survives either outcome: if the frontier model wins, compute demand rises; if the cheap model wins, token volume rises.' If you invented the label this session, the reader does not have it, so use the plain phrase.\n"
-        "- **Parenthetical piles.** BAD: 'The verification layer (DDOG, NOW/GTLB, plus private harness plays) is the purest expression.' GOOD: 'Datadog, ServiceNow, and GitLab sell review capacity, the scarce resource, so demand for them scales with agent volume rather than token price.' Three or more figures comparing the same thing belong in a small table, not a parenthetical.\n"
-        "- **Telegraphic fragments.** BAD: 'S1b wash-out: capex gap closes with a thud, 2028-2031.' GOOD: 'If adoption disappoints, the capex gap closes through write-downs and canceled power contracts rather than growth, most likely between 2028 and 2031.' Short labels are fine in your own working notes; in delivered prose, say what the thing is.\n"
-        "- **Fireworks over information.** BAD: 'The numbers are brutal. The gap is real. The bet stands.' GOOD: 'The frontier version of the 2030 forecast needs about 115 gigawatts; the cheap-model version needs 3.4.' One specific number carries more force than three punchy fragments.\n"
-        "\nTask Report:\n"
-        "The task report is how the operator syncs with your work; they did not watch the session, so write it for someone who can read only this file and know what happened, what you decided, and why. Keep it skimmable: short paragraphs, bullets for lists, and a bold lead-in for each section, so the outcome and the key decisions survive a quick scan.\n"
-        "\nBefore writing it, verify your work by actually running it: execute your code, re-read final files, re-check computed values, and quote real observed output. Label inferences as inferences. For **writing** of all kinds, verification means the two passes in the Writing Rules. A task report that claims success without demonstrated verification is incomplete.\n"
-        "\nWhen the task is complete, create task_report/report.md containing:\n"
-        "1. **Outcome first.** One short paragraph stating what was delivered and whether it succeeded and use this as the place to answer user questions unless directed to write other reports. In explaining what you did, name the artifact and the verdict, e.g. 'Rewrote the pricing script and re-ran the three scenarios; all outputs match the independent hand check.'\n"
-        "2. **Key decisions.** Why you made them, especially where the operator might have chosen differently.\n"
-        "3. **Uncertainties.** Anything you are not sure about.\n"
-        "4. **Environment and tooling.** Anything about the environment or tool calling you unnecessarily struggled with; this is how the harness gets fixed.\n"
-        "5. **Success assessment.** Whether the task succeeded, with the verification evidence you observed. Quote real output, e.g. 'the script prints \"generous world: 337 MW\", matching the hand-derived 340 MW within rounding', not 'the numbers looked right'.\n"
-        "6. **Images.** You may create or copy images (.jpg or .png, no larger than 1200 pixels please) to task_report/ if the task requires those for evaluation.\n"
-        "7. Markdown or images in task_report/ are only for evaluation and will be deleted after your work is evaluated.\n"
-        "\nAfter writing task_report/report.md, reply with one short sentence confirming completion.\n"
+        "\n### Writing Guide\n"
+        "\nThe goal of our writing should be rapid knowledge acquisition by the user. Our expectation for your writing is that it gets to the point without jargon. The user should find it easy to skim.\n"
+        "\nAfter this content overview, you should guide the user to greater detail and technical understanding. We want to make the user better and their reading time efficient, with language that centers their outcome rather than optimizing for impressive sounding phrases. Use direct and concise language.\n"
+        "\nAfter writing, review your work for LLM tics. These, while not originally bad, have become overused and must be removed from your writing. Here's what to check and fix:\n"
+        "- Use commas or separate sentences, **no em dashes**\n"
+        "- Use **accepted English words with variety**, even less common words that fit the situation, but do not use shorthand or chain of thought / reasoning type fragments\n"
+        "- Provide options resulting in **recommendations**, avoid the equal treatment LLMs sometimes leave for the user\n"
+        "- Use words like key or core instead of load bearing\n"
+        "- Use **concrete words**, often just 'test' or 'check' will work better than the figurative 'smoke test'. Spine and seam should only be used to talk about real spines and seams and not metaphorical ones\n"
+        "- Find ways to make direct statements like 'The position survives either outcome', **avoid unnecessary hyphenated phrases** like 'the wash-out scenario is survivable'\n"
+        "- Check each phrase and sentence: **is there unnecessary verbosity that could be trimmed?**\n"
+        "\n### Write Task Report\n"
+        "\nWhen finished, you must write a task report `task_report/report.md`, which is the best way of communicating your successes and failures with the user. Your well written task report should guide them from ignorance of what you've done to a state of deep understanding of where things stand. Assume the user will skim the report for many tasks, but read deeper when they want to learn more or provide more context for a future task. Capture details from the messages in this session (including the past context summary if available), as this document may be archived in this project for richer context going forward.\n"
+        "\nHere is a helpful template:\n"
+        "- **Outcome:** Without repeating anything in the system or task prompts, what did you do and how did you do it? What were the results?\n"
+        "- **Decisions:** What were they, what is your plan to make more progress, and why?\n"
+        "- **Uncertainties:** What have you not figured out yet, and what would it take for resolution?\n"
+        "- **Environment:** Has there been any points of friction in working in this environment with this agent harness? How did you fix it or get around it?\n"
+        "- **Continuity:** What were you last doing (with which files?) and what would be the most immediate next step?\n"
+        "\nWrite and verify you have written an effective `task_report/report.md`, then respond with a very short sentence or paragraph to end the session.\n"
     )
 
 
@@ -2462,10 +2544,18 @@ def main():
                 if "max_tokens_override" in state:
                     del state["max_tokens_override"]
                 for tc in tool_calls:
+                    if not isinstance(tc, dict):
+                        # cannot dispatch or round-trip a non-object entry; skip
+                        # it. the stored copy stays in the assistant message, but
+                        # _sanitize_tool_calls drops it (and nothing is paired
+                        # with it) if a strict provider 400s on the next POST.
+                        print(ts() + "  [tool call] (unnamed): INCOMPLETE CALL (not an object)")
+                        continue
                     # index the call structure defensively: providers occasionally
                     # emit elements missing id/name/arguments, and a KeyError here
                     # kills the run instead of becoming a corrective tool error
-                    fn = tc.get("function") or {}
+                    fn = tc.get("function")
+                    fn = fn if isinstance(fn, dict) else {}
                     fn_name = fn.get("name") or "(unnamed)"
                     tc_id = tc.get("id") or "missing-id-" + str(tool_calls_done)
                     raw_args = fn.get("arguments")
@@ -2473,10 +2563,15 @@ def main():
                     # layer 1: structurally incomplete call or malformed JSON args
                     # layer 2: valid JSON but wrong/missing parameter keys
                     # both return the error as a tool result so the model self-corrects.
-                    # layer 3 (in dispatch_tool): general except for anything else
+                    # layer 3 (in dispatch_tool): general except for anything else.
+                    # every failed branch also repairs the stored assistant copy
+                    # (_repair_tool_call): the raw broken arguments string must
+                    # never round-trip to the provider, or it 400s the next POST
+                    # with "Invalid function arguments" and kills the run.
                     if not fn.get("name") or not isinstance(raw_args, str):
                         print(ts() + "  [tool call] " + fn_name + ": INCOMPLETE CALL (missing name or arguments)")
                         tool_result = "Error: tool call was missing its name or its arguments string. Re-issue a complete tool call."
+                        _repair_tool_call(tc, tc_id)
                     else:
                         try:
                             fn_args = json.loads(raw_args)
@@ -2484,10 +2579,12 @@ def main():
                             print(ts() + "  [tool call] " + fn_name + ": MALFORMED ARGUMENTS")
                             fn_args = None
                             tool_result = "Error: tool call arguments were not valid JSON (" + str(e) + "). Re-issue the call with corrected, complete JSON arguments."
+                            _repair_tool_call(tc, tc_id)
                         if fn_args is not None and not isinstance(fn_args, dict):
                             print(ts() + "  [tool call] " + fn_name + ": ARGUMENTS NOT AN OBJECT")
                             fn_args = None
                             tool_result = 'Error: tool call arguments must be a JSON object of named parameters, e.g. {"filename": ...}. Re-issue with an object.'
+                            _repair_tool_call(tc, tc_id)
                         if fn_args is not None:
                             try:
                                 tool_result = dispatch_tool(mcp, fn_name, fn_args)
@@ -2513,9 +2610,14 @@ def main():
                     )
                     tool_calls_done += 1
 
-                # append per-turn telemetry to the last tool result
+                # append per-turn telemetry to the last tool result; when every
+                # tool call this turn was undispatchable (non-object entries),
+                # no tool result exists, so carry the status in a user notice
                 status = make_status_line(state, tool_calls_done)
-                new_messages[-1]["content"] = new_messages[-1]["content"] + "\n\n" + status
+                if isinstance(new_messages[-1].get("content"), str):
+                    new_messages[-1]["content"] = new_messages[-1]["content"] + "\n\n" + status
+                else:
+                    new_messages.append({"role": "user", "content": status})
 
                 # soft budget notices
                 print("TCC", tool_calls_done, flush=True)
