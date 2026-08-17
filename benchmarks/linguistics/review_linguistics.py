@@ -20,10 +20,10 @@ from pathlib import Path
 import requests
 
 # Model selector. Edit this one line; do not use an env var.
-MODEL = "gem36f"
+MODEL = "dsv4p"
 
 MODEL_REGISTRY = {
-    "gem36f": {"model": "google/gemini-3.6-flash:nitro", "reasoning": {"effort": "high"}, "provider": None},
+    "dsv4p": {"model": "deepseek/deepseek-v4-pro-0813:exacto", "reasoning": {"effort": "xhigh"}, "provider": {"quantizations": ["fp8"]}},
 }
 
 
