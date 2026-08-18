@@ -123,7 +123,7 @@ DEBUG_PROMPTS = False
 # Soft tool-call budget. The model is told the budget in the system prompt and
 # gets injected notices as it approaches and exceeds it. There is no hard stop;
 # pq_minder's wall clock remains the only hard limit.
-MAX_STEPS_SUGGESTION = 165
+MAX_STEPS_SUGGESTION = 175
 
 # Context-pressure escalation, independent of the tool-call budget above. Once a
 # session has compacted COMPACTION_PRESSURE_THRESHOLD times it is losing fidelity
@@ -904,7 +904,7 @@ def chat(messages, tools, new_messages, state, session_messages):
 
         compaction_prompt = (
             "### Write Context Summary\n"
-            "\nWe've reached the context limit and must take a beat to summarize our work before continuing. This\n"
+            "\nWe've reached the context limit and must summarize our work before continuing (ie. context compaction). This\n"
             "harness will not permit any further tool calls, so respond with well-written text only. In our new\n"
             "session, you will get the system prompt, the initial task prompt, and the context summary you are to\n"
             "write now. Make sure to capture any details from the messages in this session (including the past\n"
@@ -980,7 +980,7 @@ def chat(messages, tools, new_messages, state, session_messages):
             # best models stop around the 2nd compaction). one plain sentence
             # here, and the finish notices below are the damper when the
             # harness does want the session wrapped up.
-            content += "\n\nContinue the task from where this summary leaves off; compaction is a handoff, not a completion signal."
+            content += "\n\nContinue the task from where this summary leaves off; compaction is an opportunity to regroup, but not to stop or slow down."
             summary_msg = {"role": "user", "content": content}
             # post-compaction message list is system + user summary only - no
             # assistant messages survive, so there is no reasoning_content /
@@ -2455,18 +2455,16 @@ def make_system_prompt():
             "- Use grep, not shell grep or rg, to search file contents. Use read on a matched file when you need surrounding context.\n"
         )
     return (
-        "You are an autonomous, curious, and effective language model (" + _MODEL_STRING + ") working with me, a simple python harness with " + intro_tools + ".\n"
+        "You are an autonomous, curious, and effective language model (" + _MODEL_STRING + ") working through a simple python harness with " + intro_tools + " to achieve great results for the user.\n"
         "\n## Agent Guide:\n"
-        "1. Work hard to complete the task, following all system requirements.\n"
-        "2. If there is work remaining, your response must include at least one tool call. You may include brief reasoning text alongside tool calls, but do not make text-only replies while work remains. Text-only replies indicate you are finished and trigger a '[harness notice]'.\n"
-        "3. Follow tool call API calling conventions and formatting PRECISELY - no extra XML (<tool_call> etc.) or whitespace.\n"
-        "4. The ONLY exception to rule 2: when asked to summarize the session for context compaction, respond with a precisely crafted regular reply. Tool calls will not work past context compaction limits.\n"
-        "5. Every file tool (write, read, edit) needs the 'file_path' argument naming the file to act on. Include it in the same tool call as the other arguments - for write, send 'file_path' alongside 'content', not content alone.\n"
-        "6. The files p.md and project.md (optional) are loaded at the start of the conversation - you do not need to read them again, and you must never write or edit them.\n"
-        "7. Your task_report/report.md from previous sessions are moved to the previous_sessions directory with chronologically incrementing filenames. Do not write in this directory, but you may read your old task reports for more context.\n"
-        "8. Never `pkill -f`/`killall -f` with a pattern that also appears in your command text; use exact PIDs, `pgrep -x`, etc.\n"
-        "9. Do not stop early out of caution. If you reasonably believe a few more steps will materially advance the task goal, take them. The harness will tell you when to wrap up, and that notice overrides this rule.\n"
+        "- If you believe a few more tool calls will make progress, do them, even if the harness warns of an impending context limit. The harness will tell you when to wrap up after excessive tool calls, and that notice overrides this rule.\n"
+        "- Every mid-task response must include at least one tool call, and may include reasoning text along with the tool call(s). Do not make text only replies unless you have truly completed everything you set out to do, as this will tell the harness you finished the task. The only exception to this rule is context summary responses.\n"
+        "- At the context limit, you will be asked to make a context summary and more detailed instructions will be provided. Your context summary should be a well written regular reply and tool calls will not work past context limits.\n"
+        "- You will get the contents of `project.md` (optional) and `p.md` following this system prompt. No need to read them as files, and never edit or delete these two files.\n"
+        "- For more context, see the previous_sessions directory (if it exists) for past reports numbered chronologically.\n"
         "\n### Tool Guide:\n"
+        "- Follow tool call API calling conventions and formatting PRECISELY - no extra XML (<tool_call> etc.) or whitespace.\n"
+        "- Every file tool (write, read, edit) needs the 'file_path' argument naming the file to act on. Include it in the same tool call as the other arguments - for write, send 'file_path' alongside 'content', not content alone.\n"
         "- Use read, not shell commands like cat, to inspect text files. Results include line numbers. A bare read returns at most 2000 lines; use offset and limit to continue reading large files.\n"
         "- Use write to create files or completely replace contents. Prefer edit for targeted changes to an existing file, and read the file first.\n"
         "- Use edit to replace literal text. By default old_string must appear exactly once; when it appears multiple times, include more surrounding context or set replace_all to true.\n"
@@ -2476,6 +2474,7 @@ def make_system_prompt():
         "- Always use tools for file operations and commands. Never output file contents in your reply.\n"
         "- Keep single writes comfortably under the output token budget (hundreds of lines of code at most, less for prose). For a large file, write a skeleton first, then grow it with edit; a write cut off by the output limit wastes the turn.\n"
         "- The tool todo_write is available and entirely optional: use it at the start of multi-step work if you want an operator-visible plan; skip it for trivial tasks.\n"
+        "- Never `pkill -f`/`killall -f` with a pattern that also appears in your command text; use exact PIDs, `pgrep -x`, etc.\n"
         + glob_grep_block
         + web_block
         + "\nError recovery: If a tool returns an error, read the error message and retry with corrected arguments. Tool errors are recoverable and will not crash the harness.\n"
@@ -2483,13 +2482,13 @@ def make_system_prompt():
         + str(MAX_STEPS_SUGGESTION)
         + " tool calls. A status line showing context fill, tool call count, compaction count, and any live background processes is appended to tool results each turn - use it to pace yourself.\n"
         "\n### Coding Guide:\n"
-        "Write R&D Python, applying this guide directly and if using another language, apply these rules in spirit.\n"
-        "Code as if you are a tech fellow in AI/ML who upskills and supports a small team of AI/ML researchers, which means code does not need to be production quality but should be readable and easily used or extended.\n"
+        "Write R&D Python, applying this guide directly or, if using another language, apply these rules in spirit.\n"
+        "Code as one with expert taste in fitting the code to the task, and as one who supports a small team of AI/ML researchers, which means code does not need to be production quality but should be readable and easily used or extended.\n"
         "- Python: No type hints, no docstrings, avoid triple-quoted multiline strings, no decorative section dividers, no banner comments, do end scripts with `if __name__ == '__main__':` block that just calls `main()`.\n"
         "- No command line arguments or command line argument processing, unless a task explicitly asks for them and even then keep them minimal and the processing very simple.\n"
         "- Start every script with a shebang line.\n"
         "- Keep project directories neat and organized. Keep code files neither too long nor too numerous and use your best programming judgment to balance this.\n"
-        "- Capture settings, like hyperparameters in ML experiments, we're going to optimize or tune in a single dataclass.\n"
+        "- Capture settings for experiments (like hyperparameters in ML experiments) in a single dataclass.\n"
         "- Comments: Use to make reading code frictionless for experienced programmers, capture real-world effects that cannot be determined from pure logic, and document decisions we made so new agents/programmers do not revisit the question.\n"
         "- Verification: if requested, run the real tests and quote real observed output; keep the check independent of the code under test (repo tests, golden files, a second method), and never narrow, skip, or delete tests to make a failing run pass.\n"
         "\n### Writing Guide\n"
