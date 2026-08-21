@@ -35,34 +35,6 @@ from flowmark import reformat_file
 #                nested OpenRouter-style reasoning.effort 400s on some Go
 #                models, e.g. kimi-k2.7-code)
 
-"""
-trivia:
-16	1	deepseek/deepseek-v4-flash-0731	0.065	0.14
-43	0	deepseek/deepseek-v4-pro-0813	1.188	3.564
-53	1	google/gemini-3.7-flash:nitro	0.375	1.875
-50	1	meta/muse-spark-1.2:nitro	1.25	4.25
-47	1	openai/gpt-5.6-sol	2.5	15
-26	1	stealth/ox-alpha:nitro	0	0
-20	1	x-ai/grok-4.6	2	6
-36	0	z-ai/glm-5.3:nitro	1.4	4.4
-				
-				
-				
-				
-				
-33	0	opencode-go/deepseek-v4-flash	no temp	
-21	0	opencode-go/glm-5.3	no temp	
-39	0	opencode-go/muse-spark-1.2-contributor	no temp	
-				
-28	0	opencode-go/x-preview-f-free	zen no temp	
-41	0	opencode-go/deepseek-v4-pro	zen no temp	
-23	0	opencode-go/nemotron-3-ultra-free	zen no temp	
-41	0	opencode-go/muse-spark-1.2-contributor-free	zen no temp	
-43	0	opencode-go/gpt-5.6-sol	zen no temp	
-
-
-
-"""
 
 MODEL_REGISTRY = {
     # OpenRouter
@@ -74,11 +46,11 @@ MODEL_REGISTRY = {
     "glm53": {"provider": "openrouter", "model": "z-ai/glm-5.3:nitro", "max_tokens": 20000, "max_output_tokens": 100000, "fp8": True, "score": 58.5},
     "dsv4f": {"provider": "openrouter", "model": "deepseek/deepseek-v4-flash-0731:nitro", "max_tokens": 20000, "max_output_tokens": 100000, "fp8": True, "temperature": 0.95, "score": 86.04},
     # OpenCode Go
-    # muse-spark-1.2-contributor will only work with OpenAI Requests API, NOT chat completions
     "go-muse12": {"provider": "opencode-go", "model": "muse-spark-1.2-contributor", "max_tokens": 20000, "max_output_tokens": 100000, "score": 71.65},
     "go-dsv4p": {"provider": "opencode-go", "model": "deepseek-v4-pro", "max_tokens": 20000, "max_output_tokens": 100000, "score": 0},
     "go-glm53": {"provider": "opencode-go", "model": "glm-5.3", "max_tokens": 20000, "max_output_tokens": 100000, "score": 58.5},
     "go-dsv4f": {"provider": "opencode-go", "model": "deepseek-v4-flash", "max_tokens": 20000, "max_output_tokens": 100000, "temperature": 0.95, "score": 86.04},
+    # OpenCode Zen
     "zen-muse12": {"provider": "opencode-zen", "model": "muse-spark-1.2-contributor-free", "max_tokens": 20000, "max_output_tokens": 100000, "score": 71.65},
     "zen-oxalpha": {"provider": "opencode-zen", "model": "x-preview-f-free", "max_tokens": 20000, "max_output_tokens": 100000, "score": 71.65},
     "zen-nemotron": {"provider": "opencode-zen", "model": "nemotron-3-ultra-free", "max_tokens": 20000, "max_output_tokens": 100000, "score": 71.65},
@@ -424,11 +396,11 @@ def get_state_of_system():
 
     def render(path, prefix, is_last, depth):
         nonlocal n_files, n_dirs, total
-        tree.append(prefix + ("└── " if is_last else "├── ") + os.path.basename(path) + ("/" if os.path.isdir(path) else ""))
+        tree.append(prefix + ("+-- " if is_last else "+-- ") + os.path.basename(path) + ("/" if os.path.isdir(path) else ""))
         if os.path.isdir(path):
             n_dirs += 1
             if depth < 2:
-                emit_children(path, prefix + ("    " if is_last else "│   "), depth + 1)
+                emit_children(path, prefix + ("    " if is_last else "|   "), depth + 1)
         else:
             n_files += 1
             total += os.path.getsize(path)
@@ -440,7 +412,7 @@ def get_state_of_system():
         for i, kid in enumerate(shown):
             render(kid, prefix, i == len(shown) - 1 and not capped, depth)
         if capped:
-            tree.append(prefix + "└── ...")
+            tree.append(prefix + "+-- ...")
 
     emit_children(root, "", 1)
 
@@ -983,6 +955,36 @@ def _dump_compaction_artifact(name, obj):
         print(ts() + "  [warn] failed to write compaction dump " + name + ": " + str(e))
 
 
+# plain-text separator between sections of the readable .md compaction logs
+COMPACTION_MD_SEPARATOR = "----=====-----=====-----\n"
+
+
+def _msg_text(msg):
+    # content of a session message for the .md logs; content is normally a
+    # string, but never trust a non-string blindly in a logging path.
+    content = msg.get("content")
+    if isinstance(content, str):
+        return content
+    if content is None:
+        return ""
+    return json.dumps(content, indent=2)
+
+
+def _dump_compaction_md(name, sections):
+    # readable .md twin of the json dumps above: prints the session-start
+    # messages (and, after compaction, the fresh system state plus the context
+    # summary) verbatim, each section separated by a banner line, so a
+    # compaction handoff can be reviewed as plain text instead of JSON.
+    path = os.path.join(WORKSPACE, "task_report", name)
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(COMPACTION_MD_SEPARATOR.join(str(s) for s in sections))
+        print(ts() + "  [debug] wrote " + os.path.relpath(path, WORKSPACE))
+    except OSError as e:
+        print(ts() + "  [warn] failed to write compaction dump " + name + ": " + str(e))
+
+
 def chat(messages, tools, new_messages, state, session_messages):
     # MAX_CONTEXT_LENGTH (module scope) is the conservative cap and compaction
     # trigger point. Long-context quality degrades well before nominal limits,
@@ -994,6 +996,19 @@ def chat(messages, tools, new_messages, state, session_messages):
     if pre_prompt_total_context > MAX_CONTEXT_LENGTH:
         print(ts() + "PERFORM COMPACTION", flush=True)
         state["compaction_count"] += 1
+        if state["compaction_count"] == 1:
+            # first compaction only: snapshot the initial messages the llm saw,
+            # as a readable .md (system prompt, initial user prompt, initial
+            # system state) so the pre-compaction context is reviewable without
+            # digging through the raw json request dump.
+            _dump_compaction_md(
+                "compaction_1_initial_messages.md",
+                [
+                    _msg_text(session_messages[0]),
+                    _msg_text(session_messages[1]),
+                    _msg_text(session_messages[-1]),
+                ],
+            )
         # let's try the compaction prompt without state of system
         # file_listing = get_state_of_system()
 
@@ -1067,6 +1082,20 @@ def chat(messages, tools, new_messages, state, session_messages):
         print(summary if summary else "(no usable compaction summary - falling back to tail-keep)")
         print("-" * 80)
         print()
+
+        # post-compaction handoff context as a readable .md: the system prompt
+        # and initial user prompt are unchanged from the first dump, the system
+        # state is fetched fresh (files and context changed during the session),
+        # and the context summary this run produced is appended last.
+        _dump_compaction_md(
+            "compaction_" + str(state["compaction_count"]) + "_post_compaction.md",
+            [
+                _msg_text(session_messages[0]),
+                _msg_text(session_messages[1]),
+                get_state_of_system(),
+                summary if summary else "(no usable compaction summary - falling back to tail-keep)",
+            ],
+        )
 
         if summary:
             content = "[context compacted] Session summary:\n" + summary + _touched_block()
@@ -2550,14 +2579,13 @@ def make_system_prompt():
             "- Use grep, not shell grep or rg, to search file contents. Use read on a matched file when you need surrounding context.\n"
         )
     return (
-        "You are an autonomous, curious, and effective language model (" + _MODEL_STRING + ") working through a simple python harness with " + intro_tools + " to achieve great results for the user.\n"
-        "\n## Agent Guide:\n"
-        "- If you believe a few more tool calls will make progress, do them, even if the harness warns of an impending context limit. The harness will tell you when to wrap up after excessive tool calls, and that notice overrides this rule.\n"
-        "- Every mid-task response must include at least one tool call, and may include reasoning text along with the tool call(s). Do not make text only replies unless you have truly completed everything you set out to do, as this will tell the harness you finished the task. The only exception to this rule is context summary responses.\n"
-        "- At the context limit, you will be asked to make a context summary and more detailed instructions will be provided. Your context summary should be a well written regular reply and tool calls will not work past context limits.\n"
-        "- You will get the contents of `project.md` (optional) and `p.md` following this system prompt. No need to read them as files, and never edit or delete these two files.\n"
-        "- For more context, see the previous_sessions directory (if it exists) for past reports numbered chronologically.\n"
-        "\n### Tool Guide:\n"
+        "Work to complete the user's task, using clear and transparent English for any and all writing. You are " + _MODEL_STRING + ", working through a Python harness with " + intro_tools + ".\n"
+        "\n## Agent Guide\n"
+        "- Keep working if another tool call could produce evidence or improve the result. Any context limit warning is advisory only and context summaries are handoffs to continue work with fresh context. Stop and summarize when the harness indicates a context limit or when sends a wrap-up notice due to total tool call limits.\n"
+        "- Every mid-task response must make at least one tool call. A text-only response tells the harness that the task is done. Context summaries are the exception and the text-only summary is required before continuing work.\n"
+        "- The harness sends the contents of `project.md` (optional) and `p.md` (the user task request) after this prompt. Respond to those messages directly without re-reading the files, and do not edit or delete either file.\n"
+        "- The directory `previous_sessions/` (if it exists) contains your past task reports renamed using chronologically increasing numbers. Read these for context.\n"
+        "\n### Tool Guide\n"
         "- Follow tool call API calling conventions and formatting PRECISELY - no extra XML (<tool_call> etc.) or whitespace.\n"
         "- Every file tool (write, read, edit) needs the 'file_path' argument naming the file to act on. Include it in the same tool call as the other arguments - for write, send 'file_path' alongside 'content', not content alone.\n"
         "- Use read, not shell commands like cat, to inspect text files. Results include line numbers. A bare read returns at most 2000 lines; use offset and limit to continue reading large files.\n"
@@ -2576,7 +2604,7 @@ def make_system_prompt():
         "\nResource budget: You have a soft budget of approximately "
         + str(MAX_STEPS_SUGGESTION)
         + " tool calls. A status line showing context fill, tool call count, compaction count, and any live background processes is appended to tool results each turn - use it to pace yourself.\n"
-        "\n### Coding Guide:\n"
+        "\n### Coding Guide\n"
         "Write R&D Python, applying this guide directly or, if using another language, apply these rules in spirit.\n"
         "Code as one with expert taste in fitting the code to the task, and as one who supports a small team of AI/ML researchers, which means code does not need to be production quality but should be readable and easily used or extended.\n"
         "- Python: No type hints, no docstrings, avoid triple-quoted multiline strings, no decorative section dividers, no banner comments, do end scripts with `if __name__ == '__main__':` block that just calls `main()`.\n"
@@ -2598,14 +2626,14 @@ def make_system_prompt():
         "- Find ways to make direct statements like 'The position survives either outcome', **avoid unnecessary hyphenated phrases** like 'the wash-out scenario is survivable'\n"
         "- Check each phrase and sentence: **is there unnecessary verbosity that could be trimmed?**\n"
         "\n### Write Task Report\n"
-        "\nWhen finished, you must write a task report `task_report/report.md`, which is the best way of communicating your successes and failures with the user. Your well written task report should guide them from ignorance of what you've done to a state of deep understanding of where things stand. Assume the user will skim the report for many tasks, but read deeper when they want to learn more or provide more context for a future task. Capture details from the messages in this session (including the past context summary if available), as this document may be archived in this project for richer context going forward.\n"
-        "\nHere is a helpful template:\n"
-        "- **Outcome:** Without repeating anything in the system or task prompts, what did you do and how did you do it? What were the results?\n"
-        "- **Decisions:** What were they, what is your plan to make more progress, and why?\n"
-        "- **Uncertainties:** What have you not figured out yet, and what would it take for resolution?\n"
-        "- **Environment:** Has there been any points of friction in working in this environment with this agent harness? How did you fix it or get around it?\n"
-        "- **Continuity:** What were you last doing (with which files?) and what would be the most immediate next step?\n"
-        "\nWrite and verify you have written an effective `task_report/report.md`, then respond with a very short sentence or paragraph to end the session.\n"
+        "When the task is done, act as a modern Joseph Grinnell making field notes, using plain and readable language to write `task_report/report.md`. This report is an important piece of communication with the user and context for you in future sessions. Bring the user to a deep and detailed understand quickly and record facts that will still be useful for future tasks.\n"
+        "\nTask report template:\n"
+        "- **Responses to user:** Lead with answers to user questions (especially if the user asks for something in the task report). Only put responses in other places / files if specifically directed. If there were no expectations for a response, this section can be omitted.\n"
+        "- **Outcome:** State what was done and what changed in detail, including files, decisions or recommendations, and checks or results.\n"
+        "- **Uncertainties:** Describe what remains unknown or confused and how it could be resolved.\n"
+        "- **Environment:** List tool, harness, or environment failures, any workaround attempted, and especially make note of potential harness improvements.\n"
+        "- **Continuity:** Provide extra details about your last few actions for smoother handoffs. Avoid speculating about next steps as the user might have feedback for future tasks.\n"
+        "\nRead the report once after writing it, checking it for good writing that lets the user effortlessly scan your report to gain a complete and detailed picture. Then end the session with a short final text-only reply.\n"
     )
 
 
