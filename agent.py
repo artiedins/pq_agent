@@ -38,22 +38,29 @@ from flowmark import reformat_file
 
 MODEL_REGISTRY = {
     # OpenRouter
-    "gpt56": {"provider": "openrouter", "model": "openai/gpt-5.6-sol:exacto", "max_tokens": 20000, "max_output_tokens": 100000, "score": 0},
-    "gem37": {"provider": "openrouter", "model": "google/gemini-3.7-flash:exacto", "max_tokens": 20000, "max_output_tokens": 100000, "score": 75.65},
-    "grok46": {"provider": "openrouter", "model": "x-ai/grok-4.6:exacto", "max_tokens": 20000, "max_output_tokens": 100000, "score": 0},
-    "muse12": {"provider": "openrouter", "model": "meta/muse-spark-1.2:exacto", "max_tokens": 20000, "max_output_tokens": 100000, "score": 71.65},
-    "dsv4p": {"provider": "openrouter", "model": "deepseek/deepseek-v4-pro-0813:exacto", "max_tokens": 20000, "max_output_tokens": 100000, "fp8": True, "score": 0},
-    "glm53": {"provider": "openrouter", "model": "z-ai/glm-5.3:nitro", "max_tokens": 20000, "max_output_tokens": 100000, "fp8": True, "score": 58.5},
-    "dsv4f": {"provider": "openrouter", "model": "deepseek/deepseek-v4-flash-0731:nitro", "max_tokens": 20000, "max_output_tokens": 100000, "fp8": True, "temperature": 0.95, "score": 86.04},
+    "gem37": {"provider": "openrouter", "model": "google/gemini-3.7-flash:nitro", "max_tokens": 20000, "max_output_tokens": 100000, "temperature": 0.7, "score": 53},
+    "gpt56": {"provider": "openrouter", "model": "openai/gpt-5.6-sol:exacto", "max_tokens": 20000, "max_output_tokens": 100000, "score": 45},
+    "muse12": {"provider": "openrouter", "model": "meta/muse-spark-1.2:nitro", "max_tokens": 20000, "max_output_tokens": 100000, "temperature": 0.7, "score": 43},
+    "dsv4p": {"provider": "openrouter", "model": "deepseek/deepseek-v4-pro-0813:exacto", "max_tokens": 20000, "max_output_tokens": 100000, "fp8": True, "score": 42},
+    "glm53": {"provider": "openrouter", "model": "z-ai/glm-5.3:nitro", "max_tokens": 20000, "max_output_tokens": 100000, "fp8": True, "temperature": 0.7, "score": 28},
+    "oxalpha": {"provider": "openrouter", "model": "stealth/ox-alpha:nitro", "max_tokens": 20000, "max_output_tokens": 100000, "temperature": 0.7, "score": 27},
+    "dsv4f": {"provider": "openrouter", "model": "deepseek/deepseek-v4-flash-0731:exacto", "max_tokens": 20000, "max_output_tokens": 100000, "score": 25},
     # OpenCode Go
-    "go-muse12": {"provider": "opencode-go", "model": "muse-spark-1.2-contributor", "max_tokens": 20000, "max_output_tokens": 100000, "score": 71.65},
-    "go-dsv4p": {"provider": "opencode-go", "model": "deepseek-v4-pro", "max_tokens": 20000, "max_output_tokens": 100000, "score": 0},
-    "go-glm53": {"provider": "opencode-go", "model": "glm-5.3", "max_tokens": 20000, "max_output_tokens": 100000, "score": 58.5},
-    "go-dsv4f": {"provider": "opencode-go", "model": "deepseek-v4-flash", "max_tokens": 20000, "max_output_tokens": 100000, "temperature": 0.95, "score": 86.04},
+    "go-gem37": {"provider": "opencode-go", "model": "gemini-3.7-flash", "max_tokens": 20000, "max_output_tokens": 100000, "temperature": 0.7, "score": 53},
+    "go-gpt56": {"provider": "opencode-go", "model": "gpt-5.6-sol", "max_tokens": 20000, "max_output_tokens": 100000, "score": 45},
+    "go-muse12": {"provider": "opencode-go", "model": "muse-spark-1.2-contributor", "max_tokens": 20000, "max_output_tokens": 100000, "temperature": 0.7, "score": 43},
+    "go-dsv4p": {"provider": "opencode-go", "model": "deepseek-v4-pro", "max_tokens": 20000, "max_output_tokens": 100000, "score": 42},
+    "go-glm53": {"provider": "opencode-go", "model": "glm-5.3", "max_tokens": 20000, "max_output_tokens": 100000, "temperature": 0.7, "score": 28},
+    "go-oxalpha": {"provider": "opencode-go", "model": "ox-alpha-free", "max_tokens": 20000, "max_output_tokens": 100000, "temperature": 0.7, "score": 27},
+    "go-dsv4f": {"provider": "opencode-go", "model": "deepseek-v4-flash", "max_tokens": 20000, "max_output_tokens": 100000, "score": 25},
     # OpenCode Zen
-    "zen-muse12": {"provider": "opencode-zen", "model": "muse-spark-1.2-contributor-free", "max_tokens": 20000, "max_output_tokens": 100000, "score": 71.65},
-    "zen-oxalpha": {"provider": "opencode-zen", "model": "x-preview-f-free", "max_tokens": 20000, "max_output_tokens": 100000, "score": 71.65},
-    "zen-nemotron": {"provider": "opencode-zen", "model": "nemotron-3-ultra-free", "max_tokens": 20000, "max_output_tokens": 100000, "score": 71.65},
+    "zen-gem37": {"provider": "opencode-zen", "model": "gemini-3.7-flash", "max_tokens": 20000, "max_output_tokens": 100000, "temperature": 0.7, "score": 53},
+    "zen-gpt56": {"provider": "opencode-zen", "model": "gpt-5.6-sol", "max_tokens": 20000, "max_output_tokens": 100000, "score": 45},
+    "zen-muse12": {"provider": "opencode-zen", "model": "muse-spark-1.2-contributor-free", "max_tokens": 20000, "max_output_tokens": 100000, "temperature": 0.7, "score": 43},
+    "zen-dsv4p": {"provider": "opencode-zen", "model": "deepseek-v4-pro", "max_tokens": 20000, "max_output_tokens": 100000, "score": 42},
+    "zen-glm53": {"provider": "opencode-zen", "model": "glm-5.3", "max_tokens": 20000, "max_output_tokens": 100000, "temperature": 0.7, "score": 28},
+    "zen-oxalpha": {"provider": "opencode-zen", "model": "x-preview-f-free", "max_tokens": 20000, "max_output_tokens": 100000, "temperature": 0.7, "score": 27},
+    "zen-dsv4f": {"provider": "opencode-zen", "model": "deepseek-v4-flash-free", "max_tokens": 20000, "max_output_tokens": 100000, "score": 25},
 }
 
 
@@ -133,7 +140,7 @@ USE_GLOB_GREP_TOOLS = False
 
 # When True, dump the initial conversation payload to INITIAL_PROMPTS.md and exit
 # without sending anything to the LLM. Useful for debugging prompt construction.
-DEBUG_PROMPTS = False
+DEBUG_PROMPTS = True
 
 # Soft tool-call budget. The model is told the budget in the system prompt and
 # gets injected notices as it approaches and exceeds it. There is no hard stop;
@@ -407,7 +414,7 @@ def get_state_of_system():
 
     def emit_children(d, prefix, depth):
         kids = children(d)
-        shown = kids[:20]
+        shown = kids[:30]
         capped = len(kids) > len(shown)
         for i, kid in enumerate(shown):
             render(kid, prefix, i == len(shown) - 1 and not capped, depth)
@@ -432,32 +439,30 @@ def get_state_of_system():
         if not size_str:
             size_str = f"{num:.1f} PiB"
 
-    return "\n".join(
-        [
-            "",
-            "---",
-            "",
-            "## State of the system as of this message",
-            f"- **Snapshot**: {hostname} @ {ts}",
-            f"- **OS**: {pretty} (Linux {platform.release()} {platform.machine()})",
-            f"- **Container**: {container}",
-            f"- **Python**: {platform.python_version()}",
-            f"- **CPU / RAM**: {cores} cores, {total_mib:,} MiB RAM ({total_mib / 1024:.2f} GiB, {used_pct:.1f}% used)",
-            *gpu_bullets,
-            "",
-            "### Working Directory Snapshot",
-            f"- **Path**: `{root}`",
-            f"- **Total Files**: {n_files} files across {n_dirs} subdirectories",
-            f"- **Total Size**: {size_str}",
-            f"- **Disk Space**: {usage.free / 2**30:.1f} GiB Available (Mount: `{mount}`)",
-            "",
-            "Files and dirs listed to depth 2; if '...' shown, then contents exceeded listing limit:",
-            "```",
-            *tree,
-            "```",
-            "",
-            "---",
-        ]
+    return (
+        "\n".join(
+            [
+                "## State of the system as of this message",
+                f"- **Snapshot**: {hostname} @ {ts}",
+                f"- **OS**: {pretty} (Linux {platform.release()} {platform.machine()})",
+                f"- **Container**: {container}",
+                f"- **Python**: {platform.python_version()}",
+                f"- **CPU / RAM**: {cores} cores, {total_mib:,} MiB RAM ({total_mib / 1024:.2f} GiB, {used_pct:.1f}% used)",
+                *gpu_bullets,
+                "",
+                "### Working Directory Snapshot",
+                f"- **Path**: `{root}`",
+                f"- **Total Files**: {n_files} files across {n_dirs} subdirectories",
+                f"- **Total Size**: {size_str}",
+                f"- **Disk Space**: {usage.free / 2**30:.1f} GiB Available (Mount: `{mount}`)",
+                "",
+                "Files and dirs listed to depth two; if '...' shown, then contents have been clipped:",
+                "```",
+                *tree,
+                "```",
+            ]
+        )
+        + "\n"
     )
 
 
@@ -1097,6 +1102,12 @@ def chat(messages, tools, new_messages, state, session_messages):
             ],
         )
 
+        # refresh the runtime snapshot for the post-compaction session: files and
+        # context changed during the run, so the opening state message is stale.
+        # the fresh copy goes to the llm as a standalone message, matching the
+        # initial 3-message shape (system, project+task prompt, system state).
+        fresh_runtime = get_state_of_system()
+
         if summary:
             content = "[context compacted] Session summary:\n" + summary + _touched_block()
             # compaction is a handoff, not a completion signal: models that
@@ -1106,15 +1117,20 @@ def chat(messages, tools, new_messages, state, session_messages):
             # harness does want the session wrapped up.
             content += "\n\nContinue the task from where this summary leaves off; compaction is an opportunity to regroup, but not to stop or slow down."
             summary_msg = {"role": "user", "content": content}
-            # post-compaction message list is system + user summary only - no
+            # post-compaction message list keeps the session prefix (system
+            # prompt, project+task prompt) and replaces the stale opening
+            # snapshot with the fresh one, then appends the context summary, so
+            # the agent sees the same 4-message shape the user intended. no
             # assistant messages survive, so there is no reasoning_content /
-            # reasoning_details state that needs to be preserved. the next API call
-            # starts a fresh assistant turn from the summary context. this is safe
-            # for all backends because the reasoning passback requirement only
-            # applies to continuing from a prior assistant turn, not starting fresh.
-            # the runtime snapshot is the last session message and is now stale, so
-            # drop it: task and project context stay prefix-stable.
-            new_session = list(session_messages[:-1]) + [summary_msg]
+            # reasoning_details state that needs to be preserved. the next API
+            # call starts a fresh assistant turn from the summary context. this
+            # is safe for all backends because the reasoning passback
+            # requirement only applies to continuing from a prior assistant
+            # turn, not starting fresh.
+            new_session = list(session_messages[:-1]) + [
+                {"role": "user", "content": fresh_runtime},
+                summary_msg,
+            ]
         else:
             # degraded fallback: two failed summary attempts. keep the session
             # preamble plus a recent tail of raw messages and press on - losing
@@ -1138,7 +1154,14 @@ def chat(messages, tools, new_messages, state, session_messages):
                 "content": "[context compacted] Automatic summarization failed; older messages were dropped and only recent raw messages follow. Re-read NOTES.md and files on disk to recover earlier findings before continuing."
                 + _touched_block(),
             }
-            new_session = list(session_messages[:-1]) + [note] + full_history[start:]
+            new_session = (
+                list(session_messages[:-1])
+                + [
+                    {"role": "user", "content": fresh_runtime},
+                    note,
+                ]
+                + full_history[start:]
+            )
 
         messages.clear()
         messages += new_session
@@ -1169,15 +1192,11 @@ def chat(messages, tools, new_messages, state, session_messages):
     if DEBUG_PROMPTS and not state.get("_debug_prompts_done"):
         state["_debug_prompts_done"] = True
         dump_path = os.path.join(WORKSPACE, "INITIAL_PROMPTS.md")
-        system_text = ""
-        user_text = ""
-        for m in messages:
-            if m.get("role") == "system" and not system_text:
-                system_text = m.get("content", "")
-            elif m.get("role") == "user" and not user_text:
-                user_text = m.get("content", "")
+        # dump the opening messages the agent sees: system prompt, project+task
+        # prompt, then the runtime snapshot, each same spacer text in between
+        sections = [str(m.get("content", "")) for m in messages if m.get("role") in ("system", "user")]
         with open(dump_path, "w", encoding="utf-8") as f:
-            f.write("----------===-----------\n" + system_text + "----------===-----------\n" + user_text + "----------===-----------\n")
+            f.write("----------===-----------\n" + "----------===-----------\n".join(sections) + "----------===-----------\n")
         print()
         print("=" * 70)
         print("DEBUG_PROMPTS: prompts written to", dump_path)
@@ -2228,7 +2247,7 @@ def read_p():
     if not os.path.exists(p_path):
         sys.exit("Error: no p.md found in " + WORKSPACE)
     with open(p_path, "r", encoding="utf-8") as f:
-        return f.read().strip()
+        return f.read().strip() + "\n"
 
 
 def read_project():
@@ -2237,7 +2256,7 @@ def read_project():
     if not os.path.exists(project_path):
         return ""
     with open(project_path, "r", encoding="utf-8") as f:
-        return f.read().strip()
+        return f.read().strip() + "\n\n"
 
 
 def make_tools():
@@ -2615,9 +2634,8 @@ def make_system_prompt():
         "- Comments: Use to make reading code frictionless for experienced programmers, capture real-world effects that cannot be determined from pure logic, and document decisions we made so new agents/programmers do not revisit the question.\n"
         "- Verification: if requested, run the real tests and quote real observed output; keep the check independent of the code under test (repo tests, golden files, a second method), and never narrow, skip, or delete tests to make a failing run pass.\n"
         "\n### Writing Guide\n"
-        "\nThe goal of our writing should be rapid knowledge acquisition by the user. Our expectation for your writing is that it gets to the point without jargon. The user should find it easy to skim.\n"
-        "\nAfter this content overview, you should guide the user to greater detail and technical understanding. We want to make the user better and their reading time efficient, with language that centers their outcome rather than optimizing for impressive sounding phrases. Use direct and concise language.\n"
-        "\nAfter writing, review your work for LLM tics. These, while not originally bad, have become overused and must be removed from your writing. Here's what to check and fix:\n"
+        "The goal of your writing should be rapid knowledge acquisition by the user and you always get to the point without jargon. The user should find it easy to skim anything you create, whether that is code comments or task reports.\n"
+        "After writing, review your work for LLM tics. These, while not originally bad, have become overused and must be removed from your writing. Here's what to check and fix:\n"
         "- Use commas or separate sentences, **no em dashes**\n"
         "- Use **accepted English words with variety**, even less common words that fit the situation, but do not use shorthand or chain of thought / reasoning type fragments\n"
         "- Provide options resulting in **recommendations**, avoid the equal treatment LLMs sometimes leave for the user\n"
@@ -2627,7 +2645,7 @@ def make_system_prompt():
         "- Check each phrase and sentence: **is there unnecessary verbosity that could be trimmed?**\n"
         "\n### Write Task Report\n"
         "When the task is done, act as a modern Joseph Grinnell making field notes, using plain and readable language to write `task_report/report.md`. This report is an important piece of communication with the user and context for you in future sessions. Bring the user to a deep and detailed understand quickly and record facts that will still be useful for future tasks.\n"
-        "\nTask report template:\n"
+        "Task report template:\n"
         "- **Responses to user:** Lead with answers to user questions (especially if the user asks for something in the task report). Only put responses in other places / files if specifically directed. If there were no expectations for a response, this section can be omitted.\n"
         "- **Outcome:** State what was done and what changed in detail, including files, decisions or recommendations, and checks or results.\n"
         "- **Uncertainties:** Describe what remains unknown or confused and how it could be resolved.\n"
@@ -2733,24 +2751,24 @@ def main():
     # used by the inline tool_call rescue below to reject names never offered
     known_tool_names = set(t["function"]["name"] for t in tools)
 
-    # message order mirrors DSH: system, then the task prompt on its own, then a
-    # project <system-reminder> when project.md exists, then the runtime snapshot
-    # last. The snapshot is the only environment message, so it can be dropped
-    # after compaction (see chat()) without touching the task or project context.
     task_prompt = read_p()
     project_text = read_project()
     system_prompt = make_system_prompt()
     snapshot = get_state_of_system()
 
-    runtime_content = ("## Runtime context\n" "Your working directory is " + WORKSPACE + ", and it is the only directory you can write to while reads are allowed anywhere.\n") + snapshot
+    runtime_content = snapshot
+
+    # if project_text exists, I want that simply concatenated with task prompt
+    if project_text:
+        user_prompt = project_text + task_prompt
+    else:
+        user_prompt = task_prompt
 
     session_messages = [
         {"role": "system", "content": system_prompt},
-        {"role": "user", "content": task_prompt},
+        {"role": "user", "content": user_prompt},
+        {"role": "user", "content": runtime_content},
     ]
-    if project_text:
-        session_messages.append({"role": "user", "content": "<system-reminder>\n" + project_text + "\n</system-reminder>"})
-    session_messages.append({"role": "user", "content": runtime_content})
 
     # last_post_tokens starts at 0: on the first turn everything is in
     # new_messages and counted by the estimator, so a nonzero seed here (the
