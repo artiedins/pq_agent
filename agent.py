@@ -35,30 +35,57 @@ from flowmark import reformat_file
 #                nested OpenRouter-style reasoning.effort 400s on some Go
 #                models, e.g. kimi-k2.7-code)
 
+"""
+trivia:
+16	1	deepseek/deepseek-v4-flash-0731	0.065	0.14
+43	0	deepseek/deepseek-v4-pro-0813	1.188	3.564
+53	1	google/gemini-3.7-flash:nitro	0.375	1.875
+50	1	meta/muse-spark-1.2:nitro	1.25	4.25
+47	1	openai/gpt-5.6-sol	2.5	15
+26	1	stealth/ox-alpha:nitro	0	0
+20	1	x-ai/grok-4.6	2	6
+36	0	z-ai/glm-5.3:nitro	1.4	4.4
+				
+				
+				
+				
+				
+33	0	opencode-go/deepseek-v4-flash	no temp	
+21	0	opencode-go/glm-5.3	no temp	
+39	0	opencode-go/muse-spark-1.2-contributor	no temp	
+				
+28	0	opencode-go/x-preview-f-free	zen no temp	
+41	0	opencode-go/deepseek-v4-pro	zen no temp	
+23	0	opencode-go/nemotron-3-ultra-free	zen no temp	
+41	0	opencode-go/muse-spark-1.2-contributor-free	zen no temp	
+43	0	opencode-go/gpt-5.6-sol	zen no temp	
+
+
+
+"""
 
 MODEL_REGISTRY = {
-    # OpenRouter. The routing suffix is part of the wire model string: ":exacto"
-    # by default, ":nitro" (throughput sort) for deepseek-v4-flash. "fp8" adds
-    # OpenRouter's fp8-quantization provider selector.
-    # escalation: dsv4p, gem31, go-glm53, kimi3, opus46, gem35, gpt56, fable5
-    "fable5": {"provider": "openrouter", "model": "anthropic/claude-fable-5:exacto", "max_tokens": 20000, "max_output_tokens": 100000, "score": 70},
-    "gpt56": {"provider": "openrouter", "model": "openai/gpt-5.6-sol:exacto", "max_tokens": 20000, "max_output_tokens": 100000, "score": 56},
-    "gem35": {"provider": "openrouter", "model": "google/gemini-3.5-flash:exacto", "max_tokens": 20000, "max_output_tokens": 100000, "score": 50},
-    "opus46": {"provider": "openrouter", "model": "anthropic/claude-opus-4.6:exacto", "max_tokens": 20000, "max_output_tokens": 100000, "score": 46},
-    "kimi3": {"provider": "openrouter", "model": "moonshotai/kimi-k3:exacto", "max_tokens": 20000, "max_output_tokens": 100000, "fp8": True, "score": 42},
-    "gem31": {"provider": "openrouter", "model": "google/gemini-3.1-pro-preview:exacto", "max_tokens": 20000, "max_output_tokens": 100000, "score": 69},
-    "dsv4p": {"provider": "openrouter", "model": "deepseek/deepseek-v4-pro-0813:exacto", "max_tokens": 20000, "max_output_tokens": 100000, "fp8": True, "score": 45},
-    "dsv4f": {"provider": "openrouter", "model": "deepseek/deepseek-v4-flash-0731:nitro", "max_tokens": 20000, "max_output_tokens": 100000, "fp8": True, "temperature": 0.7, "score": 25},
-    # OpenCode Go. No suffix, no fp8 selector: the gateway picks the provider and
-    # quantization itself.
-    "go-kimi3": {"provider": "opencode-go", "model": "kimi-k3", "max_tokens": 20000, "max_output_tokens": 100000, "score": 42},
-    "go-glm53": {"provider": "opencode-go", "model": "glm-5.3", "max_tokens": 20000, "max_output_tokens": 100000, "score": 40},
-    "go-dsv4p": {"provider": "opencode-go", "model": "deepseek-v4-pro", "max_tokens": 20000, "max_output_tokens": 100000, "score": 45},
-    "go-dsv4f": {"provider": "opencode-go", "model": "deepseek-v4-flash", "max_tokens": 20000, "max_output_tokens": 100000, "temperature": 0.7, "score": 25},
+    # OpenRouter
+    "gpt56": {"provider": "openrouter", "model": "openai/gpt-5.6-sol:exacto", "max_tokens": 20000, "max_output_tokens": 100000, "score": 0},
+    "gem37": {"provider": "openrouter", "model": "google/gemini-3.7-flash:exacto", "max_tokens": 20000, "max_output_tokens": 100000, "score": 75.65},
+    "grok46": {"provider": "openrouter", "model": "x-ai/grok-4.6:exacto", "max_tokens": 20000, "max_output_tokens": 100000, "score": 0},
+    "muse12": {"provider": "openrouter", "model": "meta/muse-spark-1.2:exacto", "max_tokens": 20000, "max_output_tokens": 100000, "score": 71.65},
+    "dsv4p": {"provider": "openrouter", "model": "deepseek/deepseek-v4-pro-0813:exacto", "max_tokens": 20000, "max_output_tokens": 100000, "fp8": True, "score": 0},
+    "glm53": {"provider": "openrouter", "model": "z-ai/glm-5.3:nitro", "max_tokens": 20000, "max_output_tokens": 100000, "fp8": True, "score": 58.5},
+    "dsv4f": {"provider": "openrouter", "model": "deepseek/deepseek-v4-flash-0731:nitro", "max_tokens": 20000, "max_output_tokens": 100000, "fp8": True, "temperature": 0.95, "score": 86.04},
+    # OpenCode Go
+    # muse-spark-1.2-contributor will only work with OpenAI Requests API, NOT chat completions
+    "go-muse12": {"provider": "opencode-go", "model": "muse-spark-1.2-contributor", "max_tokens": 20000, "max_output_tokens": 100000, "score": 71.65},
+    "go-dsv4p": {"provider": "opencode-go", "model": "deepseek-v4-pro", "max_tokens": 20000, "max_output_tokens": 100000, "score": 0},
+    "go-glm53": {"provider": "opencode-go", "model": "glm-5.3", "max_tokens": 20000, "max_output_tokens": 100000, "score": 58.5},
+    "go-dsv4f": {"provider": "opencode-go", "model": "deepseek-v4-flash", "max_tokens": 20000, "max_output_tokens": 100000, "temperature": 0.95, "score": 86.04},
+    "zen-muse12": {"provider": "opencode-zen", "model": "muse-spark-1.2-contributor-free", "max_tokens": 20000, "max_output_tokens": 100000, "score": 71.65},
+    "zen-oxalpha": {"provider": "opencode-zen", "model": "x-preview-f-free", "max_tokens": 20000, "max_output_tokens": 100000, "score": 71.65},
+    "zen-nemotron": {"provider": "opencode-zen", "model": "nemotron-3-ultra-free", "max_tokens": 20000, "max_output_tokens": 100000, "score": 71.65},
 }
 
 
-MODEL_ID = os.environ.get("PQ_MODEL", "go-dsv4p")
+MODEL_ID = os.environ.get("PQ_MODEL", "dsv4f")
 if MODEL_ID not in MODEL_REGISTRY:
     sys.exit("Error: unknown model '" + MODEL_ID + "'. " "Known models: " + ", ".join(sorted(MODEL_REGISTRY.keys())))
 
@@ -69,14 +96,20 @@ def _cfg(key, default=None):
 
 _PROVIDER = _cfg("provider")
 
-# Both providers auth with PQ_API_KEY (Bearer). One name so child-shell scrubbing
-# (_API_KEY suffix) and bwrap passthrough stay consistent; ops just swap which
-# provider's key is in PQ_API_KEY for the run.
+# Auth key per provider. OpenRouter and Go always need a key (PQ_API_KEY / the
+# provider's key placed in PQ_API_KEY - one name so child-shell scrubbing
+# (_API_KEY suffix) and bwrap passthrough stay consistent). OpenCode Zen also
+# reads PQ_API_KEY: paid zen models like deepseek-v4-pro need the opencode
+# go/zen key, which the user keeps in PQ_API_KEY. Free zen models serve
+# anonymously, so the key is optional (only sent when the env var is present).
+# Unlike the zen trivia benchmark (which ran both the zen model and an
+# OpenRouter judge in one script and so needed a separate ZEN_API_KEY), agent.py
+# runs one model at a time, so PQ_API_KEY is the single key slot for zen too.
 _API_KEY = os.environ.get("PQ_API_KEY")
-if not _API_KEY:
-    sys.exit("Error: PQ_API_KEY is required for model '" + MODEL_ID + "'.")
 
 if _PROVIDER == "openrouter":
+    if not _API_KEY:
+        sys.exit("Error: PQ_API_KEY is required for model '" + MODEL_ID + "' (OpenRouter).")
     _API_URL = "https://openrouter.ai/api/v1/chat/completions"
     _API_HEADERS = {
         "Authorization": "Bearer " + _API_KEY,
@@ -85,11 +118,21 @@ if _PROVIDER == "openrouter":
         "HTTP-Referer": "https://github.com/artiedins/pq_agent",
     }
 elif _PROVIDER == "opencode-go":
+    if not _API_KEY:
+        sys.exit("Error: PQ_API_KEY is required for model '" + MODEL_ID + "' (OpenCode Go).")
     _API_URL = "https://opencode.ai/zen/go/v1/chat/completions"
     _API_HEADERS = {
         "Authorization": "Bearer " + _API_KEY,
         "Content-Type": "application/json",
     }
+elif _PROVIDER == "opencode-zen":
+    _API_URL = "https://opencode.ai/zen/v1/chat/completions"
+    _API_HEADERS = {"Content-Type": "application/json"}
+    # PQ_API_KEY carries the opencode go/zen key, which paid zen models like
+    # deepseek-v4-pro require. Free zen models serve anonymously, so the key is
+    # only sent when present.
+    if _API_KEY:
+        _API_HEADERS["Authorization"] = "Bearer " + _API_KEY
 else:
     sys.exit("Error: unknown provider '" + _PROVIDER + "' for model '" + MODEL_ID + "'.")
 
@@ -174,7 +217,7 @@ MAX_REPORT_RESCUES = 8
 # Adaptive output boost: on truncation, max_tokens is doubled up to this cap. At
 # DS V4 Flash rates ($0.18/M output), 32000 reserves ~$0.006 per request through
 # OpenRouter - negligible.
-MAX_OUTPUT_BOOST = 32000
+MAX_OUTPUT_BOOST = 64000
 
 # After this many length-truncated replies, escalate the rescue message. There
 # is still no hard stop (pq_minder's wall clock is the hard limit), but the
@@ -576,6 +619,11 @@ def _repair_tool_call(tc, tc_id):
     # retry 4xx. repair the stored copy in place: the corrective tool result
     # already told the model to re-issue, so replacing the arguments with an
     # empty object loses nothing the model needs.
+    # NOTE: for Gemini 3.x this rewrite is itself a corruption vector - the
+    # thought_signature is bound to the original functionCall (name+args), so
+    # rewriting arguments in place without removing the paired reasoning_details
+    # signature block can turn a malformed call into a "Corrupted thought
+    # signature" 400 on the next request. handled reactively by _drop_current_turn.
     if not isinstance(tc, dict):
         return
     fn = tc.get("function")
@@ -672,6 +720,39 @@ def _strip_reasoning_fields(messages):
     return fixed
 
 
+def _thought_signature_notice():
+    return (
+        "[harness notice] The provider rejected the previous tool-calling turn with a "
+        "thought-signature error (Gemini requires thought signatures to be echoed back exactly "
+        "during multi-step tool calling, and the round-tripped state was rejected). The harness "
+        "dropped that turn's history so the request could be re-sent. Files on disk and NOTES.md "
+        "are intact. Re-issue any tool calls you still need, then continue."
+    )
+
+
+def _drop_current_turn(messages):
+    # Gemini thought-signature recovery. When the provider rejects a request with
+    # a "thought signature" error, the round-tripped reasoning state for the
+    # current tool-calling turn is poisoned. Gemini only validates signatures
+    # within the current turn, which is bounded by the most recent user message
+    # carrying plain text content (not a tool result). Dropping every message
+    # after that boundary removes the bad state while keeping assistant/tool
+    # pairing intact, so the next attempt starts a fresh turn. Returns the number
+    # of messages dropped; 0 when history already ends on a user message.
+    last_user = -1
+    for i in range(len(messages) - 1, -1, -1):
+        m = messages[i]
+        if isinstance(m, dict) and m.get("role") == "user" and isinstance(m.get("content"), str) and m["content"].strip():
+            last_user = i
+            break
+    if last_user < 0:
+        return 0
+    dropped = len(messages) - 1 - last_user
+    if dropped > 0:
+        del messages[last_user + 1 :]
+    return dropped
+
+
 def post_with_retry(payload):
     payload_repaired = False
     for attempt in range(9):
@@ -730,6 +811,12 @@ def post_with_retry(payload):
                             payload_repaired = True
                             print(ts() + "  [error] 400 duplicate reasoning field in history, stripped and retrying...")
                             continue
+                    if "thought signature" in body_lower or "thought_signature" in body_lower:
+                        if _drop_current_turn(msg_list) > 0:
+                            payload_repaired = True
+                            msg_list.append({"role": "user", "content": _thought_signature_notice()})
+                            print(ts() + "  [error] 400 thought-signature error, dropped poisoned turn and retrying...")
+                            continue
         resp.raise_for_status()
         # Validate the body parses as JSON before declaring success. OpenRouter
         # occasionally returns 200 OK with truncated or SSE-style bodies (we've
@@ -760,6 +847,14 @@ def post_with_retry(payload):
             # raw error message. Provider errors (5xx) and content filter
             # issues after generation are retryable.
             if isinstance(code, int) and 400 <= code < 500 and code != 429:
+                body_lower = msg.lower()
+                msg_list = payload.get("messages")
+                if attempt < 8 and not payload_repaired and isinstance(msg_list, list) and "thought signature" in body_lower:
+                    if _drop_current_turn(msg_list) > 0:
+                        payload_repaired = True
+                        msg_list.append({"role": "user", "content": _thought_signature_notice()})
+                        print(ts() + "  [error] 400 thought-signature error (code=" + str(code) + "), dropped poisoned turn and retrying...")
+                        continue
                 raise RuntimeError("API error " + str(code) + ": " + msg)
             if attempt < 8:
                 print(ts() + "  [error] response has error instead of choices (code=" + str(code) + "), retrying (attempt " + str(attempt + 1) + "/8): " + msg[:120])
@@ -824,10 +919,10 @@ def apply_reasoning(payload):
     # thinking is always "high" for every model. Kept uniform after the trivia
     # bench validated one fixed setting across the whole registry, so there is no
     # per-turn or per-model effort knob. OpenRouter wants a nested reasoning
-    # block; OpenCode Go wants top-level reasoning_effort (AI SDK shape) because
-    # nested OpenRouter-style reasoning.effort 400s on some Go models (e.g.
-    # kimi-k2.7-code). mutates payload in place.
-    if _PROVIDER == "opencode-go":
+    # block; OpenCode Go and OpenCode Zen want top-level reasoning_effort (AI
+    # SDK shape) because nested OpenRouter-style reasoning.effort 400s on some
+    # Go models (e.g. kimi-k2.7-code). mutates payload in place.
+    if _PROVIDER in ("opencode-go", "opencode-zen"):
         payload["reasoning_effort"] = "high"
     else:
         payload["reasoning"] = {"effort": "high"}
