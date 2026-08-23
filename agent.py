@@ -22,11 +22,8 @@ import socket
 import tiktoken
 from flowmark import reformat_file
 
-# max_tokens is the default per-request output budget; max_output_tokens is the
-# model's hard ceiling via the provider. MAX_OUTPUT_BOOST (32K) is the binding
-# constraint on the adaptive boost path, not max_output_tokens - raise
-# MAX_OUTPUT_BOOST if you want bigger single responses. context window size is
-# irrelevant here because compaction is hard-coded to trigger at
+# Default per-request output budget is 20K, boosted to 40K on truncation failure.
+# Context window size is irrelevant here because compaction is hard-coded to trigger at
 # MAX_CONTEXT_LENGTH (~150K), well inside every model's context.
 #
 # thinking is always "high" for every model (hardcoded in apply_reasoning):
@@ -36,35 +33,20 @@ from flowmark import reformat_file
 #                models, e.g. kimi-k2.7-code)
 
 
+# deepseek-v4-pro, grok-4.5,
+# gem37 gpt56
+
 MODEL_REGISTRY = {
-    # OpenRouter
-    "gem37": {"provider": "openrouter", "model": "google/gemini-3.7-flash:nitro", "max_tokens": 20000, "max_output_tokens": 100000, "temperature": 0.7, "score": 53},
-    "gpt56": {"provider": "openrouter", "model": "openai/gpt-5.6-sol:exacto", "max_tokens": 20000, "max_output_tokens": 100000, "score": 45},
-    "muse12": {"provider": "openrouter", "model": "meta/muse-spark-1.2:nitro", "max_tokens": 20000, "max_output_tokens": 100000, "temperature": 0.7, "score": 43},
-    "dsv4p": {"provider": "openrouter", "model": "deepseek/deepseek-v4-pro-0813:exacto", "max_tokens": 20000, "max_output_tokens": 100000, "fp8": True, "score": 42},
-    "glm53": {"provider": "openrouter", "model": "z-ai/glm-5.3:nitro", "max_tokens": 20000, "max_output_tokens": 100000, "fp8": True, "temperature": 0.7, "score": 28},
-    "oxalpha": {"provider": "openrouter", "model": "stealth/ox-alpha:nitro", "max_tokens": 20000, "max_output_tokens": 100000, "temperature": 0.7, "score": 27},
-    "dsv4f": {"provider": "openrouter", "model": "deepseek/deepseek-v4-flash-0731:exacto", "max_tokens": 20000, "max_output_tokens": 100000, "score": 25},
-    # OpenCode Go
-    "go-gem37": {"provider": "opencode-go", "model": "gemini-3.7-flash", "max_tokens": 20000, "max_output_tokens": 100000, "temperature": 0.7, "score": 53},
-    "go-gpt56": {"provider": "opencode-go", "model": "gpt-5.6-sol", "max_tokens": 20000, "max_output_tokens": 100000, "score": 45},
-    "go-muse12": {"provider": "opencode-go", "model": "muse-spark-1.2-contributor", "max_tokens": 20000, "max_output_tokens": 100000, "temperature": 0.7, "score": 43},
-    "go-dsv4p": {"provider": "opencode-go", "model": "deepseek-v4-pro", "max_tokens": 20000, "max_output_tokens": 100000, "score": 42},
-    "go-glm53": {"provider": "opencode-go", "model": "glm-5.3", "max_tokens": 20000, "max_output_tokens": 100000, "temperature": 0.7, "score": 28},
-    "go-oxalpha": {"provider": "opencode-go", "model": "ox-alpha-free", "max_tokens": 20000, "max_output_tokens": 100000, "temperature": 0.7, "score": 27},
-    "go-dsv4f": {"provider": "opencode-go", "model": "deepseek-v4-flash", "max_tokens": 20000, "max_output_tokens": 100000, "score": 25},
-    # OpenCode Zen
-    "zen-gem37": {"provider": "opencode-zen", "model": "gemini-3.7-flash", "max_tokens": 20000, "max_output_tokens": 100000, "temperature": 0.7, "score": 53},
-    "zen-gpt56": {"provider": "opencode-zen", "model": "gpt-5.6-sol", "max_tokens": 20000, "max_output_tokens": 100000, "score": 45},
-    "zen-muse12": {"provider": "opencode-zen", "model": "muse-spark-1.2-contributor-free", "max_tokens": 20000, "max_output_tokens": 100000, "temperature": 0.7, "score": 43},
-    "zen-dsv4p": {"provider": "opencode-zen", "model": "deepseek-v4-pro", "max_tokens": 20000, "max_output_tokens": 100000, "score": 42},
-    "zen-glm53": {"provider": "opencode-zen", "model": "glm-5.3", "max_tokens": 20000, "max_output_tokens": 100000, "temperature": 0.7, "score": 28},
-    "zen-oxalpha": {"provider": "opencode-zen", "model": "x-preview-f-free", "max_tokens": 20000, "max_output_tokens": 100000, "temperature": 0.7, "score": 27},
-    "zen-dsv4f": {"provider": "opencode-zen", "model": "deepseek-v4-flash-free", "max_tokens": 20000, "max_output_tokens": 100000, "score": 25},
+    "go-muse12": {"provider": "opencode-go", "model": "muse-spark-1.2-contributor"},
+    "go-muse12t": {"provider": "opencode-go", "model": "muse-spark-1.2-contributor", "temperature": 0.7},
+    "go-oxalpha": {"provider": "opencode-go", "model": "ox-alpha-free"},
+    "go-oxalphat": {"provider": "opencode-go", "model": "ox-alpha-free", "temperature": 0.7},
+    "go-dsv4f": {"provider": "opencode-go", "model": "deepseek-v4-flash"},
+    "go-dsv4ft": {"provider": "opencode-go", "model": "deepseek-v4-flash", "temperature": 0.7},
 }
 
 
-MODEL_ID = os.environ.get("PQ_MODEL", "dsv4f")
+MODEL_ID = os.environ.get("PQ_MODEL", "dsv4p")
 if MODEL_ID not in MODEL_REGISTRY:
     sys.exit("Error: unknown model '" + MODEL_ID + "'. " "Known models: " + ", ".join(sorted(MODEL_REGISTRY.keys())))
 
@@ -90,11 +72,16 @@ if _PROVIDER == "openrouter":
     if not _API_KEY:
         sys.exit("Error: PQ_API_KEY is required for model '" + MODEL_ID + "' (OpenRouter).")
     _API_URL = "https://openrouter.ai/api/v1/chat/completions"
+    # Attribution matches NousResearch/hermes-agent agent/auxiliary_client.py
+    # _OR_HEADERS_BASE / build_or_headers() (plus HermesAgent User-Agent used
+    # on other Hermes provider paths). OpenRouter dashboard reads X-Title.
     _API_HEADERS = {
         "Authorization": "Bearer " + _API_KEY,
         "Content-Type": "application/json",
-        "X-Title": "pq-agent",
-        "HTTP-Referer": "https://github.com/artiedins/pq_agent",
+        "X-Title": "Hermes Agent",
+        "HTTP-Referer": "https://hermes-agent.nousresearch.com",
+        "X-OpenRouter-Categories": "productivity,cli-agent",
+        "User-Agent": "HermesAgent/0.20.5",
     }
 elif _PROVIDER == "opencode-go":
     if not _API_KEY:
@@ -140,7 +127,7 @@ USE_GLOB_GREP_TOOLS = False
 
 # When True, dump the initial conversation payload to INITIAL_PROMPTS.md and exit
 # without sending anything to the LLM. Useful for debugging prompt construction.
-DEBUG_PROMPTS = True
+DEBUG_PROMPTS = False
 
 # Soft tool-call budget. The model is told the budget in the system prompt and
 # gets injected notices as it approaches and exceeds it. There is no hard stop;
@@ -192,11 +179,6 @@ MAX_COMMAND_RESULT_TOKENS = 9000
 # nudge it instead of exiting, up to this many times, so a forgetful final turn
 # doesn't burn an entire pq_minder attempt.
 MAX_REPORT_RESCUES = 8
-
-# Adaptive output boost: on truncation, max_tokens is doubled up to this cap. At
-# DS V4 Flash rates ($0.18/M output), 32000 reserves ~$0.006 per request through
-# OpenRouter - negligible.
-MAX_OUTPUT_BOOST = 64000
 
 # After this many length-truncated replies, escalate the rescue message. There
 # is still no hard stop (pq_minder's wall clock is the hard limit), but the
@@ -498,7 +480,7 @@ def truncate_playwright_text(text):
         + str(tail_n)
         + "): "
         + str(elided)
-        + " tokens elided from the middle of this page. Re-fetching the same URL returns this same truncated view - to reach the middle, use playwright_extract_content with a CSS selector, the site's API or raw data files, or a different source.]\n"
+        + " tokens elided from the middle of this page. Re-fetching the same URL returns this same truncated view. Use playwright_extract_content with a CSS selector, the site's API or raw data files, or a different source to reach the middle of the page.]\n"
         + tail
     )
 
@@ -531,8 +513,8 @@ def truncate_command_text(text, spill_path=None):
         # to the full value; teach query-it / don't-re-run instead of the
         # re-run guidance, which is wrong once the full output exists on disk
         guidance = (
-            "The full output is saved to " + spill_path + " (outside the workspace) - "
-            "treat this path as a handle to the full value: query it with read or "
+            "The full output is saved to " + spill_path + " (outside the workspace). "
+            "Treat this path as a handle to the full value: query it with read or "
             "bash (grep/sed/awk); do not re-run the command expecting the middle in context."
         )
     else:
@@ -905,6 +887,17 @@ def apply_reasoning(payload):
         payload["reasoning"] = {"effort": "high"}
 
 
+def apply_model_params(payload):
+    # per-model sampling/quantization settings shared by normal turns and the
+    # compaction summarization request, so compaction uses the same temperature
+    # (and fp8 quantization) as everything else. mutates payload in place.
+    if _cfg("fp8"):
+        payload["provider"] = {"quantizations": ["fp8"]}
+    temperature = _cfg("temperature")
+    if temperature is not None:
+        payload["temperature"] = temperature
+
+
 def _touched_block():
     # harness-built file lists for the post-compaction handoff: deterministic
     # and cumulative across compactions, so the fresh session re-orients even
@@ -1046,6 +1039,7 @@ def chat(messages, tools, new_messages, state, session_messages):
             "max_tokens": COMPACTION_MAX_TOKENS,
             "messages": compaction_input,
         }
+        apply_model_params(compaction_payload)
         apply_reasoning(compaction_payload)
 
         _dump_compaction_artifact(
@@ -1174,7 +1168,7 @@ def chat(messages, tools, new_messages, state, session_messages):
     messages += new_messages
     new_messages.clear()
 
-    max_tok = state.get("max_tokens_override") or _cfg("max_tokens", 16000)
+    max_tok = state.get("max_tokens_override", 20000)
     payload = {
         "model": _MODEL_STRING,
         "tools": tools,
@@ -1182,13 +1176,8 @@ def chat(messages, tools, new_messages, state, session_messages):
         "max_tokens": max_tok,
         "messages": messages,
     }
-    if _cfg("fp8"):
-        payload["provider"] = {"quantizations": ["fp8"]}
-    temperature = _cfg("temperature")
-    if temperature is not None:
-        payload["temperature"] = temperature
+    apply_model_params(payload)
     apply_reasoning(payload)
-
     if DEBUG_PROMPTS and not state.get("_debug_prompts_done"):
         state["_debug_prompts_done"] = True
         dump_path = os.path.join(WORKSPACE, "INITIAL_PROMPTS.md")
@@ -1453,7 +1442,7 @@ def safe_path(filename, write=False):
     if write:
         ws = os.path.realpath(WORKSPACE)
         if target != ws and not target.startswith(ws + os.sep):
-            raise ValueError("path '" + filename + "' resolves outside workspace - writes are restricted to the workspace directory")
+            raise ValueError("path '" + filename + "' resolves outside workspace. All writes are restricted to the workspace directory")
     return target
 
 
@@ -1566,7 +1555,7 @@ def tool_str_replace(file_path, old_string, new_string, replace_all=False):
             + ". Match must be exact including whitespace and indentation (but WITHOUT the line-number prefix from read). Use read to see the current content."
         )
     if count > 1 and not replace_all:
-        return "Error: old_string appears " + str(count) + " times in " + file_path + " - include more surrounding lines so it matches exactly once, or set replace_all to true."
+        return "Error: old_string appears " + str(count) + " times in " + file_path + ". Include more surrounding lines so it matches exactly once, or set replace_all to true."
 
     new_content = content.replace(old_string, new_string)
     try:
@@ -1785,7 +1774,7 @@ def tool_run_command(command, description="", yield_time_ms=DEFAULT_YIELD_MS, ti
         print(ts() + "  [tool call] bash: YIELDED " + handle + " | " + description)
         return (
             "[command still running after " + str(int(yield_s * 1000)) + "ms; it is now managed in the background as " + handle + ". "
-            "Continue with other work - the final output will be delivered automatically as a later notification. "
+            "Continue with other work and expect the final output to be delivered automatically as a later notification. "
             "Use process_status to inspect it or kill_process to stop it.]\n\n"
             "[partial output so far:]\n" + partial
         )
@@ -1962,7 +1951,7 @@ def tool_write_todos(todos):
         if not text:
             return "Error: each todo item needs non-empty 'content'."
         if status not in valid:
-            return "Error: invalid status '" + status + "' - must be one of " + ", ".join(valid) + "."
+            return "Error: invalid status '" + status + "'. Todo status must be one of " + ", ".join(valid) + "."
         cleaned.append((text, status))
     # hand-rolled YAML (single-quote always) keeps the harness free of a yaml
     # dependency; todo text is short and operator-facing, so quoting is enough
@@ -2041,7 +2030,7 @@ def tool_fetch_url(mcp, url):
         + str(len(text))
         + " chars saved to "
         + spill_path
-        + " (outside the workspace) - treat this path as a handle to the full value: query it with read or bash (grep/jq/sed/python); do not re-fetch the URL expecting a different in-context body.]\n"
+        + " (outside the workspace). Treat this path as a handle to the full value: query it with read or bash (grep/jq/sed/python); do not re-fetch the URL expecting a different in-context body.]\n"
     )
 
 
@@ -2150,7 +2139,7 @@ def dispatch_tool(mcp, name, arguments):
         print(ts() + "  [tool call] " + name + ": UNHANDLED ERROR " + type(e).__name__ + ": " + str(e)[:200])
         # cap the error text returned to the model: a pathological exception
         # can quote an entire page, and its message goes straight into context
-        return "Error: " + type(e).__name__ + ": " + str(e)[:500] + " - please try a different approach."
+        return "Error: " + type(e).__name__ + ": " + str(e)[:500] + ". This is an unhandled error that must be worked around and noted in the task report."
 
 
 def _dispatch_tool_inner(mcp, name, arguments):
@@ -3040,17 +3029,14 @@ def main():
 
             if finish == "length":
                 # reply was cut off by max_tokens mid-thought (or mid-tool-call).
-                # boost the output budget once (up to the cap); after that, be
+                # boost the output budget once to 40K; after that, be
                 # honest that the ceiling is reached instead of falsely claiming
                 # another increase every time. no hard stop - pq_minder's wall
                 # clock remains the hard limit - but the message escalates.
                 length_rescues += 1
                 if "max_tokens_override" not in state:
-                    base = _cfg("max_tokens", 16000)
-                    output_cap = _cfg("max_output_tokens", base)
-                    boosted = min(base * 2, MAX_OUTPUT_BOOST, output_cap)
-                    state["max_tokens_override"] = boosted
-                    print(ts() + "  [warn] reply truncated at max_tokens, boosting output to " + str(boosted))
+                    state["max_tokens_override"] = 40000
+                    print(ts() + "  [warn] reply truncated at max_tokens, boosting output to 40000")
                     budget_note = "The output budget has been increased. "
                 else:
                     print(ts() + "  [warn] reply truncated at max_tokens again (rescue " + str(length_rescues) + "), budget already boosted")
@@ -3058,8 +3044,8 @@ def main():
                 escalation = ""
                 if length_rescues > MAX_LENGTH_RESCUES:
                     escalation = (
-                        " You have now hit the output limit " + str(length_rescues) + " times - stop retrying the same oversized output. "
-                        "It will never fit. Break it up: write a short skeleton with write, then add sections one at a time with edit."
+                        " You have now hit the output limit " + str(length_rescues) + " times. stop retrying the same oversized output as it will never fit. "
+                        "Break it up: write a short skeleton with write, then add sections one at a time with edit."
                     )
                 new_messages.append(
                     {
