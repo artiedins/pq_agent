@@ -6,13 +6,19 @@
 // Dependencies: @modelcontextprotocol/sdk, playwright, zod
 // (turndown is no longer needed - ariaSnapshot replaces HTML-to-markdown)
 //
-// v2.1: added web_search (structured top-10, Brave default with DDG fallback)
-// and fetch_url (raw response body, no aria conversion). Both run in a
+// v2.1: added web_search (structured top-10) and fetch_url (raw response body,
+// no aria conversion). Both run in a
 // throwaway tab so they never clobber the shared page the model may be
 // mid-reading with playwright_extract_content. One shared CDP connection is
 // kept alive for the whole process: repeatedly connecting/disconnecting
 // Playwright clients wedged the Chrome debugger in soak tests, while tab
 // create/close on a single connection stayed stable.
+//
+// v2.2: web_search default is DuckDuckGo html; Brave is an explicit override
+// only, with its result-card selector fixed for the current layout.
+// v2.3: web_search accepts the DSH 'queries' array (1-4 strings) and fans it
+// out into concurrent searches, one result set per query. ensureBrowser is
+// promise-guarded so a concurrent fan-out shares one CDP connection.
 
 const { McpServer } = require('@modelcontextprotocol/sdk/server/mcp.js');
 const { StdioServerTransport } = require('@modelcontextprotocol/sdk/server/stdio.js');
@@ -22,29 +28,36 @@ const { z } = require('zod');
 let browser = null;
 let context = null;
 let page = null;
+// in-flight connect promise: a concurrent first use (a web_search fan-out)
+// must share one CDP connection instead of racing to open several
+let browserPromise = null;
 
 const server = new McpServer({
   name: 'playwright-chrome',
-  version: '2.1.0',
+  version: '2.3.0',
 });
 
-async function ensureBrowser() {
-  if (!browser) {
-    try {
-      browser = await chromium.connectOverCDP('http://localhost:9222');
-    } catch (err) {
-      throw new Error(
-        'Could not connect to Chrome at localhost:9222. '
-        + 'Is Chrome running with --remote-debugging-port=9222? '
-        + '(' + err.message + ')'
-      );
-    }
-    context = browser.contexts()[0];
-    const pages = context.pages();
-    page = pages.length > 0 ? pages[0] : await context.newPage();
-    console.error('Connected to existing Chrome instance');
+function ensureBrowser() {
+  if (!browserPromise) {
+    browserPromise = (async () => {
+      try {
+        browser = await chromium.connectOverCDP('http://localhost:9222');
+      } catch (err) {
+        browserPromise = null;
+        throw new Error(
+          'Could not connect to Chrome at localhost:9222. '
+          + 'Is Chrome running with --remote-debugging-port=9222? '
+          + '(' + err.message + ')'
+        );
+      }
+      context = browser.contexts()[0];
+      const pages = context.pages();
+      page = pages.length > 0 ? pages[0] : await context.newPage();
+      console.error('Connected to existing Chrome instance');
+      return page;
+    })();
   }
-  return page;
+  return browserPromise;
 }
 
 // shared helper: extract page or element content via ariaSnapshot with
@@ -135,14 +148,13 @@ server.tool(
   }
 );
 
-// in-page extractors for search result cards. measured in the round-2 engine
-// eval: Brave surfaced practitioner threads (Reddit/HN) where DDG's open-query
-// top hits were affiliate listicles, and the old ampersand DDG URL silently
-// broke site: queries, so Brave is the default and DDG proper (html/?q=) is
-// the fallback.
+// in-page extractors for search result cards. DDG html is the default: it is
+// blocker-free from this IP and has a stable, lean DOM. Brave is an explicit
+// override only (engine=brave); it currently 429s from this IP, and its card
+// selector was updated in v2.2 (the #results wrapper is gone).
 const BRAVE_EXTRACT = `(() => {
   const out = [];
-  for (const c of document.querySelectorAll('#results div.snippet[data-type="web"]')) {
+  for (const c of document.querySelectorAll('div.snippet[data-type="web"]')) {
     const a = c.querySelector('a[href^="http"]');
     if (!a) continue;
     const t = c.querySelector('.title');
@@ -173,15 +185,15 @@ const DDG_EXTRACT = `(() => {
 })()`;
 
 const ENGINES = {
-  brave: {
-    url: (q) => 'https://search.brave.com/search?q=' + encodeURIComponent(q),
-    wait: '#results div.snippet[data-type="web"]',
-    extract: BRAVE_EXTRACT,
-  },
   ddg: {
     url: (q) => 'https://html.duckduckgo.com/html/?q=' + encodeURIComponent(q),
     wait: '.result',
     extract: DDG_EXTRACT,
+  },
+  brave: {
+    url: (q) => 'https://search.brave.com/search?q=' + encodeURIComponent(q),
+    wait: 'div.snippet[data-type="web"]',
+    extract: BRAVE_EXTRACT,
   },
 };
 
@@ -196,43 +208,58 @@ async function searchOn(engineName, query) {
 
 server.tool(
   'web_search',
-  'Search the web and return a structured top-10 list of {title, url, snippet}. Brave by default, DuckDuckGo fallback.',
+  'Search the web and return a structured top-10 list of {title, url, snippet} per query. DuckDuckGo by default, Brave optional override.',
   {
-    query: z.string().describe('Plain text search query'),
-    engine: z.string().optional().describe('Optional engine override: "brave" or "ddg". Default tries brave then ddg.'),
+    query: z.string().optional().describe('Plain text search query (single search).'),
+    queries: z.array(z.string()).max(4).optional().describe('DSH form: 1-4 search query strings. Each is searched separately and returned as its own result set.'),
+    engine: z.string().optional().describe('Optional engine override: "ddg" (default) or "brave". Omit unless you have a reason.'),
   },
-  async ({ query, engine }) => {
-    const preferred = engine && ENGINES[engine] ? [engine] : [];
-    const order = preferred.concat(Object.keys(ENGINES).filter((e) => e !== preferred[0]));
-    let used = order[0];
-    let results = [];
-    for (const name of order) {
-      try {
-        results = await searchOn(name, query);
-        used = name;
-      } catch (err) {
-        console.error('search on ' + name + ' failed: ' + err.message);
-        results = [];
-      }
-      // zero results usually means a bot wall or a dead layout, not an
-      // honest empty SERP, so fall through to the next engine
-      if (results.length) break;
+  async ({ query, queries, engine }) => {
+    // ddg is the default; brave is an explicit override only and is not in the
+    // fallback chain (it 429s from this IP, and a wasted Brave load would
+    // otherwise precede every DDG search).
+    const name = engine && ENGINES[engine] ? engine : 'ddg';
+    const list = [];
+    if (Array.isArray(queries)) {
+      for (const q of queries.slice(0, 4)) list.push(String(q));
     }
-    if (!results.length) {
+    if (typeof query === 'string' && query.trim()) list.push(query);
+    if (!list.length) {
       return {
         content: [{
           type: 'text',
-          text: 'No results found for "' + query + '" on ' + order.join(' or ')
-            + ' (possible bot wall). Try rephrasing, or playwright_navigate to a known URL directly.',
+          text: 'web_search requires a plain text query or a queries array of 1-4 strings.',
         }],
       };
     }
-    const top = results.slice(0, 10);
-    const lines = top.map((r, i) =>
-      (i + 1) + '. ' + r.title + '\n   ' + r.url + (r.snippet ? '\n   ' + r.snippet : '')
-    );
-    const header = 'Search results for "' + query + '" (engine: ' + used + ', showing ' + top.length + ' of ' + results.length + '):';
-    return { content: [{ type: 'text', text: header + '\n' + lines.join('\n') }] };
+    // fan out: one search per query, each in its own throwaway tab. run them
+    // concurrently so 4 searches cost about one search of wall clock. one bad
+    // query must not lose the others, so each is isolated.
+    const settled = await Promise.all(list.map(async (q) => {
+      try {
+        return { q, results: await searchOn(name, q) };
+      } catch (err) {
+        console.error('search on ' + name + ' for "' + q + '" failed: ' + err.message);
+        return { q, results: null };
+      }
+    }));
+    const blocks = [];
+    for (const { q, results } of settled) {
+      if (results === null) {
+        blocks.push('Search results for "' + q + '" (engine: ' + name + '):\n(search failed on this engine; try rephrasing or a different query.)');
+      } else if (!results.length) {
+        blocks.push('No results found for "' + q + '" on ' + name
+          + ' (possible bot wall). Try rephrasing, or playwright_navigate to a known URL directly.');
+      } else {
+        const top = results.slice(0, 10);
+        const lines = top.map((r, i) =>
+          (i + 1) + '. ' + r.title + '\n   ' + r.url + (r.snippet ? '\n   ' + r.snippet : '')
+        );
+        const header = 'Search results for "' + q + '" (engine: ' + name + ', showing ' + top.length + ' of ' + results.length + '):';
+        blocks.push(header + '\n' + lines.join('\n'));
+      }
+    }
+    return { content: [{ type: 'text', text: blocks.join('\n\n') }] };
   }
 );
 

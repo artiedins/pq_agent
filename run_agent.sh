@@ -8,7 +8,7 @@
 # if project_dir is omitted, the current working directory is used.
 #
 # env vars the agent needs:
-#   PQ_MODEL          - which model to use (default: dsv4)
+#   PQ_MODEL          - which model to use (default: go-dsv4p)
 #   PQ_API_KEY        - API key for OpenRouter or OpenCode (go_*/zen_*); put the
 #                       provider key that matches PQ_MODEL in this one var
 #   PQ_PLAYWRIGHT     - 1 to enable web search via headed Chrome, 0 to disable

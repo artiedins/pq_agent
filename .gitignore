@@ -6,20 +6,11 @@ package-lock.json
 __pycache__/
 *.pyc
 *.pyo
-.venv/
-
-# env / secrets - use shell exports instead
-.env
 
 # agent stuff
 NOTES.md
 p.md
+project.md
 task_report/
 previous_sessions/
 
-
-# editor
-.vscode/
-.idea/
-*.swp
-*~
