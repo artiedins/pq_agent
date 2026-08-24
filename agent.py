@@ -719,15 +719,17 @@ def _drop_current_turn(messages):
 
 
 def post_with_retry(payload):
+    # regular message sends get the deepest retry budget (15 attempts): this is
+    # the only loop standing between a busy provider and a dead run.
     payload_repaired = False
-    for attempt in range(12):
+    for attempt in range(15):
         if attempt > 0:
             time.sleep(backoff_delay(attempt))
         try:
             resp = requests.post(_API_URL, headers=_API_HEADERS, json=payload, timeout=API_REQUEST_TIMEOUT)
         except requests.exceptions.Timeout:
-            if attempt < 11:
-                print(ts() + "  [error] request timed out, retrying (attempt " + str(attempt + 1) + "/11)...")
+            if attempt < 14:
+                print(ts() + "  [error] request timed out, retrying (attempt " + str(attempt + 1) + "/15)...")
                 continue
             raise
         except (requests.exceptions.ConnectionError, requests.exceptions.ChunkedEncodingError) as e:
@@ -738,14 +740,14 @@ def post_with_retry(payload):
             # lets them kill the run uncaught. transient network faults, not
             # account errors. for local models this also covers "server not
             # running yet".
-            if attempt < 11:
-                print(ts() + "  [error] connection error, retrying (attempt " + str(attempt + 1) + "/11): " + str(e)[:120])
+            if attempt < 14:
+                print(ts() + "  [error] connection error, retrying (attempt " + str(attempt + 1) + "/15): " + str(e)[:120])
                 continue
             raise
         # retry all 5xx, not just 503 - OpenRouter throws 502/520/524 regularly,
         # and local servers can 500 on edge cases
-        if (resp.status_code == 429 or resp.status_code >= 500) and attempt < 11:
-            print(ts() + "  [error] " + str(resp.status_code) + " transient error, retrying (attempt " + str(attempt + 1) + "/11)...")
+        if (resp.status_code == 429 or resp.status_code >= 500) and attempt < 14:
+            print(ts() + "  [error] " + str(resp.status_code) + " transient error, retrying (attempt " + str(attempt + 1) + "/15)...")
             continue
         if not resp.ok:
             print(ts() + "\n[error] status=" + str(resp.status_code))
@@ -762,7 +764,7 @@ def post_with_retry(payload):
             # message list, so the repair also propagates to the rest of the
             # session. if nothing was actually wrong, fall through and raise
             # like any other 4xx.
-            if resp.status_code == 400 and attempt < 11 and not payload_repaired:
+            if resp.status_code == 400 and attempt < 14 and not payload_repaired:
                 body_lower = resp.text.lower()
                 msg_list = payload.get("messages")
                 if isinstance(msg_list, list):
@@ -792,9 +794,9 @@ def post_with_retry(payload):
         try:
             data = resp.json()
         except ValueError as e:
-            if attempt < 11:
+            if attempt < 14:
                 body_preview = resp.text[:200].replace("\n", " ").strip()
-                print(ts() + "  [error] response body not valid JSON, retrying (attempt " + str(attempt + 1) + "/8): " + str(e))
+                print(ts() + "  [error] response body not valid JSON, retrying (attempt " + str(attempt + 1) + "/15): " + str(e))
                 if body_preview:
                     print("  body: " + body_preview)
                 continue
@@ -814,15 +816,15 @@ def post_with_retry(payload):
             if isinstance(code, int) and 400 <= code < 500 and code != 429:
                 body_lower = msg.lower()
                 msg_list = payload.get("messages")
-                if attempt < 11 and not payload_repaired and isinstance(msg_list, list) and "thought signature" in body_lower:
+                if attempt < 14 and not payload_repaired and isinstance(msg_list, list) and "thought signature" in body_lower:
                     if _drop_current_turn(msg_list) > 0:
                         payload_repaired = True
                         msg_list.append({"role": "user", "content": _thought_signature_notice()})
                         print(ts() + "  [error] 400 thought-signature error (code=" + str(code) + "), dropped poisoned turn and retrying...")
                         continue
                 raise RuntimeError("API error " + str(code) + ": " + msg)
-            if attempt < 11:
-                print(ts() + "  [error] response has error instead of choices (code=" + str(code) + "), retrying (attempt " + str(attempt + 1) + "/8): " + msg[:120])
+            if attempt < 14:
+                print(ts() + "  [error] response has error instead of choices (code=" + str(code) + "), retrying (attempt " + str(attempt + 1) + "/15): " + msg[:120])
                 continue
             raise RuntimeError("API error after retries: " + str(code) + ": " + msg)
         # a 200 with well-formed JSON can still be structurally unusable: an
@@ -831,8 +833,8 @@ def post_with_retry(payload):
         # treat it as transient, like the parse failures above.
         choices = data.get("choices")
         if not (isinstance(choices, list) and choices and isinstance(choices[0], dict) and isinstance(choices[0].get("message"), dict)):
-            if attempt < 11:
-                print(ts() + "  [error] response missing choices[0].message, retrying (attempt " + str(attempt + 1) + "/8)...")
+            if attempt < 14:
+                print(ts() + "  [error] response missing choices[0].message, retrying (attempt " + str(attempt + 1) + "/15)...")
                 continue
             raise RuntimeError("API response missing choices[0].message after retries")
         break
@@ -986,13 +988,15 @@ def chat(messages, tools, new_messages, state, session_messages):
         apply_reasoning(compaction_payload)
 
         summary = None
-        for comp_attempt in range(9):
+        # compaction gets 10 attempts: losing the run here loses the whole
+        # session, so it retries more than the browser but less than a normal send.
+        for comp_attempt in range(10):
             if comp_attempt > 0:
                 time.sleep(backoff_delay(comp_attempt))
             try:
                 resp_json = post_with_retry(compaction_payload).json()
             except Exception as e:
-                print(ts() + "  [warn] compaction request failed (attempt " + str(comp_attempt + 1) + "/2): " + str(e)[:200])
+                print(ts() + "  [warn] compaction request failed (attempt " + str(comp_attempt + 1) + "/10): " + str(e)[:200])
                 continue
             choice = resp_json["choices"][0]
             raw_msg = choice["message"]
@@ -1003,7 +1007,7 @@ def chat(messages, tools, new_messages, state, session_messages):
             summary = extract_compaction_summary(raw_msg)
             if summary:
                 break
-            print(ts() + "  [warn] compaction returned no usable summary (attempt " + str(comp_attempt + 1) + "/2)")
+            print(ts() + "  [warn] compaction returned no usable summary (attempt " + str(comp_attempt + 1) + "/10)")
 
         # refresh the runtime snapshot for the post-compaction session: files and
         # context changed during the run, so the opening state message is stale.
@@ -1293,19 +1297,22 @@ def call_playwright(mcp, name, arguments, cap=True):
     # garbled stream) restart the subsystem; RuntimeError tool errors from the
     # server propagate to dispatch_tool untouched, since a restart cannot fix
     # a bad selector or an unreachable URL.
-    for attempt in range(9):
+    # playwright MCP calls get the smallest retry budget (5 attempts): each
+    # attempt restarts node + Chrome, which is slow, and a failed web tool can
+    # be reported back to the model as an ordinary error it can route around.
+    for attempt in range(5):
         if attempt > 0:
             delay = backoff_delay(attempt)
-            print(ts() + "  [mcp retry " + str(attempt) + "/8] waiting " + "{:.1f}".format(delay) + "s then restarting mcp...")
+            print(ts() + "  [mcp retry " + str(attempt) + "/4] waiting " + "{:.1f}".format(delay) + "s then restarting mcp...")
             time.sleep(delay)
             try:
                 restart_mcp(mcp)
             except Exception as e:
                 # a failed restart is itself retryable - previously it raised
                 # straight out of this loop with a dead subsystem left behind
-                if attempt == 8:
+                if attempt == 4:
                     raise
-                print(ts() + "  [mcp restart failed] attempt " + str(attempt) + "/8: " + str(e)[:120])
+                print(ts() + "  [mcp restart failed] attempt " + str(attempt) + "/4: " + str(e)[:120])
                 continue
         try:
             result = mcp_call(mcp, "tools/call", {"name": name, "arguments": arguments})
@@ -1321,10 +1328,10 @@ def call_playwright(mcp, name, arguments, cap=True):
                 )
             return text
         except (TimeoutError, McpTransportError, OSError) as e:
-            if attempt == 8:
+            if attempt == 4:
                 raise
             ctx = arguments.get("url", name)
-            print(ts() + "  [mcp transport error] attempt " + str(attempt + 1) + "/9 on " + ctx[:80] + ": " + type(e).__name__ + ": " + str(e))
+            print(ts() + "  [mcp transport error] attempt " + str(attempt + 1) + "/5 on " + ctx[:80] + ": " + type(e).__name__ + ": " + str(e))
 
 
 def _note_repeat(key):
@@ -3072,7 +3079,7 @@ def make_system_prompt():
         "- The `previous_sessions/` directory (if present) holds your past task reports, renamed in chronological order. Read them for context.\n"
         "- The file `NOTES.md` is for your personal use. You decide how to use it without concern for other readers.\n"
         "\n### Tool Guide\n"
-        "- Follow tool call API conventions and formatting PRECISELY. No extra XML (<tool_call> etc.), no stray whitespace.\n"
+        "- Follow tool call API conventions and formatting PRECISELY. No extra XML (<tool_call> etc.), no stray whitespace, and no fields the schema does not accept.\n"
         "- File and directory paths may be workspace-relative (e.g. 'analysis.py', 'python_harness/agent.py') or absolute from the workspace root (e.g. '/workspace/analysis.py'). Both are accepted everywhere a path is taken; the workspace is mounted at /workspace.\n"
         "- Every file tool (write, read, edit) needs a 'file_path' argument naming the target file. Include it in the same call as the other arguments: for write, send 'file_path' with 'content', never content alone.\n"
         "- Read text files with read, not shell commands like cat. Results come with line numbers. A bare read returns at most 2000 lines; page through larger files with offset and limit.\n"
@@ -3101,18 +3108,25 @@ def make_system_prompt():
         "- Start every script with a shebang line.\n"
         "- Keep project directories neat. Keep code files neither too long nor too numerous; balance this with your best judgment.\n"
         "- Capture experiment settings (e.g. hyperparameters) in a single dataclass.\n"
-        "- Comments: use them to make reading code frictionless for experienced programmers, to record real-world effects that pure logic cannot reveal, and to document decisions so new agents or programmers do not revisit them.\n"
+        "- Comments: use them to make reading code frictionless for experienced programmers, to record real-world effects that pure logic cannot reveal, and to document decisions so new agents or programmers do not revisit them. Do not narrate obvious syntax.\n"
         "- Verification: when requested, run the real tests and quote the real observed output. Keep the check independent of the code under test (repo tests, ground truth files, a second method). Never narrow, skip, or delete tests to make a failing run pass.\n"
         "\n### Writing Guide\n"
         "Write so the user acquires knowledge quickly, and get to the point without jargon. Anything you create, code comments or task reports, should be easy to skim.\n"
-        "After writing, review your work for LLM habits. The user finds them distracting; remove them from your writing. Check and fix:\n"
+        "Write a record, not a performance. This is the standard: `Brave search hit bot walls on the exact phrase but DuckDuckGo and direct fetches worked.`\n"
+        "After writing, review your work for LLM habits. The user finds them distracting; remove them from your writing. Then reread once for factual overstatement, and once more for words that add no information. Check and fix:\n"
         "- Use commas or separate sentences, **no em dashes**\n"
         "- Use **accepted English words with variety**, uncommon words that fit the situation are fine, but do not use shorthand or chain of thought / reasoning fragments\n"
+        "- Start with the answer or observed result. Cut generic setup such as 'You asked' or 'It is important to note'.\n"
+        "- Prefer a concrete subject and verb: 'Brave hit a bot wall', not 'friction was encountered'.\n"
+        "- Keep observation, inference, and recommendation distinct. Say 'not tested' when it was not tested; never present a plausible explanation as a finding.\n"
         "- Provide options resulting in **recommendations**, not a menu of equal options\n"
         "- Use words like key or core instead of load bearing\n"
         "- Describe concepts clearly and directly, without 'conceptual personification' (e.g. 'the holiday has the rest', 'the release can land'). Use 'Changes, aligned with your decisions' instead of 'Summary of what landed, mapped to your decisions'\n"
         "- Use **concrete words** like 'test' or 'check' instead of the figurative 'smoke test'. Use spine and seam only for real spines and seams, never as metaphors.\n"
         "- Prefer direct statements like 'The position survives either outcome'. Avoid **unnecessary hyphenated phrases** like 'the wash-out scenario is survivable'.\n"
+        "- Preserve useful technical terms; replace jargon only when a plainer word is equally exact.\n"
+        "- Cut repetition, self-congratulation, and claims about the text's clarity or usefulness. Let the text show those qualities.\n"
+        "- Do not perform a persona or invent stakes. Avoid staged intimacy, defiance, wonder, and urgency; facts carry authority.\n"
         "- Edit for clarity and directness: **trim unnecessary verbosity**.\n"
         "\n### Write Task Report\n"
         "When the task is done, act as a modern Joseph Grinnell making field notes, and write `task_report/report.md` in clear, direct language. The report is your main communication with the user and your context for future sessions. Bring the user to a deep understanding quickly, and record facts that remain useful for future tasks.\n"
