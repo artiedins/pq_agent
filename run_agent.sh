@@ -2,16 +2,11 @@
 
 # run_agent.sh - launch agent.py inside a bubblewrap sandbox
 #
-# usage: bash run_agent.sh [project_dir]
-#        PQ_MODEL=glm52 PQ_PLAYWRIGHT=0 bash run_agent.sh [project_dir]
-#
-# if project_dir is omitted, the current working directory is used.
-#
 # env vars the agent needs:
-#   PQ_MODEL          - which model to use (default: go-dsv4p)
-#   PQ_API_KEY        - API key for OpenRouter or OpenCode (go_*/zen_*); put the
+#   PQ_MODEL          - which model to use (default set in agent.py)
+#   PQ_API_KEY        - API key (required) for OpenRouter or OpenCode (go_*/zen_*); put the
 #                       provider key that matches PQ_MODEL in this one var
-#   PQ_PLAYWRIGHT     - 1 to enable web search via headed Chrome, 0 to disable
+#   PQ_PLAYWRIGHT     - 1 (default) to enable web search via headed Chrome, 0 to disable
 #
 # the agent code lives here (read-only inside sandbox at /agent)
 # the project dir is where the agent reads and writes (read-write at /workspace)
