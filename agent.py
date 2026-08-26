@@ -28,21 +28,24 @@ from flowmark import reformat_file
 
 
 MODEL_REGISTRY = {
-    "or-gpt56": {"provider": "openrouter", "model": "openai/gpt-5.6-sol"},
-    "or-grok46": {"provider": "openrouter", "model": "x-ai/grok-4.6"},
+    "or-gpt56": {"provider": "openrouter", "model": "openai/gpt-5.6-sol:nitro"},
+    "or-gem37": {"provider": "openrouter", "model": "google/gemini-3.7-flash:nitro"},
+    "or-grok46": {"provider": "openrouter", "model": "x-ai/grok-4.6:nitro"},
+    "or-glm53p": {"provider": "openrouter", "model": "z-ai/glm-5.3:nitro"},
     "or-dsv4p": {"provider": "openrouter", "model": "deepseek/deepseek-v4-pro-0813:nitro"},
-    "or-gem37": {"provider": "openrouter", "model": "google/gemini-3.7-flash"},
-    "or-oxalpha": {"provider": "openrouter", "model": "stealth/ox-alpha", "temperature": 0.7},  # ox-alpha benchmarks better at 0.7
-    "or-dsv4f4": {"provider": "openrouter", "model": "deepseek/deepseek-v4-flash-0731:nitro"},
+    "or-glm53f": {"provider": "openrouter", "model": "z-ai/glm-5.3-flash:nitro", "temperature": 0.7},  # benchmarks better at 0.7
+    "or-dsv4v": {"provider": "openrouter", "model": "deepseek/deepseek-v4-flash-vision-exp:nitro", "temperature": 0.7},
+    "or-dsv4f": {"provider": "openrouter", "model": "deepseek/deepseek-v4-flash-0731:nitro", "temperature": 0.7},
     "go-grok46": {"provider": "opencode-go", "model": "grok-4.6"},
-    "go-glm53": {"provider": "opencode-go", "model": "glm-5.3"},
+    "go-glm53p": {"provider": "opencode-go", "model": "glm-5.3"},
     "go-dsv4p": {"provider": "opencode-go", "model": "deepseek-v4-pro"},
-    "go-oxalpha": {"provider": "opencode-go", "model": "ox-alpha-free", "temperature": 0.7},  # ox-alpha benchmarks better at 0.7
-    "go-dsv4f": {"provider": "opencode-go", "model": "deepseek-v4-flash"},
+    "go-glm53f": {"provider": "opencode-go", "model": "glm-5.3-flash", "temperature": 0.7},  # benchmarks better at 0.7
+    "go-dsv4v": {"provider": "opencode-go", "model": "deepseek-v4-flash-vision-exp", "temperature": 0.7},
+    "go-dsv4f": {"provider": "opencode-go", "model": "deepseek-v4-flash", "temperature": 0.7},
 }
 
 
-MODEL_ID = os.environ.get("PQ_MODEL", "go-oxalpha")
+MODEL_ID = os.environ.get("PQ_MODEL", "go-glm53f")
 if MODEL_ID not in MODEL_REGISTRY:
     sys.exit("Error: unknown model '" + MODEL_ID + "'. " "Known models: " + ", ".join(sorted(MODEL_REGISTRY.keys())))
 
