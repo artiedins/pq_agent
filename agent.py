@@ -34,6 +34,7 @@ MODEL_REGISTRY = {
     "or-gem37": {"provider": "openrouter", "model": "google/gemini-3.7-flash"},
     "or-oxalpha": {"provider": "openrouter", "model": "stealth/ox-alpha", "temperature": 0.7},  # ox-alpha benchmarks better at 0.7
     "or-dsv4f4": {"provider": "openrouter", "model": "deepseek/deepseek-v4-flash-0731:nitro"},
+    "go-grok46": {"provider": "opencode-go", "model": "grok-4.6"},
     "go-glm53": {"provider": "opencode-go", "model": "glm-5.3"},
     "go-dsv4p": {"provider": "opencode-go", "model": "deepseek-v4-pro"},
     "go-oxalpha": {"provider": "opencode-go", "model": "ox-alpha-free", "temperature": 0.7},  # ox-alpha benchmarks better at 0.7
@@ -2574,7 +2575,7 @@ def make_system_prompt():
         "- Keep working while another tool call could produce evidence or concrete progress. A context warning is advisory, and a context summary is a handoff to fresh context where work continues. Stop when the task is done or the harness sends a wrap-up notice.\n"
         "- Every mid-task response must make at least one tool call, and should usually include short but descriptive text for the user. A text-only reply tells the harness you are done. Context summaries are the one exception: they must be text-only and are required before continuing work with more tool calls.\n"
         "- The harness sends `project.md` (optional) and `p.md` (the task request) right after this prompt. Do not re-read or edit them.\n"
-        "- If `previous_sessions/` exists, read the reports relevant to the task. The largest number is the most recent report.\n"
+        "- If `previous_sessions/` exists, read the reports relevant to the task. The file with the largest number is the task report from the most recent session.\n"
         "- `NOTES.md` is working memory. Use it for findings that must survive compaction or a later session. It is yours to organize.\n"
         "\n### Tool Guide\n"
         "- Use only the tools offered in this session. If you remember tools from another harness: use `edit` or `write` instead of `apply_patch`, `bash` instead of `exec_command`, and `todo_write` instead of `update_plan`. There is no `write_stdin`; background jobs deliver output automatically, and `job_output` inspects a job on demand.\n"
@@ -2617,8 +2618,8 @@ def make_system_prompt():
         "- Start with the answer or observed result. Cut generic setup such as 'You asked' or 'It is important to note'.\n"
         "- Prefer a concrete subject and verb: 'Brave hit a bot wall', not 'friction was encountered'.\n"
         "- Keep observation, inference, and recommendation distinct. Say 'not tested' when it was not tested; never present a plausible explanation as a finding.\n"
-        "- When several options matter, compare them and recommend one.\n"
-        "- Do not personify concepts, e.g. 'the holiday has the rest' or 'the release can land'. Give every action a concrete subject and verb.\n"
+        "- When several options are possible, compare them and recommend one.\n"
+        "- Do not personify concepts, e.g. 'the holiday has the rest' or 'the release can land' (especially avoid using 'land' for things like code changes). Write most statements with a concrete subject and verb.\n"
         "- Prefer plain words: key or core, not load bearing; test or check, not smoke test; spine and seam only for anatomy.\n"
         "- Avoid unnecessary hyphenated phrases; rewrite 'the wash-out scenario is survivable' as a plain sentence with a concrete subject and verb.\n"
         "- Preserve useful technical terms; replace jargon only when a plainer word is equally exact.\n"
