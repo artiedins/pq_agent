@@ -62,20 +62,33 @@ _PROVIDER = _cfg("provider")
 # anonymously (key sent only when present).
 _API_KEY = os.environ.get("PQ_API_KEY")
 
+# Agent identity, sent as User-Agent on every request to every provider.
+# dax (opencode) publicly asked agent builders to set an honest custom user
+# agent because spoofed or missing UAs are the main fraud signal on OpenCode
+# Go/Zen (x.com/thdxr/status/2094606303393906912). We previously sent
+# "HermesAgent/0.20.5" - exactly the spoof pattern he described - so all
+# Hermes strings are gone. Format follows RFC 9110 product tokens:
+# name/version plus a comment carrying repo and contact. Plain ASCII, no
+# HTML, well under 256 chars (whatismybrowser UA best practices).
+AGENT_NAME = "pq-agent"
+AGENT_VERSION = "1.0.0"
+AGENT_REPO_URL = "https://github.com/artiedins/pq_agent"
+AGENT_CONTACT = "artiedins"
+USER_AGENT = AGENT_NAME + "/" + AGENT_VERSION + " (+" + AGENT_REPO_URL + "; contact " + AGENT_CONTACT + ")"
+
 if _PROVIDER == "openrouter":
     if not _API_KEY:
         sys.exit("Error: PQ_API_KEY is required for model '" + MODEL_ID + "' (OpenRouter).")
     _API_URL = "https://openrouter.ai/api/v1/chat/completions"
-    # Attribution matches NousResearch/hermes-agent agent/auxiliary_client.py
-    # _OR_HEADERS_BASE / build_or_headers() (plus HermesAgent User-Agent used
-    # on other Hermes provider paths). OpenRouter dashboard reads X-Title.
+    # X-Title and HTTP-Referer are what the OpenRouter dashboard shows as app
+    # attribution; both now point at this repo instead of Hermes.
     _API_HEADERS = {
         "Authorization": "Bearer " + _API_KEY,
         "Content-Type": "application/json",
-        "X-Title": "Hermes Agent",
-        "HTTP-Referer": "https://hermes-agent.nousresearch.com",
+        "X-Title": AGENT_NAME,
+        "HTTP-Referer": AGENT_REPO_URL,
         "X-OpenRouter-Categories": "productivity,cli-agent",
-        "User-Agent": "HermesAgent/0.20.5",
+        "User-Agent": USER_AGENT,
     }
 elif _PROVIDER == "opencode-go":
     if not _API_KEY:
@@ -84,10 +97,14 @@ elif _PROVIDER == "opencode-go":
     _API_HEADERS = {
         "Authorization": "Bearer " + _API_KEY,
         "Content-Type": "application/json",
+        "User-Agent": USER_AGENT,
     }
 elif _PROVIDER == "opencode-zen":
     _API_URL = "https://opencode.ai/zen/v1/chat/completions"
-    _API_HEADERS = {"Content-Type": "application/json"}
+    _API_HEADERS = {
+        "Content-Type": "application/json",
+        "User-Agent": USER_AGENT,
+    }
     if _API_KEY:
         _API_HEADERS["Authorization"] = "Bearer " + _API_KEY
 else:
