@@ -18,6 +18,7 @@ import datetime
 import platform
 import socket
 import shlex
+import uuid
 
 import tiktoken
 from flowmark import reformat_file
@@ -36,6 +37,8 @@ MODEL_REGISTRY = {
     "or-glm53f": {"provider": "openrouter", "model": "z-ai/glm-5.3-flash:nitro", "temperature": 0.7},  # benchmarks better at 0.7
     "or-dsv4v": {"provider": "openrouter", "model": "deepseek/deepseek-v4-flash-vision-exp:nitro", "temperature": 0.7},
     "or-dsv4f": {"provider": "openrouter", "model": "deepseek/deepseek-v4-flash-0731:nitro", "temperature": 0.7},
+    "go-muse13t1": {"provider": "opencode-go", "model": "muse-spark-1.3-contributor", "temperature": 1.0},
+    "go-muse13t7": {"provider": "opencode-go", "model": "muse-spark-1.3-contributor", "temperature": 0.7},
     "go-grok46": {"provider": "opencode-go", "model": "grok-4.6"},
     "go-glm53p": {"provider": "opencode-go", "model": "glm-5.3"},
     "go-dsv4p": {"provider": "opencode-go", "model": "deepseek-v4-pro"},
@@ -76,6 +79,15 @@ AGENT_REPO_URL = "https://github.com/artiedins/pq_agent"
 AGENT_CONTACT = "artiedins"
 USER_AGENT = AGENT_NAME + "/" + AGENT_VERSION + " (+" + AGENT_REPO_URL + "; contact " + AGENT_CONTACT + ")"
 
+# OpenCode requires x-opencode-session on every request: one stable ID per
+# conversation. Their gateway uses it to route a conversation's requests to one
+# backend so prompt caching works, and from 2026-09-06 requests without it may
+# error (opencode-go email 2026-09-03; thdxr: "Any stable UUID per conversation
+# works" - MiMo-Code#2317, openclaw#137165). One agent.py process is one
+# conversation, so a fresh uuid4 at startup satisfies it. PQ_SESSION_ID pins
+# the ID across restarts if a wrapper wants one conversation to span them.
+SESSION_ID = os.environ.get("PQ_SESSION_ID") or str(uuid.uuid4())
+
 if _PROVIDER == "openrouter":
     if not _API_KEY:
         sys.exit("Error: PQ_API_KEY is required for model '" + MODEL_ID + "' (OpenRouter).")
@@ -98,12 +110,14 @@ elif _PROVIDER == "opencode-go":
         "Authorization": "Bearer " + _API_KEY,
         "Content-Type": "application/json",
         "User-Agent": USER_AGENT,
+        "x-opencode-session": SESSION_ID,
     }
 elif _PROVIDER == "opencode-zen":
     _API_URL = "https://opencode.ai/zen/v1/chat/completions"
     _API_HEADERS = {
         "Content-Type": "application/json",
         "User-Agent": USER_AGENT,
+        "x-opencode-session": SESSION_ID,
     }
     if _API_KEY:
         _API_HEADERS["Authorization"] = "Bearer " + _API_KEY
