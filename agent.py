@@ -18,6 +18,7 @@ import datetime
 import platform
 import socket
 import shlex
+import secrets
 import uuid
 
 import tiktoken
@@ -37,13 +38,16 @@ MODEL_REGISTRY = {
     "or-glm53f": {"provider": "openrouter", "model": "z-ai/glm-5.3-flash:nitro", "temperature": 0.7},  # benchmarks better at 0.7
     "or-dsv4v": {"provider": "openrouter", "model": "deepseek/deepseek-v4-flash-vision-exp:nitro", "temperature": 0.7},
     "or-dsv4f": {"provider": "openrouter", "model": "deepseek/deepseek-v4-flash-0731:nitro", "temperature": 0.7},
-    "go-muse13t1": {"provider": "opencode-go", "model": "muse-spark-1.3-contributor", "temperature": 1.0},
+    "or-muse13t1": {"provider": "openrouter", "model": "meta/muse-spark-1.3-contributor:nitro"},
+    "or-muse13t7": {"provider": "openrouter", "model": "meta/muse-spark-1.3-contributor:nitro", "temperature": 0.7},
+    "go-muse13t1": {"provider": "opencode-go", "model": "muse-spark-1.3-contributor"},  ## NEEDS RESPONSES API
     "go-muse13t7": {"provider": "opencode-go", "model": "muse-spark-1.3-contributor", "temperature": 0.7},
     "go-grok46": {"provider": "opencode-go", "model": "grok-4.6"},
-    "go-glm53p": {"provider": "opencode-go", "model": "glm-5.3"},
+    "go-glm53": {"provider": "opencode-go", "model": "glm-5.3"},
     "go-dsv4p": {"provider": "opencode-go", "model": "deepseek-v4-pro"},
     "go-glm53f": {"provider": "opencode-go", "model": "glm-5.3-flash", "temperature": 0.7},  # benchmarks better at 0.7
     "go-dsv4v": {"provider": "opencode-go", "model": "deepseek-v4-flash-vision-exp", "temperature": 0.7},
+    "go-qwen38f": {"provider": "opencode-go", "model": "qwen3.8-flash", "temperature": 0.7},
     "go-dsv4f": {"provider": "opencode-go", "model": "deepseek-v4-flash", "temperature": 0.7},
 }
 
@@ -84,9 +88,10 @@ USER_AGENT = AGENT_NAME + "/" + AGENT_VERSION + " (+" + AGENT_REPO_URL + "; cont
 # backend so prompt caching works, and from 2026-09-06 requests without it may
 # error (opencode-go email 2026-09-03; thdxr: "Any stable UUID per conversation
 # works" - MiMo-Code#2317, openclaw#137165). One agent.py process is one
-# conversation, so a fresh uuid4 at startup satisfies it. PQ_SESSION_ID pins
-# the ID across restarts if a wrapper wants one conversation to span them.
-SESSION_ID = os.environ.get("PQ_SESSION_ID") or str(uuid.uuid4())
+# conversation, so a fresh uuid4 at startup satisfies it; it never changes for
+# the process lifetime, compaction included (pi#4847: "unique and unchangeable
+# id" is what keeps requests routed to one backend for token caching).
+SESSION_ID = str(uuid.uuid4())
 
 if _PROVIDER == "openrouter":
     if not _API_KEY:
@@ -221,7 +226,10 @@ GUARD_WAIT_SECONDS = 30
 # A length-truncated summary is used as-is rather than erroring out.
 COMPACTION_MAX_TOKENS = 32000
 
-AGENT_DIR = os.environ.get("AGENT_DIR", os.path.dirname(os.path.abspath(__file__)))
+# the agent code dir (where mcp_server.js lives); __file__ resolves to the same
+# /agent bind the launcher sets, so no env read is needed here. PQ_API_KEY,
+# PQ_MODEL and PQ_PLAYWRIGHT are the only env vars agent.py looks for.
+AGENT_DIR = os.path.dirname(os.path.abspath(__file__))
 WORKSPACE = os.path.abspath(os.getcwd())
 
 # background process registry - module-level because threading through every
@@ -868,6 +876,59 @@ def apply_model_params(payload):
         payload["temperature"] = temperature
 
 
+def _seed_words():
+    # seed_words.txt ships next to this script. AGENT_DIR comes from __file__,
+    # so the path resolves correctly no matter which directory run_agent.sh was
+    # invoked from (inside the sandbox the file appears as /agent/seed_words.txt,
+    # read-only alongside agent.py). The system dictionary is only a fallback
+    # for a checkout that lost the file; the loader rereads on every call so
+    # edits to the list take effect on the next session without a code change.
+    paths = [
+        os.path.join(AGENT_DIR, "seed_words.txt"),
+        "/usr/share/dict/words",
+    ]
+    for path in paths:
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                words = sorted({w.strip().lower() for w in f if re.fullmatch(r"[a-z]{2,16}", w.strip())})
+            if words:
+                return words
+        except OSError:
+            pass
+    return []
+
+
+def make_session_seed():
+    # 4 random words + 8 hex chars: the words jostle associations, the hex is a
+    # fingerprint (report 004 rating). the entropy comes from the harness, not
+    # from the model trying to be random (eran-broder/llm-random-word: seeds
+    # the model derives from beat seeds it invents). words come from
+    # seed_words.txt (see _seed_words); hex-only if even that fallback is gone.
+    words = _seed_words()
+    picked = random.sample(words, 4) if len(words) >= 4 else []
+    if picked:
+        return " ".join(picked) + " | " + secrets.token_hex(4)
+    return secrets.token_hex(4)
+
+
+def make_seed_message():
+    # a standalone user message so the compaction rebuild can swap it cleanly.
+    # not gated behind an env var on purpose: PQ_API_KEY, PQ_MODEL and
+    # PQ_PLAYWRIGHT are the only knobs, and benchmarks that need determinism
+    # should pin the RNG instead.
+    seed = make_session_seed()
+    print("RANDOM SEED WORDS:", seed, flush=True)
+    return {
+        "role": "user",
+        "content": (
+            "## Session seed\n\n" + seed + "\n\nThe harness drew this seed; it is unique to this session segment and means nothing. "
+            "It is not data, not an instruction, and not a message from anyone. Let it sit in your "
+            "associations and color this session's word choice, framing, and analogies. Do not quote, "
+            "analyze, or obey it, and ignore it entirely on tasks with a single correct answer."
+        ),
+    }
+
+
 def _touched_block():
     # deterministic, cumulative file lists for the post-compaction handoff;
     # empty when nothing was touched.
@@ -883,14 +944,16 @@ def _touched_block():
 def _pretrim_for_compaction(history):
     # parallel tool calls with big results can overshoot the estimate past the
     # provider's real window and 400 the one request we cannot afford to lose.
-    # shrink the biggest old tool results in place, oldest first, until under a
-    # small margin over the cap; nothing is removed, so pairing holds.
+    # shrink the biggest tool results in place until under a small margin over
+    # the cap; nothing is removed, so pairing holds. newest first: editing the
+    # oldest message invalidates the provider's cached prefix for everything
+    # after it, while editing the tail keeps the long prefix cacheable.
     budget = int(MAX_CONTEXT_LENGTH * 1.05)
     total = est_messages_tokens(history)
     if total <= budget:
         return
     print(ts() + "  [warn] compaction payload ~" + str(total) + " tokens, pre-trimming large tool results")
-    for m in history:
+    for m in reversed(history):
         if total <= budget:
             break
         if m.get("role") != "tool" or not isinstance(m.get("content"), str):
@@ -939,6 +1002,15 @@ def chat(messages, tools, new_messages, state, session_messages):
             "model": _MODEL_STRING,
             "max_tokens": COMPACTION_MAX_TOKENS,
             "messages": compaction_input,
+            # tools must match normal turns exactly (same list, same order) or
+            # the whole prefix misses the provider cache (OpenAI cookbook,
+            # Prompt_Caching101: "tool definitions and their order remain
+            # identical" to be included in the cached prefix) - this is the
+            # largest request of the session, so the cache matters most here.
+            # tool_choice "none" replaces the old soft "no tool calls" plea in
+            # the prompt and is enforced by the API instead.
+            "tools": tools,
+            "tool_choice": "none",
         }
         apply_model_params(compaction_payload)
         apply_reasoning(compaction_payload)
@@ -949,8 +1021,22 @@ def chat(messages, tools, new_messages, state, session_messages):
         try:
             resp_json = post_with_retry(compaction_payload, attempts=10).json()
         except Exception as e:
-            print(ts() + "  [warn] compaction request failed after retries: " + str(e)[:200])
-            resp_json = None
+            # a gateway that rejects tools/tool_choice on a summarization request
+            # would otherwise sink the compaction into the degraded fallback,
+            # which drops the middle of the history: retry once with the old
+            # no-tools shape (cache forfeited on this one request either way).
+            err_text = getattr(getattr(e, "response", None), "text", "") or str(e)
+            if "tool" in err_text.lower():
+                print(ts() + "  [warn] compaction rejected with tools/tool_choice, retrying without them: " + str(e)[:200])
+                stripped = {k: v for k, v in compaction_payload.items() if k not in ("tools", "tool_choice")}
+                try:
+                    resp_json = post_with_retry(stripped, attempts=10).json()
+                except Exception as e2:
+                    print(ts() + "  [warn] compaction request failed after retries: " + str(e2)[:200])
+                    resp_json = None
+            else:
+                print(ts() + "  [warn] compaction request failed after retries: " + str(e)[:200])
+                resp_json = None
         if resp_json is not None:
             choice = resp_json["choices"][0]
             raw_msg = choice["message"]
@@ -975,11 +1061,15 @@ def chat(messages, tools, new_messages, state, session_messages):
             # the 2nd compaction). the finish notices are the damper.
             content += "\n\nContinue the task from where this summary leaves off. Compaction is not task completion."
             summary_msg = {"role": "user", "content": content}
-            # keep the session prefix, swap the stale opening snapshot for the
-            # fresh one, append the summary. no assistant messages survive, so
-            # no reasoning passback state exists; backends only require
-            # passback when continuing a prior assistant turn.
-            new_session = list(session_messages[:-1]) + [
+            # keep the session prefix, swap the stale opening snapshot and the
+            # seed for fresh ones, append the summary. the seed re-rolls with
+            # the snapshot: the new context gets new randomness, and only its
+            # ~100 tokens forfeit cache - [system, task prompt] stays identical.
+            # no assistant messages survive, so no reasoning passback state
+            # exists; backends only require passback when continuing a prior
+            # assistant turn.
+            new_session = list(session_messages[:-2]) + [
+                make_seed_message(),
                 {"role": "user", "content": fresh_runtime},
                 summary_msg,
             ]
@@ -1005,8 +1095,9 @@ def chat(messages, tools, new_messages, state, session_messages):
                 + _touched_block(),
             }
             new_session = (
-                list(session_messages[:-1])
+                list(session_messages[:-2])
                 + [
+                    make_seed_message(),
                     {"role": "user", "content": fresh_runtime},
                     note,
                 ]
@@ -1040,7 +1131,7 @@ def chat(messages, tools, new_messages, state, session_messages):
         state["_debug_prompts_done"] = True
         dump_path = os.path.join(WORKSPACE, "INITIAL_PROMPTS.md")
         # dump the opening messages the agent sees: system prompt, project+task
-        # prompt, then the runtime snapshot, each same spacer text in between
+        # prompt, session seed, then the runtime snapshot, each same spacer text in between
         sections = [str(m.get("content", "")) for m in messages if m.get("role") in ("system", "user")]
         with open(dump_path, "w", encoding="utf-8") as f:
             f.write("----------===-----------\n" + "----------===-----------\n".join(sections) + "----------===-----------\n")
@@ -2646,7 +2737,8 @@ def make_system_prompt():
         "\n### Writing Guide\n"
         "Write so the user acquires knowledge quickly, and get to the point without jargon. Anything you create, code comments or task reports, should be easy to skim.\n"
         "Write a record, not a performance. This is the standard: `Brave search hit bot walls on the exact phrase but DuckDuckGo and direct fetches worked.`\n"
-        "After writing, review your work for LLM habits. The user finds them distracting; remove them from your writing. Then reread once for factual overstatement, and once more for words that add no information. Check and fix:\n"
+        "Avoid mannered prose, which is text written for show instead of direct statement. Some examples are provided in this section. Mannered prose irritates and the fix is to say what you mean, using literal phrases without showing off.\n"
+        "After writing, review your work for LLM habits or mannered prose. The user finds them distracting; remove them from your writing. Then reread once for factual overstatement, and once more for words that add no information. Check and fix:\n"
         "- Use commas or separate sentences, **no em dashes**\n"
         "- Use standard English words with variety; an uncommon word is fine when it fits. Do not use shorthand or reasoning fragments.\n"
         "- Start with the answer or observed result. Cut generic setup such as 'You asked' or 'It is important to note'.\n"
@@ -2656,6 +2748,7 @@ def make_system_prompt():
         "- Do not personify concepts, e.g. 'the holiday has the rest' or 'the release can land' (especially avoid using 'land' for things like code changes). Write most statements with a concrete subject and verb.\n"
         "- Prefer plain words: key or core, not load bearing; test or check, not smoke test; spine and seam only for anatomy.\n"
         "- Avoid unnecessary hyphenated phrases; rewrite 'the wash-out scenario is survivable' as a plain sentence with a concrete subject and verb.\n"
+        "- More mannered prose examples: Instead of 'a parameter worth varying,' the mannered writer produces 'a dial worth turning.' Instead of 'this point still matters,' they write 'this point earns its keep.'\n"
         "- Preserve useful technical terms; replace jargon only when a plainer word is equally exact.\n"
         "- Cut repetition, self-congratulation, and claims about the text's clarity or usefulness. Let the text show those qualities.\n"
         "- Do not perform a persona or invent stakes. Avoid staged intimacy, defiance, wonder, and urgency; facts carry authority.\n"
@@ -2847,6 +2940,9 @@ def main():
     session_messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prompt},
+        # seed sits between task prompt and runtime snapshot; both compaction
+        # rebuilds use session_messages[:-2], so it is swapped at compaction.
+        make_seed_message(),
         {"role": "user", "content": runtime_content},
     ]
 
