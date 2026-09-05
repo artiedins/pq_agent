@@ -2280,9 +2280,12 @@ def _normalize_web_search_args(arguments):
 def tool_search_web(mcp, queries, engine=None):
     # backend: mcp_server.js web_search, DDG html by default with optional
     # Brave override, structured top-10 per query; a 'queries' array fans out
-    # concurrently. (the old navigate-and-dump version failed site: queries and
+    # staggered. Empty/failed ddg answers get one automatic Brave retry in the
+    # backend. (the old navigate-and-dump version failed site: queries and
     # returned ~60 regions of DDG chrome per search.)
-    notice = _note_repeat("search:" + "|".join(queries))
+    # dedupe key includes the engine: a retry on a different engine is a new
+    # fetch, not a repeat.
+    notice = _note_repeat("search:" + str(engine or "ddg") + ":" + "|".join(queries))
     args = {"queries": queries}
     if engine:
         args["engine"] = engine

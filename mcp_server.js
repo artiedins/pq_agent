@@ -19,6 +19,14 @@
 // v2.3: web_search accepts the DSH 'queries' array (1-4 strings) and fans it
 // out into concurrent searches, one result set per query. ensureBrowser is
 // promise-guarded so a concurrent fan-out shares one CDP connection.
+// v2.4: empty/failed ddg answers get exactly one Brave retry (DDG html
+// intermittently serves an HTTP 202 bot-challenge page with zero results;
+// Brave has been reliable from this IP since 2026-09-05). The fan-out is
+// staggered 400ms per query - same-instant bursts raise the 202 rate.
+// playwright_extract_content no longer errors when a selector matches
+// several elements; it snapshots each match (capped) instead.
+// withTab no longer can hang forever: plain tab.close() stalls on tabs
+// stuck on chrome-error pages, so it is raced and forced via CDP.
 
 const { McpServer } = require('@modelcontextprotocol/sdk/server/mcp.js');
 const { StdioServerTransport } = require('@modelcontextprotocol/sdk/server/stdio.js');
@@ -34,7 +42,7 @@ let browserPromise = null;
 
 const server = new McpServer({
   name: 'playwright-chrome',
-  version: '2.3.0',
+  version: '2.4.0',
 });
 
 function ensureBrowser() {
@@ -102,13 +110,34 @@ async function navigatePage(p, url) {
 
 // run fn on a fresh throwaway tab. search/fetch get their own tab so they do
 // not navigate the shared page away from whatever the model was reading.
+async function closeTab(tab) {
+  // plain tab.close() hangs FOREVER on a tab stuck on a chrome-error page
+  // after failed navigations (seen 2026-09-05: ERR_UNSAFE_PORT double goto,
+  // reproducible; a later goto('about:blank') does not unstick it). Race a
+  // short close, then force it via CDP Target.closeTarget, which is instant.
+  const winner = await Promise.race([
+    tab.close().then(() => 'closed').catch(() => 'error'),
+    sleep(3000).then(() => 'timeout'),
+  ]);
+  if (winner === 'timeout') {
+    try {
+      const cdp = await tab.context().newCDPSession(tab);
+      const info = await cdp.send('Target.getTargetInfo');
+      await cdp.send('Target.closeTarget', { targetId: info.targetInfo.targetId });
+      await cdp.detach().catch(() => {});
+    } catch (err) {
+      console.error('forced tab close failed: ' + err.message);
+    }
+  }
+}
+
 async function withTab(fn) {
   await ensureBrowser();
   const tab = await context.newPage();
   try {
     return await fn(tab);
   } finally {
-    await tab.close().catch(() => {});
+    await closeTab(tab);
   }
 }
 
@@ -145,16 +174,39 @@ server.tool(
       return { content: [{ type: 'text', text }] };
     }
     const element = p.locator(selector);
-    await element.waitFor({ state: 'visible', timeout: 5000 }).catch(() => {});
-    const text = await extractContent(element, selector);
-    return { content: [{ type: 'text', text }] };
+    await element.first().waitFor({ state: 'visible', timeout: 5000 }).catch(() => {});
+    // strict-mode softening: a multi-match selector used to raise a strict
+    // mode violation. Snapshot each match instead (capped) so e.g. selector
+    // 'table' dumps every table on the page; 0 matches is a clean message,
+    // not a 30s timeout burn.
+    const count = await element.count();
+    if (count === 0) {
+      return { content: [{ type: 'text', text: "No elements match selector '" + selector + "' on the current page (final URL: " + p.url() + ")." }] };
+    }
+    if (count === 1) {
+      const text = await extractContent(element.first(), selector);
+      return { content: [{ type: 'text', text }] };
+    }
+    const MAX_MATCHES = 5;
+    const shown = Math.min(count, MAX_MATCHES);
+    const parts = [];
+    for (let i = 0; i < shown; i++) {
+      parts.push('=== ' + selector + ' match ' + (i + 1) + ' of ' + count + ' ===\n'
+        + await extractContent(element.nth(i), selector + '[' + i + ']'));
+    }
+    const tail = count > shown
+      ? '(' + selector + ' matched ' + count + ' elements; showing the first ' + shown + ' - use a more specific selector for the rest.)'
+      : '(' + selector + ' matched ' + count + ' elements; all shown.)';
+    return { content: [{ type: 'text', text: parts.join('\n\n') + '\n\n' + tail }] };
   }
 );
 
 // in-page extractors for search result cards. DDG html is the default: it is
-// blocker-free from this IP and has a stable, lean DOM. Brave is an explicit
-// override only (engine=brave); it currently 429s from this IP, and its card
-// selector was updated in v2.2 (the #results wrapper is gone).
+// blocker-free from this IP (robots.txt allows it) and has a stable, lean
+// DOM. Brave is an explicit override (engine=brave) AND the automatic
+// fallback for empty ddg answers; it has been reliable from this IP
+// (2026-09-05; the old "it 429s" note was stale). Its card selector was
+// fixed for the current layout in v2.2 (the #results wrapper is gone).
 const BRAVE_EXTRACT = `(() => {
   const out = [];
   for (const c of document.querySelectorAll('div.snippet[data-type="web"]')) {
@@ -209,6 +261,51 @@ async function searchOn(engineName, query) {
   });
 }
 
+// stagger between fan-out queries: firing all searches in the same instant
+// raised the rate of DDG's HTTP 202 bot-challenge pages; a 400ms skew keeps
+// most of the wall-clock saving of a concurrent fan-out.
+const SEARCH_STAGGER_MS = 400;
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// one query on the primary engine; an empty OR failed ddg answer gets exactly
+// one brave retry before giving up. DDG html intermittently serves an HTTP 202
+// anomaly page with zero results; the retry self-heals that without surfacing
+// an error to the model. An explicit engine=brave request is respected as-is.
+async function searchWithFallback(name, q) {
+  let results = null;
+  let primaryFailed = false;
+  try {
+    results = await searchOn(name, q);
+  } catch (err) {
+    primaryFailed = true;
+    console.error('search on ' + name + ' for "' + q + '" failed: ' + err.message);
+  }
+  if (name !== 'ddg' || (results && results.length)) {
+    return { results, engineUsed: name, note: '' };
+  }
+  let fb = null;
+  let fbFailed = false;
+  try {
+    fb = await searchOn('brave', q);
+  } catch (err) {
+    fbFailed = true;
+    console.error('brave fallback for "' + q + '" failed: ' + err.message);
+  }
+  if (fb && fb.length) {
+    const why = primaryFailed ? 'fell back after ddg error' : 'fell back from empty ddg';
+    return { results: fb, engineUsed: 'brave', note: ', ' + why };
+  }
+  // both engines errored -> real failure; otherwise report the empty result
+  // (a ddg bot wall usually looks like an empty page, not a thrown error)
+  if (results === null && fbFailed) {
+    return { results: null, engineUsed: name, note: '' };
+  }
+  if (fb !== null && !fb.length) {
+    console.error('brave fallback for "' + q + '" also returned no results');
+  }
+  return { results: [], engineUsed: name, note: '' };
+}
+
 server.tool(
   'web_search',
   'Search the web and return a structured top-10 list of {title, url, snippet} per query. DuckDuckGo by default, Brave optional override.',
@@ -218,9 +315,8 @@ server.tool(
     engine: z.string().optional().describe('Optional engine override: "ddg" (default) or "brave". Omit unless you have a reason.'),
   },
   async ({ query, queries, engine }) => {
-    // ddg is the default; brave is an explicit override only and is not in the
-    // fallback chain (it 429s from this IP, and a wasted Brave load would
-    // otherwise precede every DDG search).
+    // ddg is the default; brave is an explicit override and the automatic
+    // fallback for empty ddg answers (see searchWithFallback).
     const name = engine && ENGINES[engine] ? engine : 'ddg';
     const list = [];
     if (Array.isArray(queries)) {
@@ -235,19 +331,16 @@ server.tool(
         }],
       };
     }
-    // fan out: one search per query, each in its own throwaway tab. run them
-    // concurrently so 4 searches cost about one search of wall clock. one bad
-    // query must not lose the others, so each is isolated.
-    const settled = await Promise.all(list.map(async (q) => {
-      try {
-        return { q, results: await searchOn(name, q) };
-      } catch (err) {
-        console.error('search on ' + name + ' for "' + q + '" failed: ' + err.message);
-        return { q, results: null };
-      }
+    // fan out: one search per query, each in its own throwaway tab, staggered
+    // by SEARCH_STAGGER_MS so 4 searches cost about one search of wall clock
+    // without burst-firing them. one bad query must not lose the others, so
+    // each is isolated.
+    const settled = await Promise.all(list.map(async (q, i) => {
+      await sleep(i * SEARCH_STAGGER_MS);
+      return { q, ...(await searchWithFallback(name, q)) };
     }));
     const blocks = [];
-    for (const { q, results } of settled) {
+    for (const { q, results, engineUsed, note } of settled) {
       if (results === null) {
         blocks.push('Search results for "' + q + '" (engine: ' + name + '):\n(search failed on this engine; try rephrasing or a different query.)');
       } else if (!results.length) {
@@ -258,7 +351,7 @@ server.tool(
         const lines = top.map((r, i) =>
           (i + 1) + '. ' + r.title + '\n   ' + r.url + (r.snippet ? '\n   ' + r.snippet : '')
         );
-        const header = 'Search results for "' + q + '" (engine: ' + name + ', showing ' + top.length + ' of ' + results.length + '):';
+        const header = 'Search results for "' + q + '" (engine: ' + engineUsed + note + ', showing ' + top.length + ' of ' + results.length + '):';
         blocks.push(header + '\n' + lines.join('\n'));
       }
     }
