@@ -20,7 +20,9 @@ import socket
 import shlex
 import secrets
 import uuid
-
+import copy
+import math
+from email.utils import parsedate_to_datetime
 import tiktoken
 from flowmark import reformat_file
 
@@ -30,35 +32,21 @@ from flowmark import reformat_file
 
 
 MODEL_REGISTRY = {
-    "or-gpt56": {"provider": "openrouter", "model": "openai/gpt-5.6-sol:nitro"},
-    "or-gem37": {"provider": "openrouter", "model": "google/gemini-3.7-flash:nitro"},
-    "or-grok46": {"provider": "openrouter", "model": "x-ai/grok-4.6:nitro"},
-    "or-glm53p": {"provider": "openrouter", "model": "z-ai/glm-5.3:nitro"},
-    "or-dsv4p": {"provider": "openrouter", "model": "deepseek/deepseek-v4-pro-0813:nitro"},
-    "or-glm53f": {"provider": "openrouter", "model": "z-ai/glm-5.3-flash:nitro", "temperature": 0.7},  # benchmarks better at 0.7
-    "or-dsv4v": {"provider": "openrouter", "model": "deepseek/deepseek-v4-flash-vision-exp:nitro", "temperature": 0.7},
-    "or-dsv4f": {"provider": "openrouter", "model": "deepseek/deepseek-v4-flash-0731:nitro", "temperature": 0.7},
-    "or-muse13t1": {"provider": "openrouter", "model": "meta/muse-spark-1.3-contributor:nitro"},
-    "or-muse13t7": {"provider": "openrouter", "model": "meta/muse-spark-1.3-contributor:nitro", "temperature": 0.7},
-    "go-muse13t1": {"provider": "opencode-go", "model": "muse-spark-1.3-contributor"},  ## NEEDS RESPONSES API
-    "go-muse13t7": {"provider": "opencode-go", "model": "muse-spark-1.3-contributor", "temperature": 0.7},
-    "go-grok46": {"provider": "opencode-go", "model": "grok-4.6"},
+    "or-gem38": {"provider": "openrouter", "model": "google/gemini-3.8-flash"},
+    "or-grok46": {"provider": "openrouter", "model": "x-ai/grok-4.6"},
     "go-glm53": {"provider": "opencode-go", "model": "glm-5.3"},
-    "go-dsv4p": {"provider": "opencode-go", "model": "deepseek-v4-pro"},
-    "go-glm53f": {"provider": "opencode-go", "model": "glm-5.3-flash", "temperature": 0.7},  # benchmarks better at 0.7
-    "go-dsv4v": {"provider": "opencode-go", "model": "deepseek-v4-flash-vision-exp", "temperature": 0.7},
-    "go-qwen38f": {"provider": "opencode-go", "model": "qwen3.8-flash", "temperature": 0.7},
     "go-dsv4f": {"provider": "opencode-go", "model": "deepseek-v4-flash", "temperature": 0.7},
+    "go-omen": {"provider": "opencode-go", "model": "omen-alpha"},
 }
 
 
-MODEL_ID = os.environ.get("PQ_MODEL", "go-glm53f")
+MODEL_ID = os.environ.get("PQ_MODEL", "go-omen")
 if MODEL_ID not in MODEL_REGISTRY:
     sys.exit("Error: unknown model '" + MODEL_ID + "'. " "Known models: " + ", ".join(sorted(MODEL_REGISTRY.keys())))
 
 
 def _cfg(key, default=None):
-    return MODEL_REGISTRY[MODEL_ID].get(key, default)
+    return MODEL_REGISTRY.get(MODEL_ID, {}).get(key, default)
 
 
 _PROVIDER = _cfg("provider")
@@ -93,41 +81,33 @@ USER_AGENT = AGENT_NAME + "/" + AGENT_VERSION + " (+" + AGENT_REPO_URL + "; cont
 # id" is what keeps requests routed to one backend for token caching).
 SESSION_ID = str(uuid.uuid4())
 
-if _PROVIDER == "openrouter":
-    if not _API_KEY:
-        sys.exit("Error: PQ_API_KEY is required for model '" + MODEL_ID + "' (OpenRouter).")
-    _API_URL = "https://openrouter.ai/api/v1/chat/completions"
-    # X-Title and HTTP-Referer are what the OpenRouter dashboard shows as app
-    # attribution; both now point at this repo instead of Hermes.
-    _API_HEADERS = {
-        "Authorization": "Bearer " + _API_KEY,
-        "Content-Type": "application/json",
-        "X-Title": AGENT_NAME,
-        "HTTP-Referer": AGENT_REPO_URL,
-        "X-OpenRouter-Categories": "productivity,cli-agent",
-        "User-Agent": USER_AGENT,
+_API_URL = None
+_API_HEADERS = {}
+
+
+def configure_api():
+    # Validate at startup, not import, so local tools can be checked without a key.
+    global _API_URL, _API_HEADERS
+    if MODEL_ID not in MODEL_REGISTRY:
+        sys.exit("Error: unknown model '" + MODEL_ID + "'. Known models: " + ", ".join(sorted(MODEL_REGISTRY)))
+    urls = {
+        "openrouter": "https://openrouter.ai/api/v1/chat/completions",
+        "opencode-go": "https://opencode.ai/zen/go/v1/chat/completions",
+        "opencode-zen": "https://opencode.ai/zen/v1/chat/completions",
     }
-elif _PROVIDER == "opencode-go":
-    if not _API_KEY:
-        sys.exit("Error: PQ_API_KEY is required for model '" + MODEL_ID + "' (OpenCode Go).")
-    _API_URL = "https://opencode.ai/zen/go/v1/chat/completions"
-    _API_HEADERS = {
-        "Authorization": "Bearer " + _API_KEY,
-        "Content-Type": "application/json",
-        "User-Agent": USER_AGENT,
-        "x-opencode-session": SESSION_ID,
-    }
-elif _PROVIDER == "opencode-zen":
-    _API_URL = "https://opencode.ai/zen/v1/chat/completions"
-    _API_HEADERS = {
-        "Content-Type": "application/json",
-        "User-Agent": USER_AGENT,
-        "x-opencode-session": SESSION_ID,
-    }
+    if _PROVIDER not in urls:
+        sys.exit("Error: unknown provider '" + str(_PROVIDER) + "' for model '" + MODEL_ID + "'.")
+    if not _API_KEY and _PROVIDER != "opencode-zen":
+        sys.exit("Error: PQ_API_KEY is required for model '" + MODEL_ID + "' (" + _PROVIDER + ").")
+    _API_URL = urls[_PROVIDER]
+    _API_HEADERS = {"Content-Type": "application/json", "User-Agent": USER_AGENT}
     if _API_KEY:
         _API_HEADERS["Authorization"] = "Bearer " + _API_KEY
-else:
-    sys.exit("Error: unknown provider '" + _PROVIDER + "' for model '" + MODEL_ID + "'.")
+    if _PROVIDER == "openrouter":
+        _API_HEADERS.update({"X-Title": AGENT_NAME, "HTTP-Referer": AGENT_REPO_URL, "X-OpenRouter-Categories": "productivity,cli-agent"})
+    else:
+        _API_HEADERS["x-opencode-session"] = SESSION_ID
+
 
 _MODEL_STRING = str(_cfg("model"))
 
@@ -208,12 +188,13 @@ MAX_ERROR_RESCUES = 2
 # Timeout for API requests to the model server. Thinking models can take well
 # over 60s to first token on long prompts. Set generously to avoid killing
 # in-flight computation on retry.
-API_REQUEST_TIMEOUT = 300
+API_REQUEST_TIMEOUT = 900
+API_RETRY_BUDGET_SECONDS = 1800
+MAX_BACKOFF_SECONDS = 60
 
-# bash semantics: foreground wait up to yield_time_ms (default 10s, max 300s),
-# then managed background with auto-delivered output. timeoutMs is a hard kill
-# deadline in both phases; DEFAULT_TIMEOUT_MS applies when omitted.
-DEFAULT_YIELD_MS = 10000
+# bash waits up to 30s, then yields to managed background execution. Its 600s
+# default deadline covers both phases; immediate background jobs have no default.
+DEFAULT_YIELD_MS = 30000
 MAX_YIELD_MS = 300000
 DEFAULT_TIMEOUT_MS = 600000
 
@@ -263,10 +244,13 @@ _SECRET_SUFFIXES = ("_API_KEY", "_TOKEN", "_SECRET", "_PASSWORD")
 # this estimator. the estimator covers only the new_prompt_tokens delta, the
 # first turn, and the no-usage fallback. a model-matched tokenizer would need
 # heavy `transformers` and per-model downloads, not worth the marginal gain.
-_enc = tiktoken.get_encoding("cl100k_base")
+_enc = None
 
 
 def _tok(text):
+    global _enc
+    if _enc is None:
+        _enc = tiktoken.get_encoding("cl100k_base")
     # untrusted text can contain literal special-token strings like
     # <|endoftext|>; we measure length, not build prompts, so tiktoken's
     # special-token check is disabled at every encode site. (a Qwen model card
@@ -562,8 +546,40 @@ def est_messages_tokens(messages):
 
 
 def backoff_delay(attempt):
-    # shared exponential backoff with jitter: attempt 1 -> [1,2)s, 2 -> [2,4)s, etc.
-    return random.uniform(2 ** (attempt - 1), 2**attempt)
+    upper = min(MAX_BACKOFF_SECONDS, 2 ** min(attempt, 16))
+    return random.uniform(upper / 2, upper)
+
+
+def retry_after_seconds(headers):
+    value = headers.get("Retry-After")
+    if value is None:
+        return 0
+    try:
+        delay = float(value)
+    except (ValueError, TypeError):
+        try:
+            delay = parsedate_to_datetime(value).timestamp() - time.time()
+        except (ValueError, TypeError, OverflowError):
+            return 0
+    return max(0, delay) if math.isfinite(delay) else 0
+
+
+def record_usage(data, state):
+    if state is None:
+        return
+    state["api_responses"] = state.get("api_responses", 0) + 1
+    usage = data.get("usage")
+    if not isinstance(usage, dict):
+        return
+    details = usage.get("prompt_tokens_details")
+    cached = details.get("cached_tokens") if isinstance(details, dict) else None
+    fields = {"prompt_tokens_total": usage.get("prompt_tokens"), "completion_tokens_total": usage.get("completion_tokens"), "cached_tokens_total": cached, "cost_usd": usage.get("cost")}
+    for key, value in fields.items():
+        valid = type(value) in (int, float) if key == "cost_usd" else type(value) is int
+        if valid and value >= 0 and math.isfinite(value):
+            state[key] = state.get(key, 0) + value
+            state[key + "_responses"] = state.get(key + "_responses", 0) + 1
+    print(ts() + "  [usage] prompt=" + str(usage.get("prompt_tokens")) + " completion=" + str(usage.get("completion_tokens")) + " cached=" + str(cached) + " cost=" + str(usage.get("cost")))
 
 
 def _repair_tool_call(tc, tc_id):
@@ -670,7 +686,8 @@ def _thought_signature_notice():
         "thought-signature error (Gemini requires thought signatures to be echoed back exactly "
         "during multi-step tool calling, and the round-tripped state was rejected). The harness "
         "dropped that turn's history so the request could be re-sent. Files on disk and NOTES.md "
-        "are intact. Re-issue any tool calls you still need, then continue."
+        "are intact. Tool effects were not undone. Inspect files, job_list, and outputs before "
+        "re-issuing a call that may already have executed, especially one with external side effects."
     )
 
 
@@ -704,16 +721,27 @@ def _drop_current_turn(messages):
     return dropped
 
 
-def post_with_retry(payload, attempts=15):
-    # regular message sends get the deepest retry budget (15 attempts): this is
-    # the only loop standing between a busy provider and a dead run. compaction
-    # calls with a smaller budget (10) so one event costs bounded requests.
+def post_with_retry(payload, attempts=15, state=None):
+    if attempts < 1:
+        raise ValueError("attempts must be positive")
+    deadline = time.monotonic() + API_RETRY_BUDGET_SECONDS
     payload_repaired = False
+    retry_after = 0
     for attempt in range(attempts):
         if attempt > 0:
-            time.sleep(backoff_delay(attempt))
+            delay = max(backoff_delay(attempt), retry_after)
+            # Do not retry earlier than the server asked or sleep beyond our budget.
+            if delay >= deadline - time.monotonic():
+                raise TimeoutError("API retry budget exhausted before next attempt")
+            print(ts() + "  [retry] waiting {:.1f}s before attempt {}".format(delay, attempt + 1))
+            time.sleep(delay)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("API retry budget exhausted")
+        retry_after = 0
+        request_start = time.monotonic()
         try:
-            resp = requests.post(_API_URL, headers=_API_HEADERS, json=payload, timeout=API_REQUEST_TIMEOUT)
+            resp = requests.post(_API_URL, headers=_API_HEADERS, json=payload, timeout=min(API_REQUEST_TIMEOUT, remaining))
         except requests.exceptions.Timeout:
             if attempt < attempts - 1:
                 print(ts() + "  [error] request timed out, retrying (attempt " + str(attempt + 1) + "/" + str(attempts) + ")...")
@@ -728,9 +756,15 @@ def post_with_retry(payload, attempts=15):
                 print(ts() + "  [error] connection error, retrying (attempt " + str(attempt + 1) + "/" + str(attempts) + "): " + str(e)[:120])
                 continue
             raise
-        # retry all 5xx, not just 503 - OpenRouter throws 502/520/524 regularly,
-        # and local servers can 500 on edge cases
+        finally:
+            elapsed = time.monotonic() - request_start
+            if state is not None:
+                state["api_attempts"] = state.get("api_attempts", 0) + 1
+                state["api_seconds"] = state.get("api_seconds", 0) + elapsed
+            print(ts() + "  [request] attempt=" + str(attempt + 1) + " elapsed={:.1f}s".format(elapsed))
+        # Retry transient failures, not account or authentication errors.
         if (resp.status_code == 429 or resp.status_code >= 500) and attempt < attempts - 1:
+            retry_after = retry_after_seconds(resp.headers)
             print(ts() + "  [error] " + str(resp.status_code) + " transient error, retrying (attempt " + str(attempt + 1) + "/" + str(attempts) + ")...")
             continue
         if not resp.ok:
@@ -778,13 +812,22 @@ def post_with_retry(payload, attempts=15):
                     print("  body: " + body_preview)
                 continue
             raise
+        if not isinstance(data, dict):
+            if attempt < attempts - 1:
+                continue
+            raise RuntimeError("API response must be a JSON object")
+        record_usage(data, state)
         # 200 OK with an error body instead of choices: provider failures,
         # moderation, transient upstream errors. permanent errors (auth,
         # billing) arrive non-200 and raise above.
         if "choices" not in data and "error" in data:
             err = data["error"]
-            code = err.get("code", 0)
-            msg = err.get("message", "unknown error")
+            code = err.get("code", 0) if isinstance(err, dict) else 0
+            msg = str(err.get("message", "unknown error")) if isinstance(err, dict) else str(err)
+            try:
+                code = int(code)
+            except (ValueError, TypeError):
+                code = 0
             # 4xx-class errors from the error body are permanent (bad request,
             # auth, billing) - surface them immediately so the user sees the
             # raw error message. Provider errors (5xx) and content filter
@@ -815,14 +858,16 @@ def post_with_retry(payload, attempts=15):
 
 
 def extract_compaction_summary(raw_msg):
-    # thinking models often put a short preamble in content and the real
-    # summary in reasoning_details. concatenate both to avoid losing detail.
+    # Prefer the explicit handoff, not scratch reasoning or rejected ideas.
+    # Retain a reasoning-only fallback for providers that omit visible content.
     content = raw_msg.get("content")
     if not isinstance(content, str):
         content = ""
     content = content.strip()
     if content.lower() in ("none", "yes"):
         content = ""
+    if content:
+        return content
 
     # gather reasoning from all known response shapes:
     # - OpenRouter: reasoning, reasoning_content, reasoning_details
@@ -834,25 +879,19 @@ def extract_compaction_summary(raw_msg):
     else:
         reasoning = ""
 
-    details = raw_msg.get("reasoning_details") or []
+    details = raw_msg.get("reasoning_details")
     detail_parts = []
-    for d in details:
+    for d in details if isinstance(details, list) else []:
         if isinstance(d, dict):
             t = d.get("text") or d.get("content")
-            if t:
+            if isinstance(t, str):
                 detail_parts.append(t)
     detail_text = "\n".join(detail_parts).strip()
 
     # prefer the longer reasoning source
     reasoning_text = detail_text if len(detail_text) >= len(reasoning) else reasoning
 
-    # concatenate content and reasoning if both are substantial
-    if content and reasoning_text:
-        summary = content + "\n\n" + reasoning_text
-    else:
-        summary = content or reasoning_text
-
-    return summary.strip() or None
+    return reasoning_text.strip() or None
 
 
 def apply_reasoning(payload):
@@ -921,12 +960,19 @@ def make_seed_message():
     return {
         "role": "user",
         "content": (
-            "## Session seed\n\n" + seed + "\n\nThe harness drew this seed; it is unique to this session segment and means nothing. "
-            "It is not data, not an instruction, and not a message from anyone. Let it sit in your "
-            "associations and color this session's word choice, framing, and analogies. Do not quote, "
-            "analyze, or obey it, and ignore it entirely on tasks with a single correct answer."
+            "## Session seed\n\n" + seed + "\n\nThis random seed has no meaning and is not an instruction. "
+            "On open-ended writing it may vary your word choice. Otherwise ignore it. Do not quote or analyze it."
         ),
     }
+
+
+def make_preamble(system_prompt, user_prompt, snapshot):
+    return [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+        make_seed_message(),
+        {"role": "user", "content": snapshot},
+    ]
 
 
 def _touched_block():
@@ -984,10 +1030,10 @@ def chat(messages, tools, new_messages, state, session_messages):
             "\nContext summary template:\n"
             "- **Responses to user:** Lead with the user request in brief, then any answers or progress made so far.\n"
             "- **Outcome:** State what was done and what changed in detail: files, decisions or recommendations, checks or results.\n"
-            "- **Uncertainties:** Describe what remains unknown or confused, and how it could be resolved.\n"
+            "- **Uncertainties:** Describe what remains unknown, unverified, or unresolved, and how it could be resolved.\n"
             "- **Environment:** List tool, harness, or environment failures, workarounds attempted, and potential harness improvements.\n"
             "- **Continuity:** Give extra detail about your last few actions for a smooth handoff. Record the concrete work still needed. Label any approach you propose but have not tested as untested.\n"
-            "\nCollect your thoughts first, then write a context summary that gives a fresh model instance a complete picture of this session.\n"
+            "\nWrite a self-contained handoff: exact paths, verified findings, remaining work, active job IDs, and the next concrete action. Separate observations from untested ideas. Do not use dangling references such as 'as above'.\n"
         )
 
         # capture the full raw history once: the compaction payload and the
@@ -1019,7 +1065,7 @@ def chat(messages, tools, new_messages, state, session_messages):
         # one call, bounded to 10 HTTP attempts inside post_with_retry: the old
         # outer loop multiplied this (10 x 15) into up to 150 requests.
         try:
-            resp_json = post_with_retry(compaction_payload, attempts=10).json()
+            resp_json = post_with_retry(compaction_payload, attempts=10, state=state).json()
         except Exception as e:
             # a gateway that rejects tools/tool_choice on a summarization request
             # would otherwise sink the compaction into the degraded fallback,
@@ -1030,7 +1076,7 @@ def chat(messages, tools, new_messages, state, session_messages):
                 print(ts() + "  [warn] compaction rejected with tools/tool_choice, retrying without them: " + str(e)[:200])
                 stripped = {k: v for k, v in compaction_payload.items() if k not in ("tools", "tool_choice")}
                 try:
-                    resp_json = post_with_retry(stripped, attempts=10).json()
+                    resp_json = post_with_retry(stripped, attempts=10, state=state).json()
                 except Exception as e2:
                     print(ts() + "  [warn] compaction request failed after retries: " + str(e2)[:200])
                     resp_json = None
@@ -1068,11 +1114,7 @@ def chat(messages, tools, new_messages, state, session_messages):
             # no assistant messages survive, so no reasoning passback state
             # exists; backends only require passback when continuing a prior
             # assistant turn.
-            new_session = list(session_messages[:-2]) + [
-                make_seed_message(),
-                {"role": "user", "content": fresh_runtime},
-                summary_msg,
-            ]
+            new_session = make_preamble(session_messages[0]["content"], session_messages[1]["content"], fresh_runtime) + [summary_msg]
         else:
             # degraded fallback: keep the session preamble plus a contiguous
             # recent tail of raw messages - losing the middle beats losing the
@@ -1094,15 +1136,7 @@ def chat(messages, tools, new_messages, state, session_messages):
                 "content": "[context compacted] Automatic summarization failed; older messages were dropped and only recent raw messages follow. Re-read NOTES.md and files on disk to recover earlier findings before continuing."
                 + _touched_block(),
             }
-            new_session = (
-                list(session_messages[:-2])
-                + [
-                    make_seed_message(),
-                    {"role": "user", "content": fresh_runtime},
-                    note,
-                ]
-                + full_history[start:]
-            )
+            new_session = make_preamble(session_messages[0]["content"], session_messages[1]["content"], fresh_runtime) + [note] + full_history[start:]
 
         messages.clear()
         messages += new_session
@@ -1143,7 +1177,7 @@ def chat(messages, tools, new_messages, state, session_messages):
         print("=" * 70)
         sys.exit("DEBUG_PROMPTS mode: prompts dumped to INITIAL_PROMPTS.md, exiting without sending to LLM.")
 
-    data = post_with_retry(payload).json()
+    data = post_with_retry(payload, state=state).json()
 
     # providers can omit usage or send null; a zero here would disarm
     # compaction, so fall back to the local estimate of the full list until a
@@ -1151,7 +1185,8 @@ def chat(messages, tools, new_messages, state, session_messages):
     # carried stub counts (observed: 26.4k reported for a ~106k prompt).
     est = est_messages_tokens(messages)
     finish = data["choices"][0].get("finish_reason")
-    usage = data.get("usage") or {}
+    usage = data.get("usage")
+    usage = usage if isinstance(usage, dict) else {}
     reported = usage.get("prompt_tokens")
     if finish == "error":
         if isinstance(reported, int) and reported > 0:
@@ -1274,19 +1309,29 @@ def _spawn_mcp():
     )
     time.sleep(1)
     if proc.poll() is not None:
+        proc.wait()
+        proc.stdin.close()
+        proc.stdout.close()
         raise RuntimeError("MCP server exited immediately with code " + str(proc.returncode))
     return proc
 
 
 def start_mcp():
+    proc = None
     try:
         proc = _spawn_mcp()
-    except RuntimeError as e:
-        sys.exit(str(e))
-    mcp = {"proc": proc, "id": 0}
-    _start_reader(mcp)
-    _mcp_handshake(mcp)
-    return mcp
+        mcp = {"proc": proc, "id": 0}
+        _start_reader(mcp)
+        _mcp_handshake(mcp)
+        return mcp
+    except Exception as exc:
+        if proc is not None:
+            proc.kill()
+            proc.wait()
+            proc.stdin.close()
+            proc.stdout.close()
+        print(ts() + "  [warn] browser tools unavailable; continuing file/shell-only: " + str(exc))
+        return None
 
 
 def restart_mcp(mcp):
@@ -1334,6 +1379,8 @@ def call_playwright(mcp, name, arguments, cap=True):
         try:
             result = mcp_call(mcp, "tools/call", {"name": name, "arguments": arguments})
             text = "\n".join(b["text"] for b in result.get("content", []) if b.get("type") == "text")
+            if result.get("isError"):
+                raise RuntimeError("Browser tool failed: " + text[:1000])
             if cap:
                 text = truncate_playwright_text(text)
             if attempt > 0:
@@ -1378,31 +1425,42 @@ def safe_path(filename, write=False):
         ws = os.path.realpath(WORKSPACE)
         if target != ws and not target.startswith(ws + os.sep):
             raise ValueError("path '" + filename + "' resolves outside workspace. All writes are restricted to the workspace directory")
+        reserved = {os.path.realpath(os.path.join(WORKSPACE, "task_report", name)) for name in ("last_run.log", "stats.yaml", "todos.yaml")}
+        if target in reserved:
+            raise ValueError("this file is harness-maintained; use todo_write for the task list")
     return target
+
+
+def atomic_write_text(target, content):
+    # Same-directory replacement leaves the old file intact if writing fails.
+    # Preserve executable bits on existing scripts. safe_path resolves symlinks.
+    parent = os.path.dirname(target)
+    os.makedirs(parent, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=".pq-write-", dir=parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
+        if os.path.isfile(target):
+            shutil.copymode(target, temporary)
+        os.replace(temporary, target)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
 
 
 # file tool implementations
 
 
 def tool_write_file(file_path, content):
-    # enforce task_report/ restrictions: if writing into task_report/, only md/jpg/png allowed
-    norm = file_path.replace("\\", "/")
-    if norm.startswith("task_report/") or norm.startswith("./task_report/"):
-        ext = os.path.splitext(file_path)[1].lower()
-        if ext not in (".md", ".jpg", ".jpeg", ".png"):
-            return "Error: task_report/ only accepts .md, .jpg, and .png files. Got: " + ext
-
     try:
         target = safe_path(file_path, write=True)
     except ValueError as e:
         return "Error: " + str(e)
 
     try:
-        parent = os.path.dirname(target)
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-        with open(target, "w", encoding="utf-8") as f:
-            f.write(content)
+        atomic_write_text(target, content)
     except (IsADirectoryError, PermissionError, OSError) as e:
         return "Error writing file '" + file_path + "': " + str(e)
 
@@ -1421,9 +1479,9 @@ def tool_read_file(file_path, offset=None, limit=None):
         return "Error: file not found: " + file_path
 
     try:
-        with open(target, "r", encoding="utf-8", errors="replace") as f:
+        with open(target, "r", encoding="utf-8", newline="") as f:
             content = f.read()
-    except (PermissionError, OSError) as e:
+    except (OSError, UnicodeError) as e:
         return "Error reading file '" + file_path + "': " + str(e)
 
     lines = content.splitlines()
@@ -1452,7 +1510,7 @@ def tool_read_file(file_path, offset=None, limit=None):
     print(ts() + "  [tool call] read: " + rel + range_tag + " (" + str(len(lines)) + " lines)")
     # plain numbered lines (cat -n style). The number+tab prefix is for reference
     # only; edit matches against the line text without it.
-    numbered = "\n".join("{:>5}\t{}".format(i, l.rstrip()) for i, l in enumerate(lines, first_num))
+    numbered = "\n".join("{:>5}\t{}".format(i, l) for i, l in enumerate(lines, first_num))
     last_num = first_num + len(lines) - 1
     if last_num < total_lines:
         numbered += "\n(Showing lines " + str(first_num) + "-" + str(last_num) + " of " + str(total_lines) + ". Use offset=" + str(last_num + 1) + " to continue.)"
@@ -1463,6 +1521,8 @@ def tool_read_file(file_path, offset=None, limit=None):
 
 
 def tool_str_replace(file_path, old_string, new_string, replace_all=False):
+    if not old_string:
+        return "Error: old_string must not be empty. Use write to replace the whole file."
     try:
         target = safe_path(file_path, write=True)
     except ValueError as e:
@@ -1474,9 +1534,9 @@ def tool_str_replace(file_path, old_string, new_string, replace_all=False):
         return "Error: file not found: " + file_path + " - use write to create it first"
 
     try:
-        with open(target, "r", encoding="utf-8", errors="replace") as f:
+        with open(target, "r", encoding="utf-8", newline="") as f:
             content = f.read()
-    except (PermissionError, OSError) as e:
+    except (OSError, UnicodeError) as e:
         return "Error reading file '" + file_path + "': " + str(e)
 
     count = content.count(old_string)
@@ -1491,8 +1551,7 @@ def tool_str_replace(file_path, old_string, new_string, replace_all=False):
 
     new_content = content.replace(old_string, new_string)
     try:
-        with open(target, "w", encoding="utf-8") as f:
-            f.write(new_content)
+        atomic_write_text(target, new_content)
     except (PermissionError, OSError) as e:
         return "Error writing file '" + file_path + "': " + str(e)
 
@@ -1604,7 +1663,7 @@ def _collect_background_deliveries():
             + str(rc)
             + " after "
             + str(elapsed)
-            + "s. Last 256 KiB per stream:\n"
+            + "s. Output tail (up to 256 KiB per stream):\n"
             + body
         )
         if len(notices) >= 3:
@@ -1822,9 +1881,8 @@ def _check_self_kill_command(command, _depth=0):
             continue
         options = tokens[1:]
         full = any(opt == "--full" or (opt.startswith("-") and not opt.startswith("--") and "f" in opt[1:]) for opt in options)
-        # Preserve the existing conservative check for pgrep -f. Process-name
-        # pgrep is only dangerous when its output participates in a kill.
-        if full or has_kill:
+        # Read-only process listings cannot signal the harness.
+        if has_kill:
             targets.append(("f" if full else "pkill", operands[-1].rstrip(")")))
     # grep patterns only matter when the pipeline ends in a kill
     if re.search(r"\bkill\b|\bxargs\b", command):
@@ -1931,6 +1989,7 @@ def tool_run_command(command, description="", yield_time_ms=DEFAULT_YIELD_MS, ti
     proc = subprocess.Popen(
         command,
         shell=True,
+        executable="/bin/bash",
         cwd=cwd,
         stdout=out_f,
         stderr=err_f,
@@ -2023,6 +2082,7 @@ def tool_start_process(command, description="", workdir=None, timeout_s=None):
     proc = subprocess.Popen(
         command,
         shell=True,
+        executable="/bin/bash",
         cwd=cwd,
         stdout=out_f,
         stderr=err_f,
@@ -2420,7 +2480,7 @@ def make_tools():
                 "function": {
                     "name": "playwright_navigate",
                     "strict": True,
-                    "description": "Navigate the browser to a URL and return the page content as markdown. Use for known URLs (e.g. links found in search results). For searches use the web_search tool instead. Long pages are truncated head+tail; re-fetching the same URL returns the same truncated content. Consider using a selector, the site's API, or another source instead of re-fetching.",
+                    "description": "Navigate the browser to a URL and return an accessibility snapshot (roles and text), with a labeled plain-text fallback. Use for known URLs (e.g. links found in search results). For searches use the web_search tool instead. Long pages are truncated head+tail; re-fetching the same URL returns the same truncated content. Consider using a selector, the site's API, or another source instead of re-fetching.",
                     "parameters": {
                         "type": "object",
                         "properties": {"url": {"type": "string"}},
@@ -2435,7 +2495,7 @@ def make_tools():
                 "type": "function",
                 "function": {
                     "name": "playwright_extract_content",
-                    "description": "Extract the current browser page as clean markdown.",
+                    "description": "Extract an accessibility snapshot (roles and text) of the current page or selected element, with a labeled plain-text fallback.",
                     "parameters": {
                         "type": "object",
                         "properties": {
@@ -2535,7 +2595,7 @@ def make_tools():
             "type": "function",
             "function": {
                 "name": "bash",
-                "description": "Run a shell command. By default it waits up to 10s in the foreground; a command still running after that stays managed in the background and its final output is delivered automatically as a later notification (no polling needed). For a slow build or test, pass a larger yield_time_ms (up to 300000) to wait on it in this one call. timeoutMs is an optional hard kill deadline; usually omit it. Pass a short description (3-8 words, base-form verb) when the command's purpose is not obvious from its text; it is optional and auto-derived from the command if omitted. For multi-line scripts, write them to a file with write and run the file instead of piping code through heredocs. Each call runs in a fresh shell; pass workdir instead of using cd.",
+                "description": "Run a shell command. Commands run in /bin/bash. By default it waits up to 30s in the foreground; a command still running after that stays managed in the background and its final output is delivered automatically as a later notification (no polling needed). For a slow build or test, pass a larger yield_time_ms (up to 300000) to wait on it in this one call. timeoutMs is an optional hard kill deadline; usually omit it. Pass a short description (3-8 words, base-form verb) when the command's purpose is not obvious from its text; it is optional and auto-derived from the command if omitted. For multi-line scripts, write them to a file with write and run the file instead of piping code through heredocs. Each call runs in a fresh shell; pass workdir instead of using cd.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -2543,11 +2603,11 @@ def make_tools():
                         "description": {"type": "string", "description": "3-8 words, base-form verb, e.g. 'run pytest unit tests'. Optional; auto-derived from the command if omitted."},
                         "yield_time_ms": {
                             "type": "integer",
-                            "description": "Milliseconds to wait before returning output. Default 10000, max 300000. Set high (e.g. 120000) to wait for a slow build/test in one call.",
+                            "description": "Milliseconds to wait before returning output. Default 30000, max 300000. Set high (e.g. 120000) to wait for a slow build/test in one call.",
                         },
                         "timeoutMs": {
                             "type": "integer",
-                            "description": "Optional hard kill deadline in milliseconds; usually omit. Not how long to wait - a command still running after the yield keeps running in the background.",
+                            "description": "Hard kill deadline in milliseconds, covering foreground and yielded phases. Omitted: 600000 (10 minutes), or no limit when run_in_background is true. This is not the foreground wait limit.",
                         },
                         "workdir": {
                             "type": "string",
@@ -2680,7 +2740,7 @@ def make_system_prompt():
         web_block = (
             "\nWeb research:\n"
             "- Use web_search for every web search. Pass one plain-text 'query', or a 'queries' array of up to 4 strings; each string is searched separately and returns its own top-10 list of titles, URLs, and snippets. Cite the URLs you rely on as markdown links.\n"
-            "- The headed, stateful Chrome behind playwright returns pages as markdown. Prefer it over command-line curl or wget unless absolutely necessary.\n"
+            "- The headed, stateful Chrome behind playwright returns accessibility snapshots (roles and text), with a labeled plain-text fallback. Prefer it over command-line curl or wget unless absolutely necessary.\n"
             "- Use playwright_navigate to open a known URL and playwright_extract_content to read the current page.\n"
             "- Use web_fetch for APIs and machine-readable data (JSON/CSV/text). It returns the raw body; oversized bodies are saved to a temp file and you get the path. Prefer site APIs over HTML for walled gardens: append '.json?limit=200&depth=5&raw_json=1' to a Reddit thread URL, use 'https://hn.algolia.com/api/v1/search?query=...' for Hacker News.\n"
             "- Long pages are truncated head+tail. Re-fetching the same URL returns the identical truncated view; use a CSS selector, the site's API or raw data, or another source instead.\n"
@@ -2699,35 +2759,40 @@ def make_system_prompt():
         "\n## Agent Guide\n"
         "- Keep working while another tool call could produce evidence or concrete progress. A context warning is advisory, and a context summary is a handoff to fresh context where work continues. Stop when the task is done or the harness sends a wrap-up notice.\n"
         "- Every mid-task response must make at least one tool call, and should usually include short but descriptive text for the user. A text-only reply tells the harness you are done. Context summaries are the one exception: they must be text-only and are required before continuing work with more tool calls.\n"
-        "- The harness sends `project.md` (optional) and `p.md` (the task request) right after this prompt. Do not re-read or edit them.\n"
-        "- If `previous_sessions/` exists, read the reports relevant to the task. The file with the largest number is the task report from the most recent session.\n"
+        "- The harness sends `project.md` (optional) and `p.md` (the task request) as the initial prompt right after this prompt. Do not re-read or edit them.\n"
+        "- If `previous_sessions/` exists, read the reports relevant to the task. The largest numbered `_run/` directory is the latest archived run, including failed runs without a report. Read reports there to resolve relative artifact links; numbered `_report.md` paths also support older archives.\n"
+        "- The task request must be inferred from the initial prompt, any `previous_sessions/` reports, and the workspace. There is no way to ask the user mid-run, but uncertainties can be noted in the task report.\n"
         "- `NOTES.md` is working memory. Use it for findings that must survive compaction or a later session. It is yours to organize.\n"
         "\n### Tool Guide\n"
-        "- Use only the tools offered in this session. If you remember tools from another harness: use `edit` or `write` instead of `apply_patch`, `bash` instead of `exec_command`, and `todo_write` instead of `update_plan`. There is no `write_stdin`; background jobs deliver output automatically, and `job_output` inspects a job on demand.\n"
+        "- Use only the tools offered in this session.\n"
         "- Use the exact tool names and JSON fields in the supplied schemas. Do not wrap tool calls in XML such as <tool_call>, and do not send fields the schema does not list.\n"
         "- File and directory paths may be workspace-relative (e.g. 'analysis.py', 'python_harness/agent.py') or absolute from the workspace root (e.g. '/workspace/analysis.py'). Both are accepted everywhere a path is taken; the workspace is mounted at /workspace.\n"
         "- Every file tool (write, read, edit) needs a 'file_path' argument naming the target file. Include it in the same call as the other arguments: for write, send 'file_path' with 'content', never content alone.\n"
         "- Read text files with read, not shell commands like cat. Results come with line numbers. A bare read returns at most 2000 lines; page through larger files with offset and limit.\n"
+        "- For large code files, first find definitions or the relevant symbol with grep -n, then use read for those ranges.\n"
         "- Use write to create files or replace contents wholesale. Use edit for targeted changes to an existing file, and read the file first.\n"
         "- Use edit to replace literal text. By default old_string must appear exactly once. If it appears several times, widen the surrounding context or set replace_all to true.\n"
         "- Check the [exit code: N] marker on every bash result, and investigate failures before moving on. Each bash call runs in a fresh shell, so no state (cwd, variables, functions) persists between calls. Pass workdir instead of using cd.\n"
         "- For slow builds or tests, pass a larger yield_time_ms (up to 300000) so one bash call waits for it to finish. timeoutMs is an optional hard kill deadline. Pass a short description (3-8 words, base-form verb) when the command's purpose is not obvious from its text. For multi-line scripts, write them to a file with write and run the file instead of piping heredocs.\n"
         "- Track every background job you start. You are notified when a job finishes, so do not busy-poll or sleep on one. Keep working on independent steps and do not duplicate a running job's work. Use job_list to see job ids and states, job_output to inspect one, and job_kill to stop it.\n"
-        "- Use tools for all file operations and commands. Never print file contents in a reply.\n"
-        "- Keep single writes under the output token budget (hundreds of lines of code at most, less for prose). For a large file, write a skeleton first, then grow it with edit. A write cut off by the output limit wastes the turn.\n"
+        "- Use tools to create files and execute commands; a reply does not write a file. Short excerpts are fine when they support an explanation, but do not dump entire files into replies.\n"
+        "- The normal reply ceiling is 20,000 output tokens, shared by reasoning and visible output where the provider counts both. A truncation rescue can raise it to 40,000. Leave room for reasoning and tool-call JSON. As a rough guide, 20,000 tokens is about 600 lines of code or 2,500 words of prose: one write of that size is fine, and split a file into a skeleton plus edits only beyond it.\n"
         "- todo_write is available and entirely optional. Use it at the start of multi-step work when you want an operator-visible plan; skip it for trivial tasks.\n"
         "- The harness process runs as `python3 /agent/agent.py` in the same PID namespace as your shell. It refuses to run kill-all commands (`kill -9 -1`) and any kill, pkill, killall, or grep|xargs kill whose target matches `python`, `python3`, `agent`, or `agent.py`, since killing the harness ends the run instantly and silently. Kill by exact PID instead: for processes you started through harness tools, use job_kill with its job id (job-N); for anything else, use `pgrep -f <unique-token>` to list candidates, then `kill -9 <pid>`.\n"
         "- Separately, avoid `pkill -f` or `killall -f` with a pattern that also appears in your own command text: `pkill -f` matches full command lines, including its own, so the kill can match itself. Prefer exact PIDs.\n"
         "- Do not background long-running commands with `&` inside a bash call: the harness cannot track such processes (no watchdog, no job id for job_kill, no auto-delivered completion). Use start_process, or run_in_background=True on bash, so the harness tracks and can stop it.\n"
+        "- If you remember tools from another harness: use `edit` or `write` instead of `apply_patch`, `bash` instead of `exec_command`, and `todo_write` instead of `update_plan`. There is no `write_stdin`; background jobs deliver output automatically, and `job_output` inspects a job on demand.\n"
         + web_block
         + "\nError recovery: if a tool returns an error, read the error message and retry with corrected arguments. A returned error is a normal tool result, not a crash.\n"
         "\nResource budget: you have a soft budget of approximately "
         + str(MAX_STEPS_SUGGESTION)
-        + " tool calls. A status line showing context fill, tool call count, compaction count, and any live background processes is appended to tool results each turn. Use it to pace yourself.\n"
+        + " tool calls. A status line showing context fill, tool call count, compaction count, and any live background processes is appended to tool results each turn. Use it to pace yourself. ctx is the percent of the "
+        + str(MAX_CONTEXT_LENGTH)
+        + "-token compaction threshold, not the model's maximum window.\n"
         "\n### Coding Guide\n"
         "Write R&D Python, and if you use another language, apply these rules in spirit.\n"
         "Fit the code to the task with experienced judgment. You support a small team of AI/ML researchers: the code does not need to meet production standards, but it must be readable and easy to use or extend.\n"
-        "- Python: no type hints, no docstrings, no triple-quoted multiline strings, no decorative section dividers, no banner comments. End scripts with an `if __name__ == '__main__':` block that only calls `main()`.\n"
+        "- Python: no function type hints (dataclass field annotations are fine), no docstrings, no triple-quoted multiline strings, no decorative section dividers, no banner comments. End scripts with an `if __name__ == '__main__':` block that only calls `main()`.\n"
         "- No command line arguments or argument processing unless the user explicitly asks for them, and even then keep them minimal and the processing simple.\n"
         "- Start every script with a shebang line.\n"
         "- Keep project directories neat. Keep code files neither too long nor too numerous; balance this with your best judgment.\n"
@@ -2737,6 +2802,7 @@ def make_system_prompt():
         "\n### Writing Guide\n"
         "Write so the user acquires knowledge quickly, and get to the point without jargon. Anything you create, code comments or task reports, should be easy to skim.\n"
         "Write a record, not a performance. This is the standard: `Brave search hit bot walls on the exact phrase but DuckDuckGo and direct fetches worked.`\n"
+        "Test each sentence: does it name a thing that did something, and could the reader act on it or check it? If not, cut or rewrite it.\n"
         "Avoid mannered prose, which is text written for show instead of direct statement. Some examples are provided in this section. Mannered prose irritates and the fix is to say what you mean, using literal phrases without showing off.\n"
         "After writing, review your work for LLM habits or mannered prose. The user finds them distracting; remove them from your writing. Then reread once for factual overstatement, and once more for words that add no information. Check and fix:\n"
         "- Use commas or separate sentences, **no em dashes**\n"
@@ -2745,7 +2811,7 @@ def make_system_prompt():
         "- Prefer a concrete subject and verb: 'Brave hit a bot wall', not 'friction was encountered'.\n"
         "- Keep observation, inference, and recommendation distinct. Say 'not tested' when it was not tested; never present a plausible explanation as a finding.\n"
         "- When several options are possible, compare them and recommend one.\n"
-        "- Do not personify concepts, e.g. 'the holiday has the rest' or 'the release can land' (especially avoid using 'land' for things like code changes). Write most statements with a concrete subject and verb.\n"
+        "- Do not personify concepts, e.g. 'the holiday has the rest', 'the code decides', or 'the release can land' (especially avoid using 'land' for things like code changes). Write most statements with a concrete subject and verb.\n"
         "- Prefer plain words: key or core, not load bearing; test or check, not smoke test; spine and seam only for anatomy.\n"
         "- Avoid unnecessary hyphenated phrases; rewrite 'the wash-out scenario is survivable' as a plain sentence with a concrete subject and verb.\n"
         "- More mannered prose examples: Instead of 'a parameter worth varying,' the mannered writer produces 'a dial worth turning.' Instead of 'this point still matters,' they write 'this point earns its keep.'\n"
@@ -2754,9 +2820,10 @@ def make_system_prompt():
         "- Do not perform a persona or invent stakes. Avoid staged intimacy, defiance, wonder, and urgency; facts carry authority.\n"
         "- Edit for clarity and directness: **trim unnecessary verbosity**.\n"
         "\n### Write Task Report\n"
-        "When the task is done, act as a modern Joseph Grinnell making field notes, and write `task_report/report.md` in clear, direct language. The report is your main communication with the user and your context for future sessions. Bring the user to a deep understanding quickly, and record facts that remain useful for future tasks. Use markdown formatting driven by your good design judgment to make reading the rendered report effortless.\n"
+        "When the task is done, use Joseph Grinnell's field-note standard: specific observations, kept separate from interpretation, written so a stranger can use them decades later. Write `task_report/report.md` in clear, direct language. The report is your main communication with the user and your context for future sessions. Bring the user to a deep understanding quickly, and record facts that remain useful for future tasks. Use markdown formatting driven by your good design judgment to make reading the rendered report effortless.\n"
         "Task report template:\n"
         "- **Responses to user:** Lead with answers to user questions, especially anything the user asks for in the task report. Put responses elsewhere only when directed. Omit this section if no response was expected.\n"
+        "- **User Prompt:** A short rephrasing of the user's initial prompt (p.md), demonstrating your ability to listen, understand, and interpret the task.\n"
         "- **Outcome:** State what was done and what changed in detail: files, decisions or recommendations, checks or results along with what succeeded and failed.\n"
         "- **Uncertainties:** Describe what remains unknown, unverified, or unresolved.\n"
         "- **Environment:** Record observed tool, harness, or environment failures and the workarounds tried. Suggest harness changes only when tied to evidence.\n"
@@ -2791,6 +2858,11 @@ def write_stats(state, start_time):
         f.write("final_context_tokens: " + str(state["last_post_tokens"]) + "\n")
         f.write("compaction_count: " + str(state["compaction_count"]) + "\n")
         f.write("elapsed_minutes: " + "{:.2f}".format(elapsed_minutes) + "\n")
+        for key in ("api_attempts", "api_responses", "api_seconds", "prompt_tokens_total", "completion_tokens_total", "cached_tokens_total", "cost_usd"):
+            value = state.get(key)
+            f.write(key + ": " + (str(value) if value is not None else "null") + "\n")
+            if key.endswith("_total") or key == "cost_usd":
+                f.write(key + "_responses: " + str(state.get(key + "_responses", 0)) + "\n")
         f.write("edit_counts:\n")
         f.write("  write: " + str(ec["write"]) + "\n")
         f.write("  edit: " + str(ec["edit"]) + "\n")
@@ -2801,12 +2873,86 @@ def write_stats(state, start_time):
     print(ts() + "Stats written to task_report/stats.yaml")
 
 
+def validate_tool_args(value, schema, path="arguments"):
+    # Only the JSON Schema subset used by make_tools; no second schema registry.
+    kind = schema.get("type")
+    valid = {"object": isinstance(value, dict), "array": isinstance(value, list), "string": isinstance(value, str), "integer": type(value) is int, "boolean": type(value) is bool}
+    if kind in valid and not valid[kind]:
+        return path + " must be " + kind
+    if "enum" in schema and value not in schema["enum"]:
+        return path + " must be one of " + str(schema["enum"])
+    if kind == "object":
+        props = schema.get("properties", {})
+        for key in schema.get("required", []):
+            if key not in value:
+                return path + " requires '" + key + "'"
+        for key, item in value.items():
+            if key not in props:
+                if schema.get("additionalProperties") is False:
+                    return path + " has unknown field '" + key + "'"
+                continue
+            error = validate_tool_args(item, props[key], path + "." + key)
+            if error:
+                return error
+    if kind == "array":
+        for i, item in enumerate(value):
+            error = validate_tool_args(item, schema.get("items", {}), path + "[" + str(i) + "]")
+            if error:
+                return error
+    return None
+
+
+def prepare_tool_calls(msg, tools):
+    schemas = {t["function"]["name"]: t["function"]["parameters"] for t in tools}
+    raw_calls = msg.get("tool_calls")
+    prepared, kept, notices = [], [], []
+    if not isinstance(raw_calls, list):
+        raw_calls = []
+        notices.append("tool_calls must be an array; no calls were executed")
+    ids = set()
+    for tc in raw_calls:
+        fn = tc.get("function") if isinstance(tc, dict) else None
+        name = fn.get("name") if isinstance(fn, dict) else None
+        if not isinstance(name, str) or not name.strip():
+            notices.append("a call lacked a function name and was not executed")
+            continue
+        tc_id = tc.get("id")
+        if not isinstance(tc_id, str) or not tc_id.strip() or tc_id in ids:
+            tc_id = "call_" + uuid.uuid4().hex
+        ids.add(tc_id)
+        tc["id"] = tc_id
+        tc["type"] = "function"
+        args = None
+        try:
+            raw = fn.get("arguments")
+            if not isinstance(raw, str):
+                raise ValueError("arguments must be a JSON string")
+            args = json.loads(raw)
+            if not isinstance(args, dict):
+                raise ValueError("arguments must decode to an object of named parameters")
+        except (ValueError, TypeError) as exc:
+            error = str(exc)
+            _repair_tool_call(tc, tc_id)
+        else:
+            error = "tool is not offered: " + name if name not in schemas else validate_tool_args(args, schemas[name])
+        kept.append(tc)
+        prepared.append((tc_id, name, args, "Error: " + error + ". Correct the call and retry." if error else None))
+    if kept:
+        msg["tool_calls"] = kept
+    else:
+        msg.pop("tool_calls", None)
+        _normalize_assistant_message(msg)
+    return prepared, notices
+
+
 def _normalize_assistant_message(msg):
     # strict upstreams 400 permanently on an assistant message with no content
     # key when it has no tool_calls. normalize in place; tool-call turns keep
     # their null content, which the API requires.
-    if not msg.get("tool_calls") and not isinstance(msg.get("content"), str):
-        msg["content"] = ""
+    if not msg.get("tool_calls"):
+        msg.pop("tool_calls", None)
+        if not isinstance(msg.get("content"), str):
+            msg["content"] = ""
     return msg
 
 
@@ -2872,7 +3018,28 @@ class _TeeStream:
         return self._stream.isatty()
 
 
+def archive_previous_run():
+    source = os.path.join(WORKSPACE, "task_report")
+    if not os.path.isdir(source) or not os.listdir(source):
+        return
+    previous = os.path.join(WORKSPACE, "previous_sessions")
+    os.makedirs(previous, exist_ok=True)
+    numbers = [int(m.group(1)) for name in os.listdir(previous) if (m := re.match(r"^(\d+)_", name))]
+    prefix = "{:03d}".format(max(numbers, default=-1) + 1)
+    destination = os.path.join(previous, prefix + "_run")
+    # Rename on the same filesystem preserves all artifacts, including failed runs.
+    # Keep the old report filename convention as a symlink, so relative links work
+    # when the archived report is read from the run directory.
+    os.rename(source, destination)
+    report = os.path.join(destination, "report.md")
+    if os.path.isfile(report):
+        os.symlink(prefix + "_run/report.md", os.path.join(previous, prefix + "_report.md"))
+    print(ts() + "Archived previous task_report to " + os.path.relpath(destination, WORKSPACE))
+
+
 def main():
+    global ENABLE_PLAYWRIGHT
+    configure_api()
     # a kill/pkill matching the harness is the run-ending hazard this session
     # diagnosed (report 005); log the signal instead of dying silently
     signal.signal(signal.SIGTERM, _signal_death)
@@ -2883,23 +3050,8 @@ def main():
     TOUCHED["read"].clear()
     TOUCHED["modified"].clear()
 
-    # startup: archive previous task_report then wipe it
     task_report_dir = os.path.join(WORKSPACE, "task_report")
-    report_path = os.path.join(task_report_dir, "report.md")
-    previous_sessions_dir = os.path.join(WORKSPACE, "previous_sessions")
-    if os.path.isdir(task_report_dir):
-        if os.path.isfile(report_path):
-            os.makedirs(previous_sessions_dir, exist_ok=True)
-            i = 0
-            while i < 1000:
-                candidate = os.path.join(previous_sessions_dir, "{:03d}_report.md".format(i))
-                if not os.path.exists(candidate):
-                    shutil.copy2(report_path, candidate)
-                    print(ts() + "Archived previous report to " + os.path.relpath(candidate, WORKSPACE))
-                    break
-                i += 1
-        shutil.rmtree(task_report_dir)
-        print(ts() + "Cleared previous task_report.")
+    archive_previous_run()
 
     start_time = time.time()
 
@@ -2920,6 +3072,10 @@ def main():
     # process is itself and a dead run's log always names its pid (report 005)
     print(ts() + "  [harness] pid=" + str(os.getpid()) + " ppid=" + str(os.getppid()) + " pgid=" + str(os.getpgrp()) + " sid=" + str(os.getsid(0)) + " argv=" + " ".join(sys.argv), flush=True)
 
+    mcp = start_mcp() if ENABLE_PLAYWRIGHT and not DEBUG_PROMPTS else None
+    if ENABLE_PLAYWRIGHT and mcp is None and not DEBUG_PROMPTS:
+        ENABLE_PLAYWRIGHT = False
+    print(ts() + ("Browser tools enabled (Chrome connects on first use)." if ENABLE_PLAYWRIGHT else "Browser tools unavailable or disabled; running file/shell-only."))
     tools = make_tools()
     # used by the inline tool_call rescue below to reject names never offered
     known_tool_names = set(t["function"]["name"] for t in tools)
@@ -2937,14 +3093,7 @@ def main():
     else:
         user_prompt = task_prompt
 
-    session_messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_prompt},
-        # seed sits between task prompt and runtime snapshot; both compaction
-        # rebuilds use session_messages[:-2], so it is swapped at compaction.
-        make_seed_message(),
-        {"role": "user", "content": runtime_content},
-    ]
+    session_messages = make_preamble(system_prompt, user_prompt, runtime_content)
 
     # last_post_tokens starts at 0: on the first turn everything is in
     # new_messages and counted by the estimator, so a nonzero seed here (the
@@ -2953,14 +3102,6 @@ def main():
 
     messages = []
     new_messages = list(session_messages)
-
-    if ENABLE_PLAYWRIGHT:
-        print(ts() + "MCP server starting...")
-        mcp = start_mcp()
-        print(ts() + "MCP ready.\n")
-    else:
-        mcp = None
-        print(ts() + "Playwright disabled (ENABLE_PLAYWRIGHT=False); running file/shell-only with no web search.\n")
 
     print(ts() + "Starting agent loop...\n")
 
@@ -2981,12 +3122,13 @@ def main():
 
             response = chat(messages, tools, new_messages, state, session_messages)
             choice = response["choices"][0]
-            msg = choice["message"]
+            msg = copy.deepcopy(choice["message"])
             finish = choice.get("finish_reason")
 
-            # debug to catch bad tool-calling behavior
-            tc_count = len(msg.get("tool_calls") or [])
-            content_preview = (msg.get("content") or "")[:150].replace("\n", "\\n")
+            # Keep the provider response intact while repairing outbound history.
+            calls_value = msg.get("tool_calls")
+            tc_count = len(calls_value) if isinstance(calls_value, list) else 0
+            content_preview = str(msg.get("content") or "")[:150].replace("\n", "\\n")
             print(ts() + "  [resp] tool_calls=" + str(tc_count) + " finish=" + str(finish) + " content=" + repr(content_preview))
 
             # CRITICAL: msg may include reasoning_details / reasoning / reasoning_content
@@ -3008,14 +3150,8 @@ def main():
                     error_rescues += 1
                     print(ts() + "  [warn] provider reported finish_reason=error (rescue " + str(error_rescues) + "/" + str(MAX_ERROR_RESCUES) + "), retrying the turn")
                     continue
-                print(ts() + "  [warn] provider reported finish_reason=error repeatedly, handing control to the model")
-                new_messages.append(
-                    {
-                        "role": "user",
-                        "content": "[harness notice] Your previous turn failed with a provider-side generation error (finish_reason=error) and produced no output; no tool calls were executed. Re-issue the tool call or reply you intended.",
-                    }
-                )
-                continue
+                raise RuntimeError("Provider repeatedly returned finish_reason=error after " + str(MAX_ERROR_RESCUES) + " retries; no tool calls were executed for these responses")
+            error_rescues = 0
 
             # round-trip guard: normalize before appending so a request can
             # never carry a content-less assistant message.
@@ -3059,53 +3195,11 @@ def main():
                 # model produced parseable tool calls - drop any output boost
                 if "max_tokens_override" in state:
                     del state["max_tokens_override"]
-                for tc in tool_calls:
-                    if not isinstance(tc, dict):
-                        # skip non-object entries; _sanitize_tool_calls drops
-                        # the stored copy if a strict provider 400s later
-                        print(ts() + "  [tool call] (unnamed): INCOMPLETE CALL (not an object)")
-                        continue
-                    # index the call structure defensively: providers occasionally
-                    # emit elements missing id/name/arguments, and a KeyError here
-                    # kills the run instead of becoming a corrective tool error
-                    fn = tc.get("function")
-                    fn = fn if isinstance(fn, dict) else {}
-                    fn_name = fn.get("name") or "(unnamed)"
-                    tc_id = tc.get("id") or "missing-id-" + str(tool_calls_done)
-                    raw_args = fn.get("arguments")
-                    # layer 1: incomplete call or malformed JSON args; layer 2:
-                    # wrong/missing parameter keys (both become corrective tool
-                    # results); layer 3 is dispatch_tool's general except. every
-                    # failed branch also repairs the stored copy via
-                    # _repair_tool_call so broken args never round-trip.
-                    if not fn.get("name") or not isinstance(raw_args, str):
-                        print(ts() + "  [tool call] " + fn_name + ": INCOMPLETE CALL (missing name or arguments)")
-                        tool_result = "Error: tool call was missing its name or its arguments string. Re-issue a complete tool call."
-                        _repair_tool_call(tc, tc_id)
-                    else:
-                        try:
-                            fn_args = json.loads(raw_args)
-                        except (ValueError, TypeError) as e:
-                            print(ts() + "  [tool call] " + fn_name + ": MALFORMED ARGUMENTS")
-                            fn_args = None
-                            tool_result = "Error: tool call arguments were not valid JSON (" + str(e) + "). Re-issue the call with corrected, complete JSON arguments."
-                            _repair_tool_call(tc, tc_id)
-                        if fn_args is not None and not isinstance(fn_args, dict):
-                            print(ts() + "  [tool call] " + fn_name + ": ARGUMENTS NOT AN OBJECT")
-                            fn_args = None
-                            tool_result = 'Error: tool call arguments must be a JSON object of named parameters, e.g. {"file_path": ...}. Re-issue with an object.'
-                            _repair_tool_call(tc, tc_id)
-                        if fn_args is not None:
-                            try:
-                                tool_result = dispatch_tool(mcp, fn_name, fn_args)
-
-                            except KeyError as e:
-                                print(ts() + "  [tool call] " + fn_name + ": MISSING PARAMETER " + str(e))
-                                print(ts() + "    got keys: " + str(list(fn_args.keys())))
-                                tool_result = "Error: tool call missing required parameter " + str(e) + ". Check the tool definition and re-issue with the correct parameter names."
-                            except TypeError as e:
-                                print(ts() + "  [tool call] " + fn_name + ": BAD PARAMETER TYPE")
-                                tool_result = "Error: tool call parameter type error (" + str(e) + "). Re-issue with correct argument types."
+                prepared, rejected = prepare_tool_calls(msg, tools)
+                if rejected or any(error for _, _, _, error in prepared):
+                    print(ts() + "  [invalid tool calls] raw=" + json.dumps(response, ensure_ascii=False), flush=True)
+                for tc_id, fn_name, fn_args, error in prepared:
+                    tool_result = error if error else dispatch_tool(mcp, fn_name, fn_args)
                     # count only successful edits: failures inflated stats.yaml
                     # and hid retry churn
                     if fn_name in state["edit_counts"] and isinstance(tool_result, str) and not tool_result.startswith("Error"):
@@ -3119,9 +3213,8 @@ def main():
                     )
                     tool_calls_done += 1
 
-                # append per-turn telemetry to the last tool result; when every
-                # tool call this turn was undispatchable (non-object entries),
-                # no tool result exists, so carry the status in a user notice
+                if rejected:
+                    new_messages.append({"role": "user", "content": "[harness notice] Invalid tool calls: " + "; ".join(rejected) + ". Re-issue complete calls using the offered schemas."})
                 status = make_status_line(state, tool_calls_done)
                 if isinstance(new_messages[-1].get("content"), str):
                     new_messages[-1]["content"] = new_messages[-1]["content"] + "\n\n" + status
@@ -3129,7 +3222,7 @@ def main():
                     new_messages.append({"role": "user", "content": status})
 
                 # soft budget notices
-                print("TCC", tool_calls_done, flush=True)
+                print("TTC", tool_calls_done, flush=True)
                 ctx_tokens = state["last_post_tokens"]
                 ctx_frac = (ctx_tokens / MAX_CONTEXT_LENGTH) if MAX_CONTEXT_LENGTH else 0.0
                 ctx_pressure = state["compaction_count"] >= COMPACTION_PRESSURE_THRESHOLD
@@ -3206,11 +3299,11 @@ def main():
                     budget_note = "The output budget has been increased. "
                 else:
                     print(ts() + "  [warn] reply truncated at max_tokens again (rescue " + str(length_rescues) + "), budget already boosted")
-                    budget_note = "The output budget is already at its maximum and will NOT be increased further. "
+                    budget_note = "The output budget is already at its maximum and will not be increased further. "
                 escalation = ""
                 if length_rescues > MAX_LENGTH_RESCUES:
                     escalation = (
-                        " You have now hit the output limit " + str(length_rescues) + " times. stop retrying the same oversized output as it will never fit. "
+                        " You have now hit the output limit " + str(length_rescues) + " times. Stop retrying the same oversized output as it will never fit. "
                         "Break it up: write a short skeleton with write, then add sections one at a time with edit."
                     )
                 new_messages.append(
@@ -3228,17 +3321,19 @@ def main():
             # model waiting for auto-delivered output, not a finish: wait
             # in-process (bounded) instead of burning round trips. start_process
             # servers are exempt; a server that never exits must not stall.
-            running_yielded = [h for h, e in PROCS.items() if e["proc"].poll() is None and e.get("yielded")]
-            if running_yielded:
-                try:
-                    report_exists = os.path.getsize(os.path.join(WORKSPACE, "task_report", "report.md")) >= 100
-                except OSError:
-                    report_exists = False
-                if not report_exists:
-                    deadline = time.time() + GUARD_WAIT_SECONDS
-                    while time.time() < deadline and any(e["proc"].poll() is None for e in PROCS.values() if e.get("yielded")):
-                        time.sleep(0.2)
-                    continue
+            while any(e.get("yielded") and e["proc"].poll() is None for e in PROCS.values()):
+                # Each yielded job has a watchdog deadline. Do not spend model turns
+                # waiting, and do not let an existing report bypass its output.
+                for e in list(PROCS.values()):
+                    if e.get("yielded") and e["proc"].poll() is None:
+                        try:
+                            e["proc"].wait(timeout=GUARD_WAIT_SECONDS)
+                        except subprocess.TimeoutExpired:
+                            pass
+            deliveries = _collect_background_deliveries()
+            if deliveries:
+                new_messages.extend({"role": "user", "content": notice} for notice in deliveries)
+                continue
 
             # final text reply: require an adequate report before accepting it
             report_path = os.path.join(WORKSPACE, "task_report", "report.md")

@@ -62,45 +62,42 @@ function ensureBrowser() {
 
 // shared helper: extract page or element content via ariaSnapshot with
 // innerText fallback. keeps tool handlers thin.
-async function extractContent(target, label) {
+async function extractContent(target, label, isPage = false) {
   try {
     const snapshot = await target.ariaSnapshot({ mode: 'ai' });
     return snapshot || 'No content found';
   } catch (err) {
     console.error('ariaSnapshot failed (' + label + '), falling back to innerText: ' + err.message);
-    // target is either a Page or a Locator; Page has .evaluate, Locator does not
-    if (typeof target.evaluate === 'function') {
-      const text = await target.evaluate(() => document.body.innerText);
-      return text || 'No content found';
-    }
-    // locator fallback
-    const text = await target.innerText().catch(() => 'No content found');
-    return text;
+    // Both Page and Locator have evaluate and innerText, with different arguments.
+    // The caller supplies the scope; never infer it from method presence.
+    const element = isPage ? target.locator('body') : target;
+    const text = await element.innerText();
+    return '[plain-text fallback; accessibility snapshot unavailable]\n' + (text || 'No content found');
   }
 }
 
 // shared helper: navigate with domcontentloaded then load fallback.
-// returns the page; logs failures to stderr.
+// Returns the final response; never extract a stale page after failed navigation.
 async function navigatePage(p, url) {
   let navigationError = null;
+  let response = null;
   try {
-    await p.goto(url, { waitUntil: 'domcontentloaded', timeout: 15000 });
+    response = await p.goto(url, { waitUntil: 'domcontentloaded', timeout: 15000 });
   } catch (err) {
     console.error('domcontentloaded timed out for ' + url + ', falling back to load');
     navigationError = err;
     try {
-      await p.goto(url, { waitUntil: 'load', timeout: 30000 });
+      response = await p.goto(url, { waitUntil: 'load', timeout: 30000 });
       navigationError = null;
     } catch (err2) {
       navigationError = err2;
     }
   }
   if (navigationError) {
-    console.error('Navigation failed for ' + url + ': ' + navigationError.message);
+    throw new Error('Navigation failed for ' + url + ' (current URL: ' + p.url() + '): ' + navigationError.message);
   }
-  // brief settle for JS-rendered content
-  await p.waitForTimeout(2000);
-  return p;
+  await p.locator('body').waitFor({ state: 'attached', timeout: 5000 });
+  return response;
 }
 
 // run fn on a fresh throwaway tab. search/fetch get their own tab so they do
@@ -121,9 +118,15 @@ server.tool(
   { url: z.string().describe('URL to navigate to') },
   async ({ url }) => {
     const p = await ensureBrowser();
-    await navigatePage(p, url);
-    const text = await extractContent(p, url);
-    return { content: [{ type: 'text', text }] };
+    try {
+      const response = await navigatePage(p, url);
+      const body = await extractContent(p, url, true);
+      const status = response ? response.status() : 'unavailable';
+      const text = 'Requested URL: ' + url + '\nFinal URL: ' + p.url() + '\nHTTP status: ' + status + '\n\n' + body;
+      return { content: [{ type: 'text', text }], isError: typeof status === 'number' && status >= 400 };
+    } catch (err) {
+      return { content: [{ type: 'text', text: err.message }], isError: true };
+    }
   }
 );
 
@@ -138,7 +141,7 @@ server.tool(
   async ({ selector }) => {
     const p = await ensureBrowser();
     if (!selector || selector === 'body' || selector === '*') {
-      const text = await extractContent(p, 'full page');
+      const text = await extractContent(p, 'full page', true);
       return { content: [{ type: 'text', text }] };
     }
     const element = p.locator(selector);
