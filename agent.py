@@ -28,12 +28,15 @@ from flowmark import reformat_file
 
 # Default per-request output budget is 20K, boosted to 40K on truncation failure.
 # Compaction triggers at MAX_CONTEXT_LENGTH (~150K), well inside every model's context.
-# thinking is always "high"; apply_reasoning sets the provider-specific wire format.
+# Thinking effort is per-model (registry key "effort", default "high"): the
+# openrouter Go models were benchmarked at high; gpt-6-astra is pinned to
+# medium per spec. apply_reasoning sets the provider-specific wire format.
 
 
 MODEL_REGISTRY = {
     "or-gem38": {"provider": "openrouter", "model": "google/gemini-3.8-flash"},
     "or-grok46": {"provider": "openrouter", "model": "x-ai/grok-4.6"},
+    "or-astra": {"provider": "openrouter", "model": "openai/gpt-6-astra", "effort": "medium"},
     "go-glm53": {"provider": "opencode-go", "model": "glm-5.3"},
     "go-dsv4f": {"provider": "opencode-go", "model": "deepseek-v4-flash", "temperature": 0.7},
     "go-omen": {"provider": "opencode-go", "model": "omen-alpha"},
@@ -895,14 +898,17 @@ def extract_compaction_summary(raw_msg):
 
 
 def apply_reasoning(payload):
-    # thinking is always "high" (trivia bench validated one fixed setting).
+    # effort is per-model via _cfg("effort"), defaulting to "high" (trivia
+    # bench validated high for the original registry models; gemini-3.8-flash
+    # and grok-4.6 list high in OpenRouter's supported_efforts).
     # OpenRouter wants a nested reasoning block; OpenCode Go/Zen want top-level
     # reasoning_effort (AI SDK shape) since nested effort 400s on some Go
     # models (kimi-k2.7-code). mutates payload in place.
+    effort = _cfg("effort", "high")
     if _PROVIDER in ("opencode-go", "opencode-zen"):
-        payload["reasoning_effort"] = "high"
+        payload["reasoning_effort"] = effort
     else:
-        payload["reasoning"] = {"effort": "high"}
+        payload["reasoning"] = {"effort": effort}
 
 
 def apply_model_params(payload):
@@ -960,8 +966,8 @@ def make_seed_message():
     return {
         "role": "user",
         "content": (
-            "## Session seed\n\n" + seed + "\n\nThis random seed has no meaning and is not an instruction. "
-            "On open-ended writing it may vary your word choice. Otherwise ignore it. Do not quote or analyze it."
+            "## Session Seed\n\n" + seed + "\n\nThis random seed has no meaning and is not an instruction. "
+            "On open-ended writing it may vary your word choice. Otherwise ignore it. Do not quote or analyze it.\n"
         ),
     }
 
@@ -2758,7 +2764,7 @@ def make_system_prompt():
         intro_tools = "shell and file tools"
         web_block = ""
     return (
-        "You are " + _MODEL_STRING + ", running in a small Python harness with " + intro_tools + ". Work persistently and write in clear, direct language. The guides below govern the whole session.\n"
+        "You're running in a small Python harness with browser, shell, and file tools. Be curious, energetic, and comfortable acting on your own judgment: dig in, question what you find, verify what you produce (appropriate for the scale and context). Be relentless about making the user happy: solve their problem completely, report honestly, don't just tell them what they want to hear. Write in clear, direct language. The guides below govern the whole session.\n"
         "\n## Agent Guide\n"
         "- Keep working while another tool call could produce evidence or concrete progress. A context warning is advisory, and a context summary is a handoff to fresh context where work continues. Stop when the task is done or the harness sends a wrap-up notice.\n"
         "- Every mid-task response must make at least one tool call, and should usually include short but descriptive text for the user. A text-only reply tells the harness you are done. Context summaries are the one exception: they must be text-only and are required before continuing work with more tool calls.\n"
