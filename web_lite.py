@@ -346,6 +346,14 @@ class WebLite:
             return None, ("spill storage budget (" + str(self.s.spill_budget_bytes // (1024 * 1024)) + " MiB under " + self.s.spill_dir + ") exhausted; only the truncated view below is available")
         try:
             os.makedirs(self.s.spill_dir, exist_ok=True)
+            if self._spill_seq == 0:
+                # seed from files already on disk so two processes sharing the
+                # spill dir (agent.py plus a python one-liner in the bash tool)
+                # cannot overwrite each other's handles
+                for name in os.listdir(self.s.spill_dir):
+                    m = re.match(r"(\d+)_", name)
+                    if m:
+                        self._spill_seq = max(self._spill_seq, int(m.group(1)))
             self._spill_seq += 1
             slug = re.sub(r"[^a-zA-Z0-9]+", "_", url.split("?")[0])[-40:].strip("_") or "page"
             path = os.path.join(self.s.spill_dir, str(self._spill_seq) + "_" + slug + ".txt")
