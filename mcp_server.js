@@ -35,6 +35,11 @@
 // 2026-09-07: "page.evaluate: SyntaxError: Unexpected token '.'"). The filter
 // now uses startsWith (no escapes), and extract strings get a syntax
 // self-check at startup so this class of bug dies at spawn, not first search.
+// v2.5: web_search is Brave-only. DDG html is TLS-fingerprint (JA3) blocked
+// from this network (HTTP 202 challenge page on every request variant since
+// 2026-09-07), so every ddg search was falling back to Brave anyway. The ddg
+// engine, DDG_EXTRACT, the automatic fallback retry, and the engine override
+// parameter are all removed. web_lite.py (mode 2) mirrors this.
 
 const { McpServer } = require('@modelcontextprotocol/sdk/server/mcp.js');
 const { StdioServerTransport } = require('@modelcontextprotocol/sdk/server/stdio.js');
@@ -209,12 +214,11 @@ server.tool(
   }
 );
 
-// in-page extractors for search result cards. DDG html is the default: it is
-// blocker-free from this IP (robots.txt allows it) and has a stable, lean
-// DOM. Brave is an explicit override (engine=brave) AND the automatic
-// fallback for empty ddg answers; it has been reliable from this IP
-// (2026-09-05; the old "it 429s" note was stale). Its card selector was
-// fixed for the current layout in v2.2 (the #results wrapper is gone).
+// in-page extractor for Brave search result cards. Brave only since v2.5:
+// DDG html is TLS-fingerprint-blocked from this network (HTTP 202 challenge
+// page, every variant, 2026-09-07), so the ddg extractor was removed. The
+// card selector was fixed for the current layout in v2.2 (the #results
+// wrapper is gone).
 const BRAVE_EXTRACT = `(() => {
   const out = [];
   for (const c of document.querySelectorAll('div.snippet[data-type="web"]')) {
@@ -232,33 +236,7 @@ const BRAVE_EXTRACT = `(() => {
   return out;
 })()`;
 
-const DDG_EXTRACT = `(() => {
-  const out = [];
-  for (const r of document.querySelectorAll('.result')) {
-    const a = r.querySelector('.result__a');
-    if (!a) continue;
-    let url = a.href;
-    // ddg wraps outbound links in a redirect carrying the target as uddg=
-    try { const q = new URL(url).searchParams.get('uddg'); if (q) url = q; } catch (e) {}
-    // ad cards link through duckduckgo.com/y.js with no uddg param; they are
-    // paid placements, not results (seen 2026-09-07: a pergola query returned
-    // an ad as result #1 with a 900-char tracking URL). startsWith, not a
-    // regex: single-backslash escapes in this template literal are eaten
-    // before the page sees them (the v2.4.1 bug).
-    if (url.startsWith('https://duckduckgo.com/y.js')) continue;
-    const s = r.querySelector('.result__snippet');
-    const snippet = (s ? s.textContent : '').replace(/\\s+/g, ' ').trim();
-    out.push({ title: a.textContent.replace(/\\s+/g, ' ').trim(), url, snippet: snippet.slice(0, 300) });
-  }
-  return out;
-})()`;
-
 const ENGINES = {
-  ddg: {
-    url: (q) => 'https://html.duckduckgo.com/html/?q=' + encodeURIComponent(q),
-    wait: '.result',
-    extract: DDG_EXTRACT,
-  },
   brave: {
     url: (q) => 'https://search.brave.com/search?q=' + encodeURIComponent(q),
     wait: 'div.snippet[data-type="web"]',
@@ -289,62 +267,31 @@ async function searchOn(engineName, query) {
 }
 
 // stagger between fan-out queries: firing all searches in the same instant
-// raised the rate of DDG's HTTP 202 bot-challenge pages; a 400ms skew keeps
-// most of the wall-clock saving of a concurrent fan-out.
+// raises bot-challenge rates on the engine; a 400ms skew keeps most of the
+// wall-clock saving of a concurrent fan-out.
 const SEARCH_STAGGER_MS = 400;
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-// one query on the primary engine; an empty OR failed ddg answer gets exactly
-// one brave retry before giving up. DDG html intermittently serves an HTTP 202
-// anomaly page with zero results; the retry self-heals that without surfacing
-// an error to the model. An explicit engine=brave request is respected as-is.
-async function searchWithFallback(name, q) {
-  let results = null;
-  let primaryFailed = false;
+// one query on Brave. There is no second engine to fall back to (ddg removed
+// in v2.5), so a failure is reported honestly to the model.
+async function searchBrave(q) {
   try {
-    results = await searchOn(name, q);
+    const results = await searchOn('brave', q);
+    return { results };
   } catch (err) {
-    primaryFailed = true;
-    console.error('search on ' + name + ' for "' + q + '" failed: ' + err.message);
+    console.error('brave search for "' + q + '" failed: ' + err.message);
+    return { results: null };
   }
-  if (name !== 'ddg' || (results && results.length)) {
-    return { results, engineUsed: name, note: '' };
-  }
-  let fb = null;
-  let fbFailed = false;
-  try {
-    fb = await searchOn('brave', q);
-  } catch (err) {
-    fbFailed = true;
-    console.error('brave fallback for "' + q + '" failed: ' + err.message);
-  }
-  if (fb && fb.length) {
-    const why = primaryFailed ? 'fell back after ddg error' : 'fell back from empty ddg';
-    return { results: fb, engineUsed: 'brave', note: ', ' + why };
-  }
-  // both engines errored -> real failure; otherwise report the empty result
-  // (a ddg bot wall usually looks like an empty page, not a thrown error)
-  if (results === null && fbFailed) {
-    return { results: null, engineUsed: name, note: '' };
-  }
-  if (fb !== null && !fb.length) {
-    console.error('brave fallback for "' + q + '" also returned no results');
-  }
-  return { results: [], engineUsed: name, note: '' };
 }
 
 server.tool(
   'web_search',
-  'Search the web and return a structured top-10 list of {title, url, snippet} per query. DuckDuckGo by default, Brave optional override.',
+  'Search the web and return a structured top-10 list of {title, url, snippet} per query. Brave search only; plain-text queries, operators like site: work.',
   {
     query: z.string().optional().describe('Plain text search query (single search).'),
     queries: z.array(z.string()).max(4).optional().describe('DSH form: 1-4 search query strings. Each is searched separately and returned as its own result set.'),
-    engine: z.string().optional().describe('Optional engine override: "ddg" (default) or "brave". Omit unless you have a reason.'),
   },
-  async ({ query, queries, engine }) => {
-    // ddg is the default; brave is an explicit override and the automatic
-    // fallback for empty ddg answers (see searchWithFallback).
-    const name = engine && ENGINES[engine] ? engine : 'ddg';
+  async ({ query, queries }) => {
     const list = [];
     if (Array.isArray(queries)) {
       for (const q of queries.slice(0, 4)) list.push(String(q));
@@ -364,21 +311,21 @@ server.tool(
     // each is isolated.
     const settled = await Promise.all(list.map(async (q, i) => {
       await sleep(i * SEARCH_STAGGER_MS);
-      return { q, ...(await searchWithFallback(name, q)) };
+      return { q, ...(await searchBrave(q)) };
     }));
     const blocks = [];
-    for (const { q, results, engineUsed, note } of settled) {
+    for (const { q, results } of settled) {
       if (results === null) {
-        blocks.push('Search results for "' + q + '" (engine: ' + name + '):\n(search failed on this engine; try rephrasing or a different query.)');
+        blocks.push('Search results for "' + q + '" (engine: brave):\n(search failed; try rephrasing or a different query.)');
       } else if (!results.length) {
-        blocks.push('No results found for "' + q + '" on ' + name
-          + ' (possible bot wall). Try rephrasing, or playwright_navigate to a known URL directly.');
+        blocks.push('No results found for "' + q + '" on brave'
+          + ' (possibly a bot wall or rate limit). Try rephrasing, or playwright_navigate to a known URL directly.');
       } else {
         const top = results.slice(0, 10);
         const lines = top.map((r, i) =>
           (i + 1) + '. ' + r.title + '\n   ' + r.url + (r.snippet ? '\n   ' + r.snippet : '')
         );
-        const header = 'Search results for "' + q + '" (engine: ' + engineUsed + note + ', showing ' + top.length + ' of ' + results.length + '):';
+        const header = 'Search results for "' + q + '" (engine: brave, showing ' + top.length + ' of ' + results.length + '):';
         blocks.push(header + '\n' + lines.join('\n'));
       }
     }

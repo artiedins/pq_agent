@@ -18,10 +18,11 @@
 #   SIGALRM watchdog in addition to socket timeouts. A watchdog is not process
 #   isolation: a stuck native call could outlive it, an accepted limitation of
 #   the in-process design.
-# - Search: DuckDuckGo HTML by default, at most one Brave fallback, sequential
-#   with a stagger; engines get a browser UA (an explicit, tested compatibility
-#   override - DDG serves 202 challenge pages to library-default UAs), all
-#   other destinations get the honest pq-agent UA.
+# - Search: Brave only, sequential with a stagger. DuckDuckGo was removed on
+#   2026-09-07: this network is TLS-fingerprint (JA3) blocked at html.duckduckgo.com
+#   (HTTP 202 challenge page on every variant), so Brave carried 100% of search
+#   anyway. The engine gets a browser UA; all other destinations get the honest
+#   pq-agent UA.
 # - Spill files live in /tmp/pq_web_lite (separate from mode 1's /tmp/pq_fetch)
 #   under a 12 MiB per-run budget. /tmp is tmpfs under run_agent.sh: spill
 #   bounds RAM, it is not disk storage. Handles already handed to the model are
@@ -44,9 +45,10 @@ from soupsieve import SelectorSyntaxError
 # repo and contact. Wikimedia etiquette requires exactly this shape, and the
 # python-requests default UA is blocked outright (phabricator T400119).
 HONEST_UA = "pq-agent/1.0 (+https://github.com/artiedins/pq_agent; contact artiedins)"
-# Search engines are the one destination class where the honest UA fails
-# outright (DDG 202 challenges to library UAs, tested 2026-09-07 from this
-# network). Browser UA here only; never send it to content sites.
+# Search engines are the one destination class where the honest UA is a
+# liability: DDG served 202 challenges to library-default UAs before its
+# network-wide block, and Brave has not been tested with one. Browser UA here
+# only; never send it to content sites.
 BROWSER_UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) " "Chrome/140.0.0.0 Safari/537.36"
 
 
@@ -366,46 +368,32 @@ class WebLite:
 
     # ---------- public tools ----------
 
-    def search(self, queries, engine=None):
+    def search(self, queries):
         # Sequential batch, one result block per query, mirroring the MCP
         # backend's output format so models see the same shape in both modes.
-        # A failed query never loses the others; the engine actually used (and
-        # any fallback reason) is named in the block header.
-        name = engine if engine in ("ddg", "brave") else "ddg"
+        # Brave only: DDG is TLS-fingerprint-blocked from this network (removed
+        # 2026-09-07), and Brave rate-limits this IP to roughly 5-6 queries per
+        # hour, so batch sensibly and prefer open APIs or known URLs. A failed
+        # query never loses the others.
+        queries = [str(q) for q in queries]
+        notice = ""
+        if len(queries) > 4:
+            notice = "\n\n(Notice: search batches cap at 4 queries; " + str(len(queries) - 4) + " dropped. Re-issue dropped queries in a later call.)"
+            queries = queries[:4]
         blocks = []
         with _Watchdog(self.s.search_watchdog):
-            for i, q in enumerate(queries[:4]):
+            for i, q in enumerate(queries):
                 if i > 0:
-                    # same-instant bursts raise the DDG 202 rate (mcp_server.js
+                    # same-instant bursts raise bot-challenge rates (mcp_server.js
                     # v2.4 lesson); the stagger is politeness, not latency tuning
                     time.sleep(self.s.search_stagger)
                 with _Watchdog(self.s.fetch_watchdog):
-                    blocks.append(self._search_with_fallback(name, str(q)))
-        return "\n\n".join(blocks)
+                    blocks.append(self._format_block(q, self._search_one(q)))
+        return "\n\n".join(blocks) + notice
 
-    def _search_with_fallback(self, name, q):
-        primary = self._search_one(name, q)
-        # results is not None => either real results or a recognizable
-        # no-results page: final either way, no fallback. An explicit engine
-        # override is respected as-is (only ddg ever falls back).
-        if name != "ddg" or primary[0] is not None:
-            return self._format_block(q, name, primary)
-        fallback = self._search_one("brave", q)
-        if fallback[0]:
-            return self._format_block(q, "brave", fallback, why=primary[1] or "empty ddg answer")
-        if fallback[0] is not None:
-            # brave parsed a genuine no-results page
-            return self._format_block(q, "brave", fallback, why="after ddg: " + (primary[1] or "no results"))
-        # ddg failed AND the brave retry failed: one honest failure block
-        combined = (
-            None,
-            (primary[1] or "failed") + "; brave fallback also failed: " + (fallback[1] or "failed"),
-            True,
-        )
-        return self._format_block(q, name, combined)
-
-    def _search_one(self, name, q):
+    def _search_one(self, q):
         # returns (results_or_None, status_note, hard_failure)
+        name = "brave"
         eng = ENGINES[name]
         try:
             # per-engine spacing beyond the batch stagger, so repeat calls to
@@ -424,11 +412,9 @@ class WebLite:
             return None, type(e).__name__ + ": " + str(e)[:150], True
         if resp.status == 429:
             return self._rate_limited(name, q, resp.retry_after)
-        if resp.status == 202:
-            # DDG's intermittent bot-challenge anomaly page, seen through real
-            # Chrome too (mcp_server.js v2.4 note); not a result page
-            return None, "bot-challenge page (HTTP 202)", True
-        if resp.status >= 400:
+        # 202 was DDG's challenge status; kept for Brave in case it ever adopts
+        # the same wall rather than an HTTP 403/429 or an in-page challenge
+        if resp.status == 202 or resp.status >= 400:
             return None, "HTTP " + str(resp.status), True
         soup = BeautifulSoup(resp.body, "html.parser")
         results = eng["parse"](soup)
@@ -462,28 +448,25 @@ class WebLite:
                 pass
         if ra_s is not None and 0 < ra_s <= self.s.retry_after_max_sleep:
             time.sleep(ra_s)
-            result = self._search_one(name, q)
+            result = self._search_one(q)
             if result[0] is not None or not result[2]:
                 return result
-        msg = "HTTP 429 rate limit" + (" (Retry-After: " + str(int(ra_s)) + "s)" if ra_s else "")
+        msg = (
+            "HTTP 429 rate limit"
+            + (" (Retry-After: " + str(int(ra_s)) + "s)" if ra_s else "")
+            + "; Brave allows about 5-6 queries/hour from this network. Wait before searching again, or use a known URL / an open API (Hacker News Algolia, GitHub api., Wikipedia) instead"
+        )
         return None, msg, True
 
-    def _format_block(self, q, engine_used, outcome, why=""):
+    def _format_block(self, q, outcome):
         results, note, failed = outcome
         if results is None:
-            return (
-                'Search results for "' + q + '" (engine: ' + engine_used + "):\n"
-                "(search failed: " + str(note)[:200] + ". Try rephrasing, try the other engine, or fetch a known URL directly with web_fetch.)"
-            )
+            return 'Search results for "' + q + '" (engine: brave):\n' "(search failed: " + str(note)[:200] + ". Try rephrasing, or fetch a known URL directly with web_fetch.)"
         if not results:
-            return 'No results found for "' + q + '" on ' + engine_used + " (" + str(note)[:120] + "). Try rephrasing."
+            return 'No results found for "' + q + '" on brave (' + str(note)[:120] + "). Try rephrasing."
         top = results[:10]
         lines = [str(i + 1) + ". " + r["title"] + "\n   " + r["url"] + ("\n   " + r["snippet"] if r["snippet"] else "") for i, r in enumerate(top)]
-        header = 'Search results for "' + q + '" (engine: ' + engine_used
-        if why:
-            header += ", fell back from ddg (" + why[:80] + ")"
-        header += ", showing " + str(len(top)) + " of " + str(len(results)) + "):"
-        return header + "\n" + "\n".join(lines)
+        return 'Search results for "' + q + '" (engine: brave, showing ' + str(len(top)) + " of " + str(len(results)) + "):\n" + "\n".join(lines)
 
     def fetch(self, url):
         # raw response body, no extraction. The header block carries status,
@@ -726,36 +709,11 @@ def _render(node):
 
 # ---------- search engine adapters ----------
 # Mirrors mcp_server.js's ENGINES so both modes speak the same result format.
-# DDG html is the default (blocker-free with a browser UA, stable lean DOM);
-# Brave is the explicit override and the single automatic fallback. No third
-# parser: Bing looked lenient in one probe, but one query is not evidence for
-# maintaining another fragile scraper (001 report, section 5).
-
-
-def _parse_ddg(soup):
-    out = []
-    for r in soup.select(".result"):
-        a = r.select_one(".result__a")
-        if not a or not a.get("href"):
-            continue
-        url = a["href"]
-        # ddg wraps outbound links in a redirect carrying the target as uddg=
-        try:
-            uddg = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query).get("uddg")
-            if uddg:
-                url = uddg[0]
-        except ValueError:
-            pass
-        # ad cards link through duckduckgo.com/y.js with no uddg param (paid
-        # placements, not results; mcp_server.js v2.4.1 lesson)
-        if url.startswith("https://duckduckgo.com/y.js"):
-            continue
-        s = r.select_one(".result__snippet")
-        snippet = re.sub(r"\s+", " ", s.get_text() if s else "").strip()
-        title = re.sub(r"\s+", " ", a.get_text()).strip()
-        if title:
-            out.append({"title": title, "url": url, "snippet": snippet[:300]})
-    return out
+# Brave only since 2026-09-07: DuckDuckGo TLS-fingerprint-blocks this network
+# (HTTP 202 challenge page on every request variant), so the ddg adapter was
+# removed rather than kept as dead fallback machinery. No second parser: Bing
+# looked lenient in one probe, but one query is not evidence for maintaining
+# another fragile scraper (001 report, section 5).
 
 
 def _parse_brave(soup):
@@ -778,10 +736,6 @@ def _parse_brave(soup):
 
 
 ENGINES = {
-    "ddg": {
-        "url": lambda q: "https://html.duckduckgo.com/html/?q=" + urllib.parse.quote_plus(q),
-        "parse": _parse_ddg,
-    },
     "brave": {
         "url": lambda q: "https://search.brave.com/search?q=" + urllib.parse.quote_plus(q),
         "parse": _parse_brave,
@@ -814,8 +768,8 @@ def _require():
     return _LITE
 
 
-def search(queries, engine=None):
-    return _require().search(queries, engine)
+def search(queries):
+    return _require().search(queries)
 
 
 def fetch(url):
