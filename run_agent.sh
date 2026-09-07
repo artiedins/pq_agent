@@ -4,11 +4,18 @@
 # harness code is read-only at /agent. Network access and host Chrome are shared.
 # This is filesystem/process isolation, not isolation from all host capabilities.
 # PQ_MODEL selects the registry entry, PQ_API_KEY its provider key, and
-# PQ_PLAYWRIGHT=0 disables browser tools. No other agent configuration is required.
+# PQ_PLAYWRIGHT the web backend: 1 (default) = headed Chrome via the Node MCP
+# server, 2 = lightweight HTTP tools (web_lite.py; for low-memory hosts, no
+# Node/browser needed), 0 = no built-in web tools. No other agent configuration
+# is required.
 
 set -euo pipefail
 
 # Host-specific capabilities are opt-in. Edit these settings for this machine.
+# The interpreter is the system python3; harness deps (requests, bs4, flowmark)
+# must be importable from it. On PEP 668 hosts (Debian 12+/Raspberry Pi OS
+# Bookworm+) that means `sudo pip3 install --break-system-packages ...`, which
+# lands in /usr/local/lib/python3.X/dist-packages, inside the /usr bind below.
 ENABLE_AUDIO=0
 ENABLE_MUSIC=0
 ENABLE_HF_CACHE=0
@@ -62,7 +69,7 @@ fi
 echo "agent dir  : $AGENT_DIR"
 echo "project dir: $PROJECT_DIR"
 echo "model      : ${PQ_MODEL:-(default)}"
-echo "playwright : ${PQ_PLAYWRIGHT:-1 (default)}"
+echo "web mode   : ${PQ_PLAYWRIGHT:-1 (default: 1=Chrome browser, 2=lite HTTP, 0=none)}"
 echo "host extras: audio=$ENABLE_AUDIO music=$ENABLE_MUSIC hf_cache=$ENABLE_HF_CACHE hf_offline=$HF_OFFLINE"
 
 # No Playwright browser-cache bind is needed: the server connects over CDP and
