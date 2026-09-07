@@ -10,7 +10,6 @@ __pycache__/
 # agent stuff
 NOTES.md
 p.md
-project.md
 task_report/
 previous_sessions/
-
+benchmarks/

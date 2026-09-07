@@ -84,7 +84,6 @@ exec bwrap \
   --ro-bind-try /run/systemd/resolve /run/systemd/resolve \
   --ro-bind "$AGENT_DIR" /agent \
   --bind "$PROJECT_DIR" /workspace \
-  --tmpfs /workspace/.pq \
   --unshare-pid \
   --unshare-ipc \
   --unshare-uts \

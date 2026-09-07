@@ -23,7 +23,6 @@ import uuid
 import copy
 import math
 from email.utils import parsedate_to_datetime
-import tiktoken
 from flowmark import reformat_file
 
 # Default per-request output budget is 20K, boosted to 40K on truncation failure.
@@ -241,25 +240,60 @@ NAV_HISTORY = {}
 _SECRET_SUFFIXES = ("_API_KEY", "_TOKEN", "_SECRET", "_PASSWORD")
 
 
-# FINAL DECISION on tokenizer: cl100k_base does not match the registry models'
-# native tokenizers, so local estimates can be off by ~20-40%. acceptable: the
-# primary compaction trigger uses state["last_post_tokens"] (API-reported), not
-# this estimator. the estimator covers only the new_prompt_tokens delta, the
-# first turn, and the no-usage fallback. a model-matched tokenizer would need
-# heavy `transformers` and per-model downloads, not worth the marginal gain.
-_enc = None
+# FINAL DECISION on tokenizer: tiktoken removed; token estimates come from a
+# GPT-2-style pretokenizer regex with cl100k-calibrated per-chunk costs. Fit
+# against real cl100k counts on harness-shaped text: within ~5% on code,
+# markdown, JSON chat messages, shell output, prose and URLs; dense-punctuation
+# JSON (-20%), dictionary word lists (-30%) and random base64 blobs (-50%)
+# underestimate. Acceptable: the primary compaction trigger uses
+# state["last_post_tokens"] (API-reported), not this estimator. The estimator
+# covers only the new_prompt_tokens delta, the first turn, and the no-usage
+# fallback. A model-matched tokenizer would need heavy `transformers` and
+# per-model downloads, not worth the marginal gain (and cl100k itself does not
+# match the registry models' native tokenizers, so exact BPE was not buying
+# accuracy anyway).
+_TOKEN_PAT = re.compile(r"(?:'s|'t|'re|'ve|'m|'ll|'d)| ?[^\W\d_]+| ?\d+| ?[^\s\w]+|\s+(?!\S)|\s+", re.S)
 
 
-def _tok(text):
-    global _enc
-    if _enc is None:
-        _enc = tiktoken.get_encoding("cl100k_base")
-    # untrusted text can contain literal special-token strings like
-    # <|endoftext|>; we measure length, not build prompts, so tiktoken's
-    # special-token check is disabled at every encode site. (a Qwen model card
-    # killed a run this way: the token crashed truncation, the exception
-    # message became a tool result, and the estimator crashed on it.)
-    return _enc.encode(text, disallowed_special=())
+def est_tokens(text):
+    # estimate token count without a tokenizer. never raises on text content:
+    # unlike tiktoken there are no special-token lookups, so untrusted text
+    # (e.g. a page containing a literal <|endoftext|>) is just measured. (a
+    # Qwen model card once killed a run that way: the special token crashed
+    # encode, the exception message became a tool result, and the estimator
+    # crashed on it.)
+    if not text:
+        return 0
+    n = 0
+    for match in _TOKEN_PAT.finditer(text):
+        chunk = match.group()
+        if chunk[0].isspace() and not chunk.strip():
+            # whitespace runs compress hard in BPE (indentation, blank lines)
+            n += 1 if len(chunk) <= 2 else max(1, len(chunk) // 14)
+            continue
+        body = chunk[1:] if chunk[0] == " " else chunk
+        if not body:
+            n += 1
+        elif body[0].isdigit():
+            n += max(1, -(-len(body) // 3))  # cl100k groups digits 1-3 per token
+        elif body[0].isalpha():
+            n += 1 if len(body) <= 6 else 1 + (len(body) - 6) // 5  # common words are 1 token
+        else:
+            n += max(1, -(-len(body) // 3))
+    # utf-8 excess approximates non-ascii cost: ~2 excess bytes per CJK char,
+    # 1 per accented char, and ~2 excess bytes is about 1 token
+    n += (len(text.encode("utf-8")) - len(text)) // 2
+    return n
+
+
+def _chars_for_tokens(text, token_cap):
+    # character budget whose token estimate is about token_cap, or None when
+    # text is already under the cap. converts the token caps above into char
+    # slices so truncation needs no tokenizer.
+    est = est_tokens(text)
+    if est <= token_cap:
+        return None
+    return max(1, len(text) * token_cap // est)
 
 
 def ts():
@@ -449,25 +483,27 @@ def truncate_playwright_text(text):
     # head+tail truncation, mirroring truncate_command_text: keep the top of
     # the page (title, nav, lede) and the bottom (table tails, footers, load
     # markers). head gets the larger share because pages front-load content.
-    toks = _tok(text)
-    if len(toks) <= MAX_PLAYWRIGHT_RESULT_TOKENS:
+    budget = _chars_for_tokens(text, MAX_PLAYWRIGHT_RESULT_TOKENS)
+    if budget is None:
         return text
-    head_n = (MAX_PLAYWRIGHT_RESULT_TOKENS * 2) // 3
-    tail_n = MAX_PLAYWRIGHT_RESULT_TOKENS - head_n
-    head = _enc.decode(toks[:head_n])
-    tail = _enc.decode(toks[-tail_n:])
-    elided = len(toks) - head_n - tail_n
+    head_n = (budget * 2) // 3
+    tail_n = budget - head_n
+    head = text[:head_n]
+    tail = text[-tail_n:]
+    total = est_tokens(text)
+    elided = total - est_tokens(head) - est_tokens(tail)
     # typed banner (NOOA-shaped): models reliably read "str(len_tokens~N,
     # head=H, tail=T)" as an elided string of known size, where the old prose
     # "truncated: N tokens elided" was routinely misread as the total length.
+    # counts are estimates (no tiktoken); see the FINAL DECISION comment.
     return (
         head
         + "\n[str(len_tokens~"
-        + str(len(toks))
+        + str(total)
         + ", head="
-        + str(head_n)
+        + str(est_tokens(head))
         + ", tail="
-        + str(tail_n)
+        + str(est_tokens(tail))
         + "): "
         + str(elided)
         + " tokens elided from the middle of this page. Re-fetching the same URL returns this same truncated view. Use playwright_extract_content with a CSS selector, the site's API or raw data files, or a different source to reach the middle of the page.]\n"
@@ -477,24 +513,24 @@ def truncate_playwright_text(text):
 
 def truncate_file_text(text):
     # head-only: file beginnings carry the structure; see MAX_FILE_READ_TOKENS.
-    toks = _tok(text)
-    if len(toks) <= MAX_FILE_READ_TOKENS:
+    budget = _chars_for_tokens(text, MAX_FILE_READ_TOKENS)
+    if budget is None:
         return text, False
-    head = _enc.decode(toks[:MAX_FILE_READ_TOKENS])
-    return head, True
+    return text[:budget], True
 
 
 def truncate_command_text(text, spill_path=None):
     # head+tail: what ran sits at the top, the final error and exit summary at
     # the bottom; tail gets the larger share.
-    toks = _tok(text)
-    if len(toks) <= MAX_COMMAND_RESULT_TOKENS:
+    budget = _chars_for_tokens(text, MAX_COMMAND_RESULT_TOKENS)
+    if budget is None:
         return text
-    head_n = MAX_COMMAND_RESULT_TOKENS // 3
-    tail_n = MAX_COMMAND_RESULT_TOKENS - head_n
-    head = _enc.decode(toks[:head_n])
-    tail = _enc.decode(toks[-tail_n:])
-    elided = len(toks) - head_n - tail_n
+    head_n = budget // 3
+    tail_n = budget - head_n
+    head = text[:head_n]
+    tail = text[-tail_n:]
+    total = est_tokens(text)
+    elided = total - est_tokens(head) - est_tokens(tail)
     if spill_path:
         # pass-by-reference copy (decided with the user): the path is a handle
         # to the full value; teach query-it / don't-re-run instead of the
@@ -509,11 +545,11 @@ def truncate_command_text(text, spill_path=None):
     return (
         head
         + "\n\n[str(len_tokens~"
-        + str(len(toks))
+        + str(total)
         + ", head="
-        + str(head_n)
+        + str(est_tokens(head))
         + ", tail="
-        + str(tail_n)
+        + str(est_tokens(tail))
         + "): "
         + str(elided)
         + " tokens elided from the middle of this output. "
@@ -539,9 +575,9 @@ def est_messages_tokens(messages):
             # encode failure; the API-reported count corrects it next turn.
             try:
                 if isinstance(val, str):
-                    tokens += len(_tok(val))
+                    tokens += est_tokens(val)
                 else:
-                    tokens += len(_tok(json.dumps(val)))
+                    tokens += est_tokens(json.dumps(val))
             except Exception:
                 s = val if isinstance(val, str) else json.dumps(val, default=str)
                 tokens += len(s) // 3
@@ -1010,11 +1046,13 @@ def _pretrim_for_compaction(history):
             break
         if m.get("role") != "tool" or not isinstance(m.get("content"), str):
             continue
-        toks = _tok(m["content"])
-        if len(toks) <= 1500:
+        est = est_tokens(m["content"])
+        if est <= 1500:
             continue
-        kept = _enc.decode(toks[:500]) + "\n[...trimmed to fit compaction request...]\n" + _enc.decode(toks[-500:])
-        total -= len(toks) - len(_tok(kept))
+        budget = max(1, len(m["content"]) * 1000 // est)
+        half = budget // 2
+        kept = m["content"][:half] + "\n[...trimmed to fit compaction request...]\n" + m["content"][-half:]
+        total -= est - est_tokens(kept)
         m["content"] = kept
 
 
@@ -2057,7 +2095,7 @@ def tool_run_command(command, description="", yield_time_ms=DEFAULT_YIELD_MS, ti
     err_f.close()
     # spill oversized finished output so the elided middle stays reachable;
     # timeout partials and job_output tails stay on plain truncation
-    spill_path = _spill_cmd_output(command, output) if len(_tok(output)) > MAX_COMMAND_RESULT_TOKENS else None
+    spill_path = _spill_cmd_output(command, output) if est_tokens(output) > MAX_COMMAND_RESULT_TOKENS else None
     output = truncate_command_text(output, spill_path)
     log = ts() + "  [tool call] bash: exit " + str(proc.returncode) + " | " + description
     if spill_path:
@@ -2312,8 +2350,7 @@ def tool_web_fetch(mcp, url):
     # stays "fetch_url" and is never model-visible.
     notice = _note_repeat("fetch:" + url)
     text = call_playwright(mcp, "fetch_url", {"url": url}, cap=False)
-    toks = _tok(text)
-    if len(toks) <= MAX_PLAYWRIGHT_RESULT_TOKENS:
+    if est_tokens(text) <= MAX_PLAYWRIGHT_RESULT_TOKENS:
         print(ts() + "[tool call] web_fetch: " + url[:100] + " | " + str(len(text)) + " chars")
         return notice + text
     FETCH_SEQ["n"] += 1
