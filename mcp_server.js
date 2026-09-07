@@ -27,6 +27,14 @@
 // several elements; it snapshots each match (capped) instead.
 // withTab no longer can hang forever: plain tab.close() stalls on tabs
 // stuck on chrome-error pages, so it is raced and forced via CDP.
+// v2.4.1: ddg ad cards (duckduckgo.com/y.js redirects) are filtered out of
+// DDG_EXTRACT instead of appearing as result #1 with a tracking URL.
+// v2.4.2: bugfix - the v2.4.1 filter used a regex with single-backslash
+// escapes inside the DDG_EXTRACT template literal, so the page-side code was
+// a syntax error and EVERY ddg search threw and fell back to brave (seen live
+// 2026-09-07: "page.evaluate: SyntaxError: Unexpected token '.'"). The filter
+// now uses startsWith (no escapes), and extract strings get a syntax
+// self-check at startup so this class of bug dies at spawn, not first search.
 
 const { McpServer } = require('@modelcontextprotocol/sdk/server/mcp.js');
 const { StdioServerTransport } = require('@modelcontextprotocol/sdk/server/stdio.js');
@@ -42,7 +50,7 @@ let browserPromise = null;
 
 const server = new McpServer({
   name: 'playwright-chrome',
-  version: '2.4.0',
+  version: '2.4.2',
 });
 
 function ensureBrowser() {
@@ -232,6 +240,12 @@ const DDG_EXTRACT = `(() => {
     let url = a.href;
     // ddg wraps outbound links in a redirect carrying the target as uddg=
     try { const q = new URL(url).searchParams.get('uddg'); if (q) url = q; } catch (e) {}
+    // ad cards link through duckduckgo.com/y.js with no uddg param; they are
+    // paid placements, not results (seen 2026-09-07: a pergola query returned
+    // an ad as result #1 with a 900-char tracking URL). startsWith, not a
+    // regex: single-backslash escapes in this template literal are eaten
+    // before the page sees them (the v2.4.1 bug).
+    if (url.startsWith('https://duckduckgo.com/y.js')) continue;
     const s = r.querySelector('.result__snippet');
     const snippet = (s ? s.textContent : '').replace(/\\s+/g, ' ').trim();
     out.push({ title: a.textContent.replace(/\\s+/g, ' ').trim(), url, snippet: snippet.slice(0, 300) });
@@ -251,6 +265,19 @@ const ENGINES = {
     extract: BRAVE_EXTRACT,
   },
 };
+
+// extract strings are evaluated as page code, so an escaping mistake inside
+// the template literal above is a runtime SyntaxError on first search, not a
+// startup failure. Parse them here so that class of bug dies at spawn. This
+// check is what v2.4.1 needed: its broken regex shipped unnoticed because
+// every ddg search silently fell back to brave.
+for (const name of Object.keys(ENGINES)) {
+  try {
+    new Function(ENGINES[name].extract);
+  } catch (err) {
+    throw new Error(name + ' extract string does not parse as page code: ' + err.message);
+  }
+}
 
 async function searchOn(engineName, query) {
   const eng = ENGINES[engineName];
