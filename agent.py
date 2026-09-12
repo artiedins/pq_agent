@@ -35,18 +35,15 @@ from flowmark import reformat_file
 MODEL_REGISTRY = {
     "or-gem38": {"provider": "openrouter", "model": "google/gemini-3.8-flash"},
     "or-grok46": {"provider": "openrouter", "model": "x-ai/grok-4.6"},
-    "or-astra": {"provider": "openrouter", "model": "openai/gpt-6-astra", "effort": "medium"},
-    "or-dsv41f": {"provider": "openrouter", "model": "deepseek/deepseek-v4.1-flash"},
-    "go-glm53": {"provider": "opencode-go", "model": "glm-5.3"},  # 220
-    "go-glm53f": {"provider": "opencode-go", "model": "glm-5.3-flash"},  # 6320
-    "go-dsv41f1": {"provider": "opencode-go", "model": "deepseek-flash"},  # 6500
-    "go-dsv41f7": {"provider": "opencode-go", "model": "deepseek-flash", "temperature": 0.7},  # 6500
-    "go-omen": {"provider": "opencode-go", "model": "omen-alpha"},  # 11600
-    "go-dsv4f": {"provider": "opencode-go", "model": "deepseek-v4-flash", "temperature": 0.7},  # 13000
+    "or-astra": {"provider": "openrouter", "model": "openai/gpt-6-astra"},
+    "go-glm53": {"provider": "opencode-go", "model": "glm-5.3"},
+    "go-dsv41f": {"provider": "opencode-go", "model": "deepseek-flash"},
+    "go-glm53f": {"provider": "opencode-go", "model": "glm-5.3-flash"},
+    "go-omen": {"provider": "opencode-go", "model": "omen-alpha"},
 }
 
 
-MODEL_ID = os.environ.get("PQ_MODEL", "go-omen")
+MODEL_ID = os.environ.get("PQ_MODEL", "go-dsv41f")
 if MODEL_ID not in MODEL_REGISTRY:
     sys.exit("Error: unknown model '" + MODEL_ID + "'. " "Known models: " + ", ".join(sorted(MODEL_REGISTRY.keys())))
 
