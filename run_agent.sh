@@ -2,6 +2,7 @@
 
 # Launch agent.py inside bubblewrap. The project is writable at /workspace;
 # harness code is read-only at /agent. Network access and host Chrome are shared.
+# GPU device nodes are exposed when ENABLE_GPU=1 (no-op on hosts without them).
 # This is filesystem/process isolation, not isolation from all host capabilities.
 # PQ_MODEL selects the registry entry, PQ_API_KEY its provider key, and
 # PQ_PLAYWRIGHT the web backend: 1 (default) = headed Chrome via the Node MCP
@@ -20,6 +21,12 @@ ENABLE_AUDIO=0
 ENABLE_MUSIC=0
 ENABLE_HF_CACHE=0
 HF_OFFLINE=0
+# GPU access: bind the NVIDIA character devices and the DRM render nodes into the
+# sandbox, which bwrap's --dev does not provide. Nothing is bound when the nodes
+# are absent, so this stays correct on a host without a GPU. The KMS master nodes
+# (/dev/dri/card*) are deliberately left out: they would let the sandbox take over
+# the display, and nothing here needs them.
+ENABLE_GPU=1
 
 AGENT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [ $# -eq 0 ]; then
@@ -65,12 +72,20 @@ fi
 if [ "$HF_OFFLINE" = 1 ]; then
     EXTRA_ARGS+=(--setenv HF_HUB_OFFLINE 1)
 fi
+if [ "$ENABLE_GPU" = 1 ]; then
+    # Globs expand against the host /dev before bwrap starts; a pattern with no
+    # match stays literal and the -e test drops it.
+    for dev in /dev/nvidia[0-9]* /dev/nvidiactl /dev/nvidia-modeset /dev/nvidia-uvm \
+               /dev/nvidia-uvm-tools /dev/nvidia-caps /dev/dri/render*; do
+        [ -e "$dev" ] && EXTRA_ARGS+=(--dev-bind "$dev" "$dev")
+    done
+fi
 
 echo "agent dir  : $AGENT_DIR"
 echo "project dir: $PROJECT_DIR"
 echo "model      : ${PQ_MODEL:-(default)}"
 echo "web mode   : ${PQ_PLAYWRIGHT:-1 (default: 1=Chrome browser, 2=lite HTTP, 0=none)}"
-echo "host extras: audio=$ENABLE_AUDIO music=$ENABLE_MUSIC hf_cache=$ENABLE_HF_CACHE hf_offline=$HF_OFFLINE"
+echo "host extras: audio=$ENABLE_AUDIO music=$ENABLE_MUSIC hf_cache=$ENABLE_HF_CACHE hf_offline=$HF_OFFLINE gpu=$ENABLE_GPU"
 
 # No Playwright browser-cache bind is needed: the server connects over CDP and
 # does not launch a downloaded browser. Private temporary files remain writable.

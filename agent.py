@@ -25,19 +25,27 @@ import math
 from email.utils import parsedate_to_datetime
 from flowmark import reformat_file
 
-# Default per-request output budget is 20K, boosted to 40K on truncation failure.
-# Compaction triggers at MAX_CONTEXT_LENGTH (~150K), well inside every model's context.
-# Thinking effort is per-model (registry key "effort", default "high"): the
-# openrouter Go models were benchmarked at high; gpt-6-astra is pinned to
-# medium per spec. apply_reasoning sets the provider-specific wire format.
-
-
 MODEL_REGISTRY = {
-    "or-astra": {"provider": "openrouter", "model": "openai/gpt-6-astra"},
-    # with **calls per 5h**
-    "go-glm53": {"provider": "opencode-go", "model": "glm-5.3"},  # **198**
-    "go-glm53f": {"provider": "opencode-go", "model": "glm-5.3-flash"},  # **6,316**
-    "go-dsv41f": {"provider": "opencode-go", "model": "deepseek-flash"},  # **26,008**
+    "or-sol": {"provider": "openrouter", "model": "openai/gpt-6.1-sol:floor"},
+    "or-argon": {"provider": "openrouter", "model": "google/gemini-4-argon:floor"},
+    "or-grok47": {"provider": "openrouter", "model": "x-ai/grok-4.7:floor"},
+    "or-nemo3u": {"provider": "openrouter", "model": "nvidia/nemotron-3-ultra-550b-a55b:free:floor"},
+    "or-spark12": {"provider": "openrouter", "model": "meta/muse-spark-1.2-contributor:floor"},
+    #
+    "or-opus": {"provider": "openrouter", "model": "anthropic/claude-opus-5.5:floor"},
+    "or-astra": {"provider": "openrouter", "model": "openai/gpt-6-astra:floor"},
+    "or-gem38f": {"provider": "openrouter", "model": "google/gemini-3.8-flash:floor"},
+    #
+    "or-nemo35s": {"provider": "openrouter", "model": "nvidia/nemotron-3.5-super-vl:free:floor"},
+    "go-beam": {"provider": "opencode-go", "model": "beam-free"},  # free ----- 19
+    "go-dsv41f": {"provider": "opencode-go", "model": "deepseek-v4.1-flash"},  # 34,670---- 23
+    "go-mimo26f": {"provider": "opencode-go", "model": "mimo-v2.6-flash"},
+    "go-minimax3": {"provider": "opencode-go", "model": "minimax-m3"},
+    "go-step5": {"provider": "opencode-go", "model": "step-5-preview"},
+    "go-hy4": {"provider": "opencode-go", "model": "hy4-preview"},
+    "go-glm53": {"provider": "opencode-go", "model": "glm-5.3"},  # 220 ---- 15
+    "go-glm53f": {"provider": "opencode-go", "model": "glm-5.3-flash"},  # 6,320 ---- 18
+    "go-kimi3": {"provider": "opencode-go", "model": "kimi-k3"},  # 110 ---- 42
 }
 
 
@@ -155,19 +163,18 @@ WEB_LITE = None
 # without sending anything to the LLM. Useful for debugging prompt construction.
 DEBUG_PROMPTS = False
 
-# Soft tool-call budget. The model is told the budget in the system prompt and
-# gets injected notices as it approaches and exceeds it. There is no hard stop;
-# pq_minder's wall clock remains the only hard limit.
+# Soft tool-call budget stated in the system prompt for pacing. The harness no
+# longer injects notices as the call count approaches or exceeds it: current
+# models judge for themselves when the task is done or still unfinished. There is
+# no hard stop; pq_minder's wall clock remains the only hard limit.
 MAX_STEPS_SUGGESTION = 175
 
-# Context-pressure escalation, independent of the tool-call budget above. Once a
-# session has compacted COMPACTION_PRESSURE_THRESHOLD times it is losing fidelity
-# on every further compaction, so when it refills context past CTX_FINISH_FRACTION
-# of MAX_CONTEXT_LENGTH we fire finish notices. CTX_PRECOMPACT_FRACTION fires a
-# pre-compaction warning once regardless of compaction count.
-COMPACTION_PRESSURE_THRESHOLD = 2
-CTX_FINISH_FRACTION = 0.90
-CTX_PRECOMPACT_FRACTION = 0.80
+# Single pre-compaction warning. When context refills past CTX_PRECOMPACT_FRACTION
+# of MAX_CONTEXT_LENGTH the harness fires one advisory notice: finish now if the
+# task is nearly done, otherwise prepare for the coming context summary. The flag
+# re-arms whenever a compaction drops fill back below half. There is no separate
+# finish-forcing notice and no compaction-pressure gate.
+CTX_PRECOMPACT_FRACTION = 0.92
 
 # conservative context cap and compaction trigger (see chat()). long-context
 # quality degrades before nominal limits and compaction is fragile: bigger
@@ -3002,20 +3009,21 @@ def make_system_prompt():
         "\n### Coding Guide\n"
         "Write R&D Python, and if you use another language, apply these rules in spirit.\n"
         "Fit the code to the task with experienced judgment. You support a small team of AI/ML researchers: the code does not need to meet production standards, but it must be readable and easy to use or extend.\n"
-        "- Python: no function type hints (dataclass field annotations are fine), no docstrings, no triple-quoted multiline strings, no decorative section dividers, no banner comments. End scripts with an `if __name__ == '__main__':` block that only calls `main()`.\n"
+        "- The user created this custom harness, and took great care in crafting all prompts and tools. You must show a similar level of care for any codebases you develop, displaying good taste in code organization and architecture.\n"
+        "- Python: no function type hints (dataclass field annotations are fine), no docstrings, no triple-quoted multiline strings, no decorative section dividers, and no banner comments. End scripts with `if __name__ == '__main__':` that only calls `main()`.\n"
         "- No command line arguments or argument processing unless the user explicitly asks for them, and even then keep them minimal and the processing simple.\n"
         "- Start every script with a shebang line.\n"
         "- Keep project directories neat. Keep code files neither too long nor too numerous; balance this with your best judgment.\n"
         "- Capture experiment settings (e.g. hyperparameters) in a single dataclass.\n"
-        "- Comments: use them to make reading code frictionless for experienced programmers, to record real-world effects that pure logic cannot reveal, and to document decisions so new agents or programmers do not revisit them. Do not narrate obvious syntax.\n"
-        "- Verification: when requested, run the real tests and quote the real observed output. Keep the check independent of the code under test (repo tests, ground truth files, a second method). Never narrow, skip, or delete tests to make a failing run pass.\n"
+        "- Comments should reduce reading friction, record real-world effects and errors, and document decisions so new agents or programmers do not revisit them. Do not narrate obvious syntax.\n"
+        "- When verification is requested, run real tests and quote the observed output. Keep checks independent of the code under test. Never narrow, skip, or delete tests to make a failing run pass.\n"
         "\n### Writing Guide\n"
-        "Write so the user acquires knowledge quickly, and get to the point without jargon. Anything you create, code comments or task reports, should be easy to skim.\n"
+        "Write so the user gains knowledge quickly, and get to the point without jargon. Anything you create, code comments or task reports, should be easy to skim.\n"
         "Write a record, not a performance. This is the standard: `Brave hit bot walls on the exact phrase but direct fetches and the site API worked.`\n"
         "Test each sentence: does it name a thing that did something, and could the reader act on it or check it? If not, cut or rewrite it.\n"
         "Avoid mannered prose, which is text written for show instead of direct statement. Some examples are provided in this section. Mannered prose irritates and the fix is to say what you mean, using literal phrases without showing off.\n"
         "After writing, review your work for LLM habits or mannered prose. The user finds them distracting; remove them from your writing. Then reread once for factual overstatement, and once more for words that add no information. Check and fix:\n"
-        "- Use commas or separate sentences, **no em dashes**\n"
+        "- Use commas or separate sentences, never em dashes.\n"
         "- Use standard English words with variety; an uncommon word is fine when it fits. Do not use shorthand or reasoning fragments.\n"
         "- Start with the answer or observed result. Cut generic setup such as 'You asked' or 'It is important to note'.\n"
         "- Prefer a concrete subject and verb: 'Brave hit a bot wall', not 'friction was encountered'.\n"
@@ -3027,8 +3035,8 @@ def make_system_prompt():
         "- More mannered prose examples: Instead of 'a parameter worth varying,' the mannered writer produces 'a dial worth turning.' Instead of 'this point still matters,' they write 'this point earns its keep.'\n"
         "- Preserve useful technical terms; replace jargon only when a plainer word is equally exact.\n"
         "- Cut repetition, self-congratulation, and claims about the text's clarity or usefulness. Let the text show those qualities.\n"
-        "- Do not perform a persona or invent stakes. Avoid staged intimacy, defiance, wonder, and urgency; facts carry authority.\n"
-        "- Edit for clarity and directness: **trim unnecessary verbosity**.\n"
+        "- Do not perform a persona or invent stakes. Avoid staged intimacy, defiance, wonder, and urgency; presenting facts in clear language will have more impact.\n"
+        "- Edit for clarity and directness, and expect the user to request improvements to prose that sounds too much like an LLM.\n"
         "\n### Write Task Report\n"
         "When the task is done, use Joseph Grinnell's field-note standard: specific observations, kept separate from interpretation, written so a stranger can use them decades later. Write `task_report/report.md` in clear, direct language. The report is your main communication with the user and your context for future sessions. Bring the user to a deep understanding quickly, and record facts that remain useful for future tasks. Use markdown formatting driven by your good design judgment to make reading the rendered report effortless.\n"
         "Task report template:\n"
@@ -3334,8 +3342,6 @@ def main():
     print(ts() + "Starting agent loop...\n")
 
     tool_calls_done = 0
-    warned_over_calls = False
-    warned_over_ctx = False
     warned_precompact = False
     report_rescues = 0
     length_rescues = 0
@@ -3449,68 +3455,24 @@ def main():
                 else:
                     new_messages.append({"role": "user", "content": status})
 
-                # soft budget notices
                 print("TTC", tool_calls_done, flush=True)
-                ctx_tokens = state["last_post_tokens"]
-                ctx_frac = (ctx_tokens / MAX_CONTEXT_LENGTH) if MAX_CONTEXT_LENGTH else 0.0
-                ctx_pressure = state["compaction_count"] >= COMPACTION_PRESSURE_THRESHOLD
+                ctx_frac = (state["last_post_tokens"] / MAX_CONTEXT_LENGTH) if MAX_CONTEXT_LENGTH else 0.0
 
-                # fire every 25th call past 250, not every call: a stubborn run
-                # was stacking an identical scolding onto every single turn,
-                # polluting the very context we were begging it to conserve
-                if tool_calls_done > 250 and tool_calls_done % 25 == 0:
-                    print("-- STRONGEST WARNING TO WRAP UP ---", flush=True)
-                    reason = "You have used " + str(tool_calls_done) + " tool calls, far past the suggested budget for this task."
-                    new_messages.append(
-                        {
-                            "role": "user",
-                            "content": "[harness notice] " + reason + " Follow system instructions to write task_report/report.md immediately. This overrides the Agent Guide keep-going rule.",
-                        }
-                    )
-
+                # a compaction drops fill back below half, re-arming the notice
                 if ctx_frac < 0.5:
-                    warned_over_ctx = False
                     warned_precompact = False
 
-                # pre-compaction warning: fires once regardless of compaction count,
-                # giving the model a chance to write findings to files before compaction
+                # single pre-compaction warning: fires once per fill cycle, giving
+                # the model a chance to finish or write findings to files first
                 if not warned_precompact and ctx_frac >= CTX_PRECOMPACT_FRACTION:
                     warned_precompact = True
                     print("-- PRE-COMPACTION WARNING ---", flush=True)
                     new_messages.append(
                         {
                             "role": "user",
-                            "content": "[harness notice] Context is " + "{:.0f}".format(ctx_frac * 100) + "% full. "
-                            "Consider updating NOTES.md and writing important findings to files now, as context compaction may happen soon. "
-                            "Information in files survives compaction; information only in message history may be compressed.",
-                        }
-                    )
-
-                steps_finish = tool_calls_done >= MAX_STEPS_SUGGESTION
-                ctx_finish = ctx_pressure and ctx_frac >= CTX_FINISH_FRACTION
-
-                if not warned_over_calls and steps_finish:
-                    warned_over_calls = True
-                    print("-- REQUEST TO FINISH ---", flush=True)
-                    reason = "You have exceeded the suggested budget of " + str(MAX_STEPS_SUGGESTION) + " tool calls."
-                    new_messages.append(
-                        {
-                            "role": "user",
-                            "content": "[harness notice] "
-                            + reason
-                            + " Finish now: verify what you have, write task_report/report.md, and reply with your completion confirmation. This overrides the Agent Guide keep-going rule.",
-                        }
-                    )
-                if not warned_over_ctx and ctx_finish:
-                    warned_over_ctx = True
-                    print("-- REQUEST TO FINISH ---", flush=True)
-                    reason = "Context is " + "{:.0f}".format(ctx_frac * 100) + "% full after " + str(state["compaction_count"]) + " compactions, and another compaction would lose fidelity."
-                    new_messages.append(
-                        {
-                            "role": "user",
-                            "content": "[harness notice] "
-                            + reason
-                            + " Finish now: verify what you have, write task_report/report.md, and reply with your completion confirmation. This overrides the Agent Guide keep-going rule.",
+                            "content": "[harness notice] Context is " + "{:.0f}".format(ctx_frac * 100) + "% full, so the harness will need a context summary soon. "
+                            "If you are close to finishing, now is a good time to write task_report/report.md and finish: you can complete the task without a summary. "
+                            "If you have more work to do, keep going, write details in NOTES.md or other files, and be ready to write your context summary in about five turns.",
                         }
                     )
 
