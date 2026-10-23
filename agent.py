@@ -33,9 +33,9 @@ MODEL_REGISTRY = {
     # busy or failing endpoint errors instead of silently rerouting to another
     # host with different weights or quantization. Leave it out to let
     # OpenRouter pick by price.
+    "or-gpt61sol": {"provider": "openrouter", "model": "openai/gpt-6.1-sol", "endpoint": "openai/flex"},
     "or-argon": {"provider": "openrouter", "model": "google/gemini-4-argon", "endpoint": "google-ai-studio/flex"},
     "or-grok47": {"provider": "openrouter", "model": "x-ai/grok-4.7", "endpoint": "xai/zdr"},
-
     "or-spark12": {"provider": "openrouter", "model": "meta/muse-spark-1.2-contributor", "endpoint": "meta"},
     "or-gpt56luna": {"provider": "openrouter", "model": "openai/gpt-5.6-luna", "endpoint": "openai/flex"},
     "or-gpt6luna": {"provider": "openrouter", "model": "openai/gpt-6-luna", "endpoint": "openai/flex"},
@@ -858,6 +858,23 @@ def _drop_current_turn(messages):
     return dropped
 
 
+def _one_line(text, limit=120):
+    # urllib3 exception text runs long and can hold newlines; keep log lines flat.
+    # urllib3 puts the host at the front and the cause at the end, so trim the
+    # middle rather than dropping the tail.
+    flat = " ".join(str(text).split())
+    if len(flat) <= limit:
+        return flat
+    head = limit * 2 // 5
+    return flat[:head] + " ... " + flat[-(limit - head - 5) :]
+
+
+def _budget_exhausted(completed):
+    # names the failure the run log showed only as a bare traceback
+    noun = "attempt" if completed == 1 else "attempts"
+    return "API retry budget exhausted after " + str(completed) + " " + noun + " (budget=" + str(API_RETRY_BUDGET_SECONDS) + "s)"
+
+
 def post_with_retry(payload, attempts=15, state=None):
     if attempts < 1:
         raise ValueError("attempts must be positive")
@@ -869,19 +886,26 @@ def post_with_retry(payload, attempts=15, state=None):
             delay = max(backoff_delay(attempt), retry_after)
             # Do not retry earlier than the server asked or sleep beyond our budget.
             if delay >= deadline - time.monotonic():
-                raise TimeoutError("API retry budget exhausted before next attempt")
+                raise TimeoutError(_budget_exhausted(attempt))
             print(ts() + "  [retry] waiting {:.1f}s before attempt {}".format(delay, attempt + 1))
             time.sleep(delay)
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            raise TimeoutError("API retry budget exhausted")
+            raise TimeoutError(_budget_exhausted(attempt))
         retry_after = 0
         request_start = time.monotonic()
+        request_timeout = min(API_REQUEST_TIMEOUT, remaining)
+        # Log before sending, so a long wait is interpretable while it happens.
+        # request_timeout is a per-socket-operation timeout, not a deadline on
+        # the whole exchange; budget_left is what the retry loop has left.
+        print(ts() + "  [request] attempt=" + str(attempt + 1) + "/" + str(attempts) + " sending, timeout={:.1f}s, budget_left={:.1f}s".format(request_timeout, remaining))
         try:
-            resp = requests.post(_API_URL, headers=_API_HEADERS, json=payload, timeout=min(API_REQUEST_TIMEOUT, remaining))
-        except requests.exceptions.Timeout:
+            resp = requests.post(_API_URL, headers=_API_HEADERS, json=payload, timeout=request_timeout)
+        except requests.exceptions.Timeout as e:
+            # Observation only: the "[retry] waiting" line announces any next
+            # attempt, and it is printed after the budget check admits one.
+            print(ts() + "  [error] request timed out (" + type(e).__name__ + "), attempt " + str(attempt + 1) + "/" + str(attempts) + ": " + _one_line(e))
             if attempt < attempts - 1:
-                print(ts() + "  [error] request timed out, retrying (attempt " + str(attempt + 1) + "/" + str(attempts) + ")...")
                 continue
             raise
         except (requests.exceptions.ConnectionError, requests.exceptions.ChunkedEncodingError) as e:
@@ -889,8 +913,8 @@ def post_with_retry(payload, attempts=15, state=None):
             # ConnectionError (requests >= 2.22), so listing it explicitly
             # catches mid-body connection deaths. transient faults, not account
             # errors; also covers "local server not up yet".
+            print(ts() + "  [error] connection error (" + type(e).__name__ + "), attempt " + str(attempt + 1) + "/" + str(attempts) + ": " + _one_line(e))
             if attempt < attempts - 1:
-                print(ts() + "  [error] connection error, retrying (attempt " + str(attempt + 1) + "/" + str(attempts) + "): " + str(e)[:120])
                 continue
             raise
         finally:
@@ -902,7 +926,7 @@ def post_with_retry(payload, attempts=15, state=None):
         # Retry transient failures, not account or authentication errors.
         if (resp.status_code == 429 or resp.status_code >= 500) and attempt < attempts - 1:
             retry_after = retry_after_seconds(resp.headers)
-            print(ts() + "  [error] " + str(resp.status_code) + " transient error, retrying (attempt " + str(attempt + 1) + "/" + str(attempts) + ")...")
+            print(ts() + "  [error] " + str(resp.status_code) + " transient error, attempt " + str(attempt + 1) + "/" + str(attempts))
             continue
         if not resp.ok:
             print(ts() + "\n[error] status=" + str(resp.status_code))
@@ -922,17 +946,17 @@ def post_with_retry(payload, attempts=15, state=None):
                     if "function arguments" in body_lower or "tool call" in body_lower or "tool_calls" in body_lower:
                         if _sanitize_tool_calls(msg_list) > 0:
                             payload_repaired = True
-                            print(ts() + "  [error] 400 invalid tool call in history, repaired and retrying...")
+                            print(ts() + "  [error] 400 invalid tool call in history, repaired payload, attempt " + str(attempt + 1) + "/" + str(attempts))
                             continue
                     if "duplicate field" in body_lower and "reasoning" in body_lower:
                         if _strip_reasoning_fields(msg_list) > 0:
                             payload_repaired = True
-                            print(ts() + "  [error] 400 duplicate reasoning field in history, stripped and retrying...")
+                            print(ts() + "  [error] 400 duplicate reasoning field in history, stripped it, attempt " + str(attempt + 1) + "/" + str(attempts))
                             continue
                     if "thought signature" in body_lower or "thought_signature" in body_lower:
                         if _repair_thought_signature(msg_list):
                             payload_repaired = True
-                            print(ts() + "  [error] 400 thought-signature error, dropped poisoned turn and retrying...")
+                            print(ts() + "  [error] 400 thought-signature error, dropped poisoned turn, attempt " + str(attempt + 1) + "/" + str(attempts))
                             continue
         resp.raise_for_status()
         # 200 OK can still carry a truncated or SSE-style body (seen most often
@@ -944,7 +968,7 @@ def post_with_retry(payload, attempts=15, state=None):
         except ValueError as e:
             if attempt < attempts - 1:
                 body_preview = resp.text[:200].replace("\n", " ").strip()
-                print(ts() + "  [error] response body not valid JSON, retrying (attempt " + str(attempt + 1) + "/" + str(attempts) + "): " + str(e))
+                print(ts() + "  [error] response body not valid JSON, attempt " + str(attempt + 1) + "/" + str(attempts) + ": " + _one_line(e))
                 if body_preview:
                     print("  body: " + body_preview)
                 continue
@@ -975,11 +999,11 @@ def post_with_retry(payload, attempts=15, state=None):
                 if attempt < attempts - 1 and not payload_repaired and isinstance(msg_list, list) and "thought signature" in body_lower:
                     if _repair_thought_signature(msg_list):
                         payload_repaired = True
-                        print(ts() + "  [error] 400 thought-signature error (code=" + str(code) + "), dropped poisoned turn and retrying...")
+                        print(ts() + "  [error] 400 thought-signature error (code=" + str(code) + "), dropped poisoned turn, attempt " + str(attempt + 1) + "/" + str(attempts))
                         continue
                 raise RuntimeError("API error " + str(code) + ": " + msg)
             if attempt < attempts - 1:
-                print(ts() + "  [error] response has error instead of choices (code=" + str(code) + "), retrying (attempt " + str(attempt + 1) + "/" + str(attempts) + "): " + msg[:120])
+                print(ts() + "  [error] response has error instead of choices (code=" + str(code) + "), attempt " + str(attempt + 1) + "/" + str(attempts) + ": " + _one_line(msg))
                 continue
             raise RuntimeError("API error after retries: " + str(code) + ": " + msg)
         # well-formed JSON can still be unusable (empty choices, no message
@@ -987,7 +1011,7 @@ def post_with_retry(payload, attempts=15, state=None):
         choices = data.get("choices")
         if not (isinstance(choices, list) and choices and isinstance(choices[0], dict) and isinstance(choices[0].get("message"), dict)):
             if attempt < attempts - 1:
-                print(ts() + "  [error] response missing choices[0].message, retrying (attempt " + str(attempt + 1) + "/" + str(attempts) + ")...")
+                print(ts() + "  [error] response missing choices[0].message, attempt " + str(attempt + 1) + "/" + str(attempts))
                 continue
             raise RuntimeError("API response missing choices[0].message after retries")
         break
