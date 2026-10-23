@@ -1,15 +1,7 @@
-# node
 node_modules/
 package-lock.json
-
-# python
-__pycache__/
+.env
 *.pyc
-*.pyo
-
-# agent stuff
-NOTES.md
 p.md
-task_report/
 previous_sessions/
-benchmarks/
+task_report/
