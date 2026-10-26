@@ -26,43 +26,20 @@ from email.utils import parsedate_to_datetime
 from flowmark import reformat_file
 
 MODEL_REGISTRY = {
-    # "provider" picks the API this harness calls (openrouter, opencode-go,
-    # opencode-zen). "endpoint" is the second, narrower choice, OpenRouter-only:
-    # an endpoint slug copied from the model page, e.g. "morph/fp8" or
-    # "wafer/us". It goes out as provider.order with allow_fallbacks false, so a
-    # busy or failing endpoint errors instead of silently rerouting to another
-    # host with different weights or quantization. Leave it out to let
-    # OpenRouter pick by price.
-    "or-gpt61sol": {"provider": "openrouter", "model": "openai/gpt-6.1-sol", "endpoint": "openai/flex"},
-    "or-argon": {"provider": "openrouter", "model": "google/gemini-4-argon", "endpoint": "google-ai-studio/flex"},
+    "or-astra": {"provider": "openrouter", "model": "openai/gpt-6-astra", "endpoint": "azure"},
+    "or-sol61": {"provider": "openrouter", "model": "openai/gpt-6.1-sol", "endpoint": "azure"},
+    "or-opus55": {"provider": "openrouter", "model": "anthropic/claude-opus-5.5", "endpoint": "amazon-bedrock"},
+    "or-argon": {"provider": "openrouter", "model": "google/gemini-4-argon", "endpoint": "google-vertex/global"},
+    "or-gem38f": {"provider": "openrouter", "model": "google/gemini-3.8-flash", "endpoint": "google-vertex/global/flex"},
+    "or-dsv41f": {"provider": "openrouter", "model": "deepseek/deepseek-v4.1-flash-1017", "endpoint": "morph/fp8"},
+    "or-spark12": {"provider": "openrouter", "model": "meta/muse-spark-1.2", "endpoint": "meta"},
+    "go-mimo26p": {"provider": "opencode-go", "model": "mimo-v2.6-pro"},
     "or-grok47": {"provider": "openrouter", "model": "x-ai/grok-4.7", "endpoint": "xai/zdr"},
-    "or-spark12": {"provider": "openrouter", "model": "meta/muse-spark-1.2-contributor", "endpoint": "meta"},
-    "or-gpt56luna": {"provider": "openrouter", "model": "openai/gpt-5.6-luna", "endpoint": "openai/flex"},
-    "or-gpt6luna": {"provider": "openrouter", "model": "openai/gpt-6-luna", "endpoint": "openai/flex"},
+    "or-glm53": {"provider": "openrouter", "model": "z-ai/glm-5.3", "endpoint": "primeintellect"},
+    "or-luna6": {"provider": "openrouter", "model": "openai/gpt-6-luna", "endpoint": "azure"},
+    "or-gem31p": {"provider": "openrouter", "model": "gemini-3.1-pro-preview", "endpoint": "google-vertex/global/flex"},
     #
-    "or-dsv41f-morph": {"provider": "openrouter", "model": "deepseek/deepseek-v4.1-flash-1017", "endpoint": "morph/fp8"},
-    "or-dsv41f-ion": {"provider": "openrouter", "model": "deepseek/deepseek-v4.1-flash-1017", "endpoint": "ionstream"},
-    "or-dsv41f-wafer": {"provider": "openrouter", "model": "deepseek/deepseek-v4.1-flash-1017", "endpoint": "wafer/mxfp4"},
-    "or-dsv41f-infnet": {"provider": "openrouter", "model": "deepseek/deepseek-v4.1-flash-1017", "endpoint": "inference-net/fp8"},
-    #
-    "or-glm53-wafer": {"provider": "openrouter", "model": "z-ai/glm-5.3", "endpoint": "wafer/us"},
-    "or-glm53-prime": {"provider": "openrouter", "model": "z-ai/glm-5.3", "endpoint": "primeintellect"},
-    "or-glm53-infnet": {"provider": "openrouter", "model": "z-ai/glm-5.3", "endpoint": "inference-net/us"},
-    "or-glm53f-together": {"provider": "openrouter", "model": "z-ai/glm-5.3-flash", "endpoint": "together"},
-    "or-glm53f-fw": {"provider": "openrouter", "model": "z-ai/glm-5.3-flash", "endpoint": "fireworks/us"},
-    #
-    "go-beam": {"provider": "opencode-go", "model": "beam-free"},  # free
-    "go-dsv41f": {"provider": "opencode-go", "model": "deepseek-v4.1-flash"},  # 34,670
-    "go-mimo26f": {"provider": "opencode-go", "model": "mimo-v2.6-flash"},  # 30,100
-    "go-omen": {"provider": "opencode-go", "model": "omen-alpha"},  # 11,600
-    "go-glm53f": {"provider": "opencode-go", "model": "glm-5.3-flash"},  # 6,320
-    "go-qwen38f": {"provider": "opencode-go", "model": "qwen3.8-flash"},  # 5,400
-    "go-minimax31f": {"provider": "opencode-go", "model": "minimax-m3.1-flash"},  # 3,880
-    "go-mimo26p": {"provider": "opencode-go", "model": "mimo-v2.6-pro"},  # 3,250
-    "go-step5": {"provider": "opencode-go", "model": "step-5-preview"},  # 1,720
-    "go-hy4": {"provider": "opencode-go", "model": "hy4-preview"},  # 1,350
-    "go-glm53": {"provider": "opencode-go", "model": "glm-5.3"},  # 220
-    "go-qwen38m": {"provider": "opencode-go", "model": "qwen3.8-max"},  # 160
+    "go-dsv41f": {"provider": "opencode-go", "model": "deepseek-v4.1-flash"},
 }
 
 
