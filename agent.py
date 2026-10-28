@@ -26,20 +26,26 @@ from email.utils import parsedate_to_datetime
 from flowmark import reformat_file
 
 MODEL_REGISTRY = {
-    "or-astra": {"provider": "openrouter", "model": "openai/gpt-6-astra", "endpoint": "azure"},
-    "or-sol61": {"provider": "openrouter", "model": "openai/gpt-6.1-sol", "endpoint": "azure"},
+    "or-astra": {"provider": "openrouter", "model": "openai/gpt-6-astra", "endpoint": "openai/flex"},
+    "or-sol61": {"provider": "openrouter", "model": "openai/gpt-6.1-sol", "endpoint": "openai/flex"},
     "or-opus55": {"provider": "openrouter", "model": "anthropic/claude-opus-5.5", "endpoint": "amazon-bedrock"},
     "or-argon": {"provider": "openrouter", "model": "google/gemini-4-argon", "endpoint": "google-vertex/global"},
     "or-gem38f": {"provider": "openrouter", "model": "google/gemini-3.8-flash", "endpoint": "google-vertex/global/flex"},
     "or-dsv41f": {"provider": "openrouter", "model": "deepseek/deepseek-v4.1-flash-1017", "endpoint": "morph/fp8"},
     "or-spark12": {"provider": "openrouter", "model": "meta/muse-spark-1.2", "endpoint": "meta"},
-    "go-mimo26p": {"provider": "opencode-go", "model": "mimo-v2.6-pro"},
     "or-grok47": {"provider": "openrouter", "model": "x-ai/grok-4.7", "endpoint": "xai/zdr"},
     "or-glm53": {"provider": "openrouter", "model": "z-ai/glm-5.3", "endpoint": "primeintellect"},
-    "or-luna6": {"provider": "openrouter", "model": "openai/gpt-6-luna", "endpoint": "azure"},
+    "or-luna6": {"provider": "openrouter", "model": "openai/gpt-6-luna", "endpoint": "openai/flex"},
     "or-gem31p": {"provider": "openrouter", "model": "gemini-3.1-pro-preview", "endpoint": "google-vertex/global/flex"},
+    "or-terra61": {"provider": "openrouter", "model": "openai/gpt-6.1-terra", "endpoint": "openai/flex"},
     #
+    "go-argon": {"provider": "opencode-go", "model": "gemini-4-argon"},
     "go-dsv41f": {"provider": "opencode-go", "model": "deepseek-v4.1-flash"},
+    "go-mimo26p": {"provider": "opencode-go", "model": "mimo-v2.6-pro"},
+    "go-grok47": {"provider": "opencode-go", "model": "grok-4.7"},
+    "go-glm53": {"provider": "opencode-go", "model": "glm-5.3"},
+    "go-luna6": {"provider": "opencode-go", "model": "gpt-6-luna"},
+    "go-kimi31p": {"provider": "opencode-go", "model": "kimi-k3.1-pro"},
 }
 
 

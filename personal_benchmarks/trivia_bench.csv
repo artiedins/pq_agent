@@ -23,8 +23,8 @@
 2026_10_22,openai/gpt-6-sol,azure,49.3
 2026_10_22,openai/gpt-6.1-sol,azure,60.7
 2026_10_22,qwen/qwen3.8-max-0902,alibaba/us-east-1,22.3
-2026_10_22,qwen3.8-flash,opencode-go,4.7
 2026_10_22,x-ai/grok-4.7,xai/zdr,23.3
 2026_10_22,xiaomi/mimo-v2.6-pro,gmicloud/bf16,23
 2026_10_22,z-ai/glm-5.3,primeintellect,22.3
 2026_10_22,z-ai/glm-5.3-flash,together,29.7
+2026_10_27,openai/gpt-6.1-terra,openai/flex,40.3
