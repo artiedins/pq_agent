@@ -291,6 +291,13 @@ TOUCHED = {"read": set(), "modified": set()}
 # returns the identical truncation and just burns context)
 NAV_HISTORY = {}
 
+# Wall clock origin for the status line. No per-run timeout is set anywhere, so
+# the only limit on a run is the wall clock: a run 40 minutes in has to see that
+# number to pace itself. PQ_DEADLINE_MINUTES, when a caller sets it, prints as
+# "14m/45m" instead of "14m".
+RUN_START = {"t": time.time()}
+DEADLINE_MINUTES = 0
+
 # The vision skill belongs to the project, not the harness: it lives at
 # <workspace>/skills/vision_skill, so installing the harness in one directory and
 # running it against a project in another still finds the project's skill. It is
@@ -366,6 +373,55 @@ def vision_setup():
     if not os.path.isfile(VISION_SCRIPT) or not vision_has_key():
         return None
     return {"script": VISION_SCRIPT, "model": vision_model()}
+
+
+# a look runs one paid request; 300 s covers a high-effort model on a big image
+LOOK_TIMEOUT_SEC = 300
+
+
+def tool_look(image, question, model=None):
+    # One call instead of a remembered script path, flag set and model slug. The
+    # answer is the skill's own stdout, so cost, saved runs and the ledger stay
+    # the skill's business. A failure returns the skill's stderr tail: it names
+    # the real cause (missing key, a model no longer allowed, a bad image path).
+    vision = vision_setup()
+    if not vision:
+        return "Error: look is unavailable: " + (vision_why_not() or "the vision skill is not installed in this project")
+    question = (question or "").strip()
+    if not question:
+        return "Error: look requires 'question' (what to look for in the image)."
+    path = os.path.expanduser((image or "").strip())
+    if not path:
+        return "Error: look requires 'image' (a path to an image file)."
+    if not os.path.isabs(path):
+        path = os.path.join(WORKSPACE, path)
+    if not os.path.isfile(path):
+        return "Error: no such image: " + path
+    chosen = (model or "").strip() or vision["model"]
+    if not chosen:
+        return "Error: the skill's model list could not be read, so name a model; `" + vision["script"] + " models` lists the allowed slugs."
+    # sys.executable is the interpreter run_agent.sh launched the harness with,
+    # which is the one the skill's Pillow dependency is installed under
+    cmd = [sys.executable, vision["script"], "ask", "--model", chosen, "--image", path, "--prompt", question]
+    started = time.monotonic()
+    try:
+        proc = subprocess.run(cmd, cwd=WORKSPACE, capture_output=True, text=True, timeout=LOOK_TIMEOUT_SEC)
+    except subprocess.TimeoutExpired:
+        print(ts() + "  [tool call] look: TIMEOUT after " + str(LOOK_TIMEOUT_SEC) + "s")
+        return "Error: vision.py ask did not return within " + str(LOOK_TIMEOUT_SEC) + "s. The request may still be billed; check `" + vision["script"] + " cost`."
+    except OSError as e:
+        return "Error: could not run the vision skill: " + str(e)[:300]
+    elapsed = time.monotonic() - started
+    answer = (proc.stdout or "").strip()
+    if proc.returncode != 0 or not answer:
+        tail = ((proc.stderr or "").strip() or answer or "no output")[-600:]
+        print(ts() + "  [tool call] look: FAILED exit=" + str(proc.returncode) + " | " + tail.replace("\n", " ")[:160])
+        return "Error: vision.py ask failed (exit " + str(proc.returncode) + "): " + tail
+    print(ts() + "  [tool call] look: " + chosen + " " + str(int(elapsed * 1000)) + "ms chars=" + str(len(answer)) + " | " + question[:60].replace("\n", " "))
+    text, cut = truncate_file_text(answer)
+    if cut:
+        text += "\n[answer truncated for context; the full answer is saved in the skill's run record under vision_runs/]"
+    return text
 
 
 # env vars with these suffixes are scrubbed from child shells. under
@@ -3390,6 +3446,9 @@ def _dispatch_tool_inner(mcp, name, arguments):
     if name == "todo_write":
         return tool_write_todos(arguments.get("todos"))
 
+    if name == "look":
+        return tool_look(arguments.get("image"), arguments.get("question"), arguments.get("model"))
+
     return "Unknown tool: " + name
 
 
@@ -3441,7 +3500,7 @@ def make_tools():
                 "function": {
                     "name": "web_read",
                     "strict": True,
-                    "description": "Open a URL in the shared Chrome tab and return the page as text: the main region (or article, or body) as plain prose, then an index of its links as 'text -> url'. Omit url to read the page the browser is already on; a url navigates that same shared tab, so page state an earlier browser_execute built up is gone. Pass selector for one CSS region ('main', 'table', '#specs'), or find to get browse's compact semantic outline of the matching elements with [ref=e12] ids, which is the read to use before clicking through browser_execute with ref('e12'). A long read is cut at about 5,000 tokens, keeping the top two thirds and the bottom third, with a banner naming how much of the middle was elided; a selector or find reaches the part you want without re-reading the page. Prose only: for the accessibility tree of a region, call await ariaSnapshot(selector) inside browser_execute.",
+                    "description": "Open a URL in the shared Chrome tab and return the page as text: the main region (or article, or body) as plain prose, then an index of its links as 'text -> url'. Omit url to read the page the browser is already on; a url navigates that same shared tab, so page state an earlier browser_execute built up is gone. Pass selector for one CSS region ('main', 'table', '#specs'), or find to get browse's compact semantic outline of the matching elements with [ref=e12] ids, which is the read to use before clicking through browser_execute with ref('e12'). A long read is cut at about 5,000 tokens, keeping the top two thirds and the bottom third, with a banner naming how much of the middle was elided; a selector or find reaches the part you want without re-reading the page. find matches on browse's compact tree, which collapses whole sections into groups, so 'no lines matched' can mean the group is collapsed: read the page text before concluding the page lacks something. Prose only: for the accessibility tree of a region, call await ariaSnapshot(selector) inside browser_execute.",
                     "parameters": {
                         "type": "object",
                         "properties": {
@@ -3452,7 +3511,7 @@ def make_tools():
                             },
                             "find": {
                                 "type": "string",
-                                "description": "Optional text or regex to find: returns browse's compact outline of matching elements with [ref=eN] ids instead of the page text. It searches that compact tree, which collapses whole sections into groups like 'navigation [18 controls]', so 'no lines matched' can mean the element is collapsed - read the text to see it.",
+                                "description": "Optional text or regex to find: returns browse's compact outline of matching elements with [ref=eN] ids instead of the page text.",
                             },
                         },
                         "required": [],
@@ -3484,7 +3543,7 @@ def make_tools():
                     "name": "browser_execute",
                     "description": "Run JavaScript in the shared Chrome session: the escape hatch for what the other web tools cannot do (click through a flow, fill a form, read a value out of the DOM"
                     + (", save a screenshot for vision_skill)" if vision_setup() else ", save a screenshot)")
-                    + ". The code runs inside an async function with page and context (Playwright's Page and BrowserContext, so the usual Playwright API works), browser, state (a plain object that keeps values between calls), snapshot(options) (the compact inspect-before-acting read, with [ref=eN] ids for ref()), ref(id), ariaSnapshot(target?, options) (Playwright's full YAML tree), fillInput, screenshotWithLabels({ path }), files.path(name), handoff, and network capture. It is not Node: no process, no require, no fetch outside the page (use page.goto or page.evaluate). Returning a string sends exactly that string back to you; a body that is a single expression is returned automatically, anything longer needs an explicit return, and a returned object is cut at 4,000 characters per string, so format the answer yourself. The page survives between calls: navigate once, then click across several calls, and page.url() says where the tab is.\n\nHuman handoff: when a page needs a person (an interactive login, 2FA, a challenge no automated route passes), call await handoff('what the person should do', { timeoutMs: 300000 }). Pass that timeoutMs: browse waits ten minutes when it is omitted. When the prompt only appears after a click (a passkey or security-key button), pass start with that click, because browse runs it while the user is already at the monitor; handoff without start only waits. The user is at the machine's monitor and has five minutes; it resolves when they click Continue, often with no value, so re-read the page before believing the step worked. Do everything possible first: open JSON APIs, alternate search results, another source. A timeout comes back as an error, so pick a second path instead of asking again.\n\ntimeoutMs is the script budget (default 60000, max 600000) and its timer pauses while handoff() waits; code that calls handoff() gets 330000 automatically. adoptTab: true adopts the tab the user shared from the browse toolbar button. resetSession: true recovers a wedged tab before running.",
+                    + ". The code runs inside an async function with page and context (Playwright's Page and BrowserContext, so the usual Playwright API works), browser, state (a plain object that keeps values between calls), snapshot(options) (the compact inspect-before-acting read, with [ref=eN] ids for ref()), ref(id), ariaSnapshot(target?, options) (Playwright's full YAML tree), fillInput, screenshotWithLabels({ path }), files.path(name), handoff, and network capture. It is not Node: no process, no require, no fetch outside the page (use page.goto or page.evaluate). Returning a string sends exactly that string back to you; a body that is a single expression is returned automatically, anything longer needs an explicit return, and a returned object is cut at 4,000 characters per string, so format the answer yourself. The page survives between calls: navigate once, then click across several calls, and page.url() says where the tab is. Two traps that each cost a retry: any navigation invalidates snapshot refs, so call snapshot() after the last goto in the same call, and fillInput needs a handle - fillInput(await ref(id), text) - with pressSequentially preferred where bot protection is likely, because fill does not fire trusted keys.\n\nHuman handoff: when a page needs a person (an interactive login, 2FA, a challenge no automated route passes), call await handoff('what the person should do', { timeoutMs: 300000 }). Pass that timeoutMs: browse waits ten minutes when it is omitted. When the prompt only appears after a click (a passkey or security-key button), pass start with that click, because browse runs it while the user is already at the monitor; handoff without start only waits. The user is at the machine's monitor and has five minutes; it resolves when they click Continue, often with no value, so re-read the page before believing the step worked. Do everything possible first: open JSON APIs, alternate search results, another source. A timeout comes back as an error, so pick a second path instead of asking again.\n\ntimeoutMs is the script budget (default 60000, max 600000) and its timer pauses while handoff() waits; code that calls handoff() gets 330000 automatically. adoptTab: true adopts the tab the user shared from the browse toolbar button. resetSession: true recovers a wedged tab before running.",
                     "parameters": {
                         "type": "object",
                         "properties": {
@@ -3769,10 +3828,45 @@ def make_tools():
             },
         }
     )
+    # look wraps the project's vision skill, so it is offered only when the skill
+    # is installed and its key is present; a project without skills/ never sees it
+    vision = vision_setup()
+    if vision:
+        look_default = (" The default model is " + vision["model"] + ".") if vision["model"] else ""
+        tools.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": "look",
+                    "description": "Look at an image with the project's vision skill and return the model's written answer: pass an image path and one focused question. Use it for what page text cannot settle - a chart's values, a product photo, a screenshot, a receipt, a map. Each call is one paid OpenRouter request (the cheap default costs roughly $0.002); ask one question per call, and for fine detail prepare a crop first with the skill's `prep` command through bash. Treat the answer as evidence rather than proof: verify consequential numbers and readings another way."
+                    + look_default,
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "image": {"type": "string", "description": "Path to the image file, absolute or relative to the workspace, e.g. /tmp/pq_browse_files/shot.png."},
+                            "question": {"type": "string", "description": "One focused question about the image, e.g. 'What is the axis label on the middle line?'"},
+                            "model": {"type": "string", "description": "Optional model slug from the skill's allow list; omit for the default."},
+                        },
+                        "required": ["image", "question"],
+                        "additionalProperties": False,
+                    },
+                },
+            }
+        )
     return tools
 
 
 def make_system_prompt():
+    # the look tool is offered only when the project has the vision skill; its
+    # one-line mention follows the same rule, so no mode names a tool it lacks
+    look_vision = vision_setup()
+    look_line = ""
+    if look_vision:
+        look_line = (
+            "\n- `look` runs the project's vision skill on an image file: pass the path and one focused question"
+            + (" (model " + look_vision["model"] + " by default)" if look_vision["model"] else "")
+            + ". Each call is a small paid request, so ask one question per image and check consequential readings another way.\n"
+        )
     if ENABLE_PLAYWRIGHT:
         intro_tools = "browser, shell, and file tools"
         # the browser path shares one headed Chrome with the operator, so the
@@ -3781,14 +3875,12 @@ def make_system_prompt():
         vision_line = ""
         vision = vision_setup()
         if vision:
-            if vision["model"]:
-                vision_step = "then run `" + vision["script"] + " ask --model " + vision["model"] + ' --image <path> --prompt "<question>"`.'
-            else:
-                vision_step = "then run `" + vision["script"] + " models` to see the models it allows, and `" + vision["script"] + ' ask --model <slug> --image <path> --prompt "<question>"`.'
             vision_line = (
                 "- To look at a page instead of reading it (a chart, a map, a product photo, a captcha-like image), save it inside browser_execute with files.path('shot.png') or screenshotWithLabels, "
-                + vision_step
-                + " files.path() returns an absolute path under /tmp that the skill can read; captures work with the tab in the background and with the screen locked. A one-color image means the capture failed, so read the page as text instead of retrying.\n"
+                "then call `look` with that path and one focused question"
+                + (" (model " + vision["model"] + " by default)" if vision["model"] else "")
+                + ". look runs the skill's `vision.py ask` underneath; go to the CLI through bash when you need a crop, a panel of models, or the cost report. "
+                "files.path() returns an absolute path under /tmp that both can read; captures work with the tab in the background and with the screen locked. A one-color image means the capture failed, so read the page as text instead of retrying.\n"
             )
         web_block = (
             "\nWeb research:\n"
@@ -3826,6 +3918,10 @@ def make_system_prompt():
     else:
         intro_tools = "shell and file tools"
         web_block = ""
+    # modes without browser_execute have no screenshot step to describe, so the
+    # look tool gets a line of its own; mode 1 names it inside vision_line
+    if look_line and not ENABLE_PLAYWRIGHT:
+        web_block = web_block + look_line
     return (
         "You're running in a small Python harness with "
         + intro_tools
@@ -3860,7 +3956,7 @@ def make_system_prompt():
         + "\nError recovery: if a tool returns an error, read the error message and retry with corrected arguments. A returned error is a normal tool result, not a crash.\n"
         "\nResource budget: you have a soft budget of approximately "
         + str(MAX_STEPS_SUGGESTION)
-        + " tool calls. A status line showing context fill, tool call count, compaction count, and any live background processes is appended to tool results each turn. Use it to pace yourself. ctx is the percent of the "
+        + " tool calls and the wall clock is the only limit on the run. A status line showing context fill, tool call count, compaction count, elapsed minutes, and any live background processes is appended to tool results each turn. Use it to pace yourself. ctx is the percent of the "
         + str(MAX_CONTEXT_LENGTH)
         + "-token compaction threshold, not the model's maximum window.\n"
         "\n### Coding Guide\n"
@@ -3910,6 +4006,9 @@ def make_system_prompt():
 def make_status_line(state, tool_calls_done):
     ctx_pct = int(100 * state["last_post_tokens"] / MAX_CONTEXT_LENGTH) if MAX_CONTEXT_LENGTH else 0
     line = "[status] ctx " + str(ctx_pct) + "% | tool calls " + str(tool_calls_done) + " | compact " + str(state["compaction_count"])
+    # elapsed minutes, because the wall clock is the only real limit on a run
+    elapsed = int((time.time() - RUN_START["t"]) / 60)
+    line += " | " + str(elapsed) + "m" + ("/" + str(DEADLINE_MINUTES) + "m" if DEADLINE_MINUTES else "")
     # job segment only when any exist: "jobs 0" every turn is noise, but a
     # forgotten running server the model never re-checks is a real failure
     if PROCS:
@@ -4113,8 +4212,14 @@ def archive_previous_run():
 
 
 def main():
-    global ENABLE_PLAYWRIGHT, ENABLE_WEB_LITE, WEB_LITE
+    global ENABLE_PLAYWRIGHT, ENABLE_WEB_LITE, WEB_LITE, DEADLINE_MINUTES
     configure_api()
+    RUN_START["t"] = time.time()
+    # optional caller-supplied run limit; garbage falls back to no limit
+    try:
+        DEADLINE_MINUTES = int(os.environ.get("PQ_DEADLINE_MINUTES", "0"))
+    except ValueError:
+        DEADLINE_MINUTES = 0
     # a kill/pkill matching the harness is the run-ending hazard this session
     # diagnosed (report 005); log the signal instead of dying silently
     signal.signal(signal.SIGTERM, _signal_death)
