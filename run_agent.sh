@@ -9,7 +9,8 @@
 # by openCode browse when it is installed and by the Node CDP server otherwise;
 # 2 = lightweight HTTP tools (web_lite.py; for low-memory hosts, no
 # Node/browser needed); 0 = no built-in web tools. No other agent
-# configuration is required.
+# configuration is required. A project directory that contains a .pq folder gets
+# that folder screened from the agent (see the PQ_ARGS block below).
 
 set -euo pipefail
 
@@ -132,11 +133,33 @@ if [ "$ENABLE_GPU" = 1 ]; then
     done
 fi
 
+# .pq is where an operator can leave harness-side material (held-out checks) that
+# the agent must not read. Shadow it with an empty tmpfs when the project has one.
+# When it does not, add nothing: --tmpfs also creates its mount point, which left
+# an empty .pq in every project directory the launcher ran against. bwrap cannot
+# hide the name itself, so a screened .pq is still listed as an empty directory.
+# A symlink or a plain file cannot be screened (mount follows the link to a path
+# that does not exist inside the sandbox), so refuse the run rather than let the
+# agent read it; the bwrap failure alone says only "Can't mount tmpfs on ...".
+PQ_ARGS=()
+if [ -L "$PROJECT_DIR/.pq" ]; then
+    echo "error: $PROJECT_DIR/.pq is a symlink and cannot be screened; use a real directory" >&2
+    exit 1
+elif [ -e "$PROJECT_DIR/.pq" ] && [ ! -d "$PROJECT_DIR/.pq" ]; then
+    echo "error: $PROJECT_DIR/.pq is not a directory and cannot be screened" >&2
+    exit 1
+elif [ -d "$PROJECT_DIR/.pq" ]; then
+    PQ_ARGS+=(--tmpfs /workspace/.pq)
+fi
+
 echo "agent dir  : $AGENT_DIR"
 echo "project dir: $PROJECT_DIR"
 echo "model      : ${PQ_MODEL:-(default)}"
 echo "web mode   : ${PQ_PLAYWRIGHT:-1 (default: 1=Chrome browser, 2=lite HTTP, 0=none)}"
 echo "host extras: audio=$ENABLE_AUDIO music=$ENABLE_MUSIC hf_cache=$ENABLE_HF_CACHE hf_offline=$HF_OFFLINE gpu=$ENABLE_GPU"
+if [ ${#PQ_ARGS[@]} -gt 0 ]; then
+    echo ".pq        : present in the project, screened behind an empty tmpfs"
+fi
 
 # No Playwright browser-cache bind is needed: the server connects over CDP and
 # does not launch a downloaded browser. Private temporary files remain writable.
@@ -163,6 +186,7 @@ exec bwrap \
   --ro-bind-try /run/systemd/resolve /run/systemd/resolve \
   --ro-bind "$AGENT_DIR" /agent \
   --bind "$PROJECT_DIR" /workspace \
+  "${PQ_ARGS[@]}" \
   --unshare-pid \
   --unshare-ipc \
   --unshare-uts \

@@ -291,12 +291,14 @@ TOUCHED = {"read": set(), "modified": set()}
 # returns the identical truncation and just burns context)
 NAV_HISTORY = {}
 
-# The vision skill sits next to this script and is optional: a project that
-# copies agent.py without skills/ still has to start, and it must not be told
-# to run a script that is not there. vision_setup() is the only place that
+# The vision skill belongs to the project, not the harness: it lives at
+# <workspace>/skills/vision_skill, so installing the harness in one directory and
+# running it against a project in another still finds the project's skill. It is
+# optional: a project without the skill still has to start, and it must not be
+# told to run a script that is not there. vision_setup() is the only place that
 # decides availability; the prompt and tool descriptions name vision when it
 # says yes and say nothing when it says no.
-VISION_ROOT = os.path.join(AGENT_DIR, "skills", "vision_skill")
+VISION_ROOT = os.path.join(WORKSPACE, "skills", "vision_skill")
 VISION_SCRIPT = os.path.join(VISION_ROOT, "scripts", "vision.py")
 
 
