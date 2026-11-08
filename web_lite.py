@@ -18,11 +18,14 @@
 #   SIGALRM watchdog in addition to socket timeouts. A watchdog is not process
 #   isolation: a stuck native call could outlive it, an accepted limitation of
 #   the in-process design.
-# - Search: Brave only, sequential with a stagger. DuckDuckGo was removed on
-#   2026-09-07: this network is TLS-fingerprint (JA3) blocked at html.duckduckgo.com
-#   (HTTP 202 challenge page on every variant), so Brave carried 100% of search
-#   anyway. The engine gets a browser UA; all other destinations get the honest
-#   pq-agent UA.
+# - Search: Yahoo first, Brave second, sequential with a stagger. Yahoo's
+#   results page is static HTML with direct links and served cleanly to a
+#   browser UA, so it carries the common case; Brave is the independent index
+#   when Yahoo shows a consent or challenge page, and its roughly 5-6 queries
+#   per hour keep it a fallback rather than the default. DuckDuckGo was removed
+#   on 2026-09-07: this network is TLS-fingerprint (JA3) blocked at
+#   html.duckduckgo.com (HTTP 202 challenge page on every variant). The engine
+#   gets a browser UA; all other destinations get the honest pq-agent UA.
 # - Spill files live in /tmp/pq_web_lite (separate from mode 1's /tmp/pq_fetch)
 #   under a 12 MiB per-run budget. /tmp is tmpfs under run_agent.sh: spill
 #   bounds RAM, it is not disk storage. Handles already handed to the model are
@@ -368,13 +371,14 @@ class WebLite:
 
     # ---------- public tools ----------
 
+    ENGINE_ORDER = ("yahoo", "brave")
+
     def search(self, queries):
         # Sequential batch, one result block per query, mirroring the MCP
         # backend's output format so models see the same shape in both modes.
-        # Brave only: DDG is TLS-fingerprint-blocked from this network (removed
-        # 2026-09-07), and Brave rate-limits this IP to roughly 5-6 queries per
-        # hour, so batch sensibly and prefer open APIs or known URLs. A failed
-        # query never loses the others.
+        # Yahoo then Brave: see ENGINE_ORDER. Brave rate-limits this IP to
+        # roughly 5-6 queries per hour, so batch sensibly and prefer open APIs
+        # or known URLs. A failed query never loses the others.
         queries = [str(q) for q in queries]
         notice = ""
         if len(queries) > 4:
@@ -392,8 +396,19 @@ class WebLite:
         return "\n\n".join(blocks) + notice
 
     def _search_one(self, q):
-        # returns (results_or_None, status_note, hard_failure)
-        name = "brave"
+        # returns (results_or_None, note, failed, engine). Engines are tried in
+        # order and the first with parsed cards wins; when none does, the note
+        # names every engine and its reason, because a silent fallback once hid
+        # a broken parser for a whole release (mcp_server.js v2.4.1).
+        tried = []
+        for name in self.ENGINE_ORDER:
+            results, note, failed = self._search_engine(name, q)
+            if results:
+                return results, "", False, name
+            tried.append(name + " (" + (note or "no results") + ")")
+        return None, "; ".join(tried), True, None
+
+    def _search_engine(self, name, q):
         eng = ENGINES[name]
         try:
             # per-engine spacing beyond the batch stagger, so repeat calls to
@@ -433,7 +448,7 @@ class WebLite:
         low = re.sub(r"\s+", " ", resp.body.lower())
         if "no results" in low or "did not match" in low:
             return [], "recognizable no-results page", False
-        if any(m in low for m in ("just a moment", "captcha", "verify you are human", "anomaly")):
+        if any(m in low for m in ("just a moment", "captcha", "verify you are human", "anomaly", "consent")):
             return None, "bot-challenge page (HTTP " + str(resp.status) + ")", True
         return None, "zero result cards parsed; layout changed or JS required", True
 
@@ -448,25 +463,28 @@ class WebLite:
                 pass
         if ra_s is not None and 0 < ra_s <= self.s.retry_after_max_sleep:
             time.sleep(ra_s)
-            result = self._search_one(q)
+            result = self._search_engine(name, q)
             if result[0] is not None or not result[2]:
                 return result
+        budget = " Brave allows about 5-6 queries/hour from this network" if name == "brave" else " this engine is rate-limiting the network"
         msg = (
             "HTTP 429 rate limit"
             + (" (Retry-After: " + str(int(ra_s)) + "s)" if ra_s else "")
-            + "; Brave allows about 5-6 queries/hour from this network. Wait before searching again, or use a known URL / an open API (Hacker News Algolia, GitHub api., Wikipedia) instead"
+            + ";"
+            + budget
+            + ". Wait before searching again, or use a known URL / an open API (Hacker News Algolia, GitHub api., Wikipedia) instead"
         )
         return None, msg, True
 
     def _format_block(self, q, outcome):
-        results, note, failed = outcome
+        results, note, failed, engine = outcome
         if results is None:
-            return 'Search results for "' + q + '" (engine: brave):\n' "(search failed: " + str(note)[:200] + ". Try rephrasing, or fetch a known URL directly with web_fetch.)"
+            return 'Search results for "' + q + '":\n(search failed: ' + str(note)[:300] + " Try rephrasing, or fetch a known URL directly with web_fetch.)"
         if not results:
-            return 'No results found for "' + q + '" on brave (' + str(note)[:120] + "). Try rephrasing."
+            return 'No results found for "' + q + '" (' + str(note)[:120] + "). Try rephrasing."
         top = results[:10]
         lines = [str(i + 1) + ". " + r["title"] + "\n   " + r["url"] + ("\n   " + r["snippet"] if r["snippet"] else "") for i, r in enumerate(top)]
-        return 'Search results for "' + q + '" (engine: brave, showing ' + str(len(top)) + " of " + str(len(results)) + "):\n" + "\n".join(lines)
+        return 'Search results for "' + q + '" (engine: ' + engine + ", showing " + str(len(top)) + " of " + str(len(results)) + "):\n" + "\n".join(lines)
 
     def fetch(self, url):
         # raw response body, no extraction. The header block carries status,
@@ -708,12 +726,42 @@ def _render(node):
 
 
 # ---------- search engine adapters ----------
-# Mirrors mcp_server.js's ENGINES so both modes speak the same result format.
-# Brave only since 2026-09-07: DuckDuckGo TLS-fingerprint-blocks this network
-# (HTTP 202 challenge page on every request variant), so the ddg adapter was
-# removed rather than kept as dead fallback machinery. No second parser: Bing
-# looked lenient in one probe, but one query is not evidence for maintaining
-# another fragile scraper (001 report, section 5).
+# Yahoo first: its results page is static HTML with direct links and it served
+# ten cards per query through a plain HTTP client (2026-11-08). Brave second:
+# the independent index when Yahoo shows consent or a challenge, at roughly 5-6
+# queries per hour from this network. DuckDuckGo stays out (TLS-fingerprint
+# blocked since 2026-09-07, HTTP 202 on every variant) and Bing stays out for
+# lack of evidence that one lenient probe predicts a parser worth maintaining
+# (001 report, section 5).
+
+
+_YAHOO_RU_RE = re.compile(r"/RU=([^/]+)/RK=")
+
+
+def _unwrap_yahoo_url(href):
+    # older Yahoo layouts wrap outbound links in r.search.yahoo.com/.../RU=<url>/RK=...
+    m = _YAHOO_RU_RE.search(href or "")
+    if m:
+        return urllib.parse.unquote(m.group(1))
+    return href or ""
+
+
+def _parse_yahoo(soup):
+    # div.algo cards; the site breadcrumb lives in div.compTitle, so the title
+    # is read from the h3 (a clean <span> holding only the headline)
+    out = []
+    for c in soup.select("div.algo"):
+        a = c.select_one("div.compTitle a[href], h3 a[href]")
+        if not a:
+            continue
+        h3 = a.select_one("h3") or c.select_one("h3")
+        title = re.sub(r"\s+", " ", (h3.get_text() if h3 else a.get_text()) or "").strip()
+        p = c.select_one("div.compText p, div.compText")
+        snippet = re.sub(r"\s+", " ", p.get_text()).strip() if p else ""
+        url = _unwrap_yahoo_url(a.get("href", ""))
+        if title and url:
+            out.append({"title": title, "url": url, "snippet": snippet[:300]})
+    return out
 
 
 def _parse_brave(soup):
@@ -736,6 +784,10 @@ def _parse_brave(soup):
 
 
 ENGINES = {
+    "yahoo": {
+        "url": lambda q: "https://search.yahoo.com/search?p=" + urllib.parse.quote_plus(q),
+        "parse": _parse_yahoo,
+    },
     "brave": {
         "url": lambda q: "https://search.brave.com/search?q=" + urllib.parse.quote_plus(q),
         "parse": _parse_brave,
