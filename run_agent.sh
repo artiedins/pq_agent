@@ -8,8 +8,10 @@
 # PQ_PLAYWRIGHT the web backend: 1 (default) = the shared headed Chrome, driven
 # by openCode browse when it is installed and by the Node CDP server otherwise;
 # 2 = lightweight HTTP tools (web_lite.py; for low-memory hosts, no
-# Node/browser needed); 0 = no built-in web tools. No other agent
-# configuration is required. A project directory that contains a .pq folder gets
+# Node/browser needed); 0 = no built-in web tools. PQ_OPENCODE=1 makes agent.py
+# present itself as the opencode v2 harness (its headers, prompt framing and
+# tool names) instead of pq-agent; default 0. No other agent configuration is
+# required. A project directory that contains a .pq folder gets
 # that folder screened from the agent (see the PQ_ARGS block below).
 
 set -euo pipefail
@@ -46,7 +48,7 @@ if ! command -v bwrap &>/dev/null; then
 fi
 
 ENV_ARGS=()
-for name in PQ_MODEL PQ_API_KEY PQ_PLAYWRIGHT PQ_BROWSER_BACKEND; do
+for name in PQ_MODEL PQ_API_KEY PQ_PLAYWRIGHT PQ_BROWSER_BACKEND PQ_OPENCODE; do
     if [ -n "${!name:-}" ]; then
         ENV_ARGS+=(--setenv "$name" "${!name}")
     fi
@@ -156,6 +158,11 @@ echo "agent dir  : $AGENT_DIR"
 echo "project dir: $PROJECT_DIR"
 echo "model      : ${PQ_MODEL:-(default)}"
 echo "web mode   : ${PQ_PLAYWRIGHT:-1 (default: 1=Chrome browser, 2=lite HTTP, 0=none)}"
+if [ "${PQ_OPENCODE:-0}" = "1" ]; then
+    echo "identity   : opencode (PQ_OPENCODE=1)"
+else
+    echo "identity   : pq-agent (PQ_OPENCODE=${PQ_OPENCODE:-0})"
+fi
 echo "host extras: audio=$ENABLE_AUDIO music=$ENABLE_MUSIC hf_cache=$ENABLE_HF_CACHE hf_offline=$HF_OFFLINE gpu=$ENABLE_GPU"
 if [ ${#PQ_ARGS[@]} -gt 0 ]; then
     echo ".pq        : present in the project, screened behind an empty tmpfs"

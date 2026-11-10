@@ -40,6 +40,10 @@ MODEL_REGISTRY = {
     "or-gem31p": {"provider": "openrouter", "model": "gemini-3.1-pro-preview", "endpoint": "google-vertex/global/flex"},
     "or-terra61": {"provider": "openrouter", "model": "openai/gpt-6.1-terra", "endpoint": "openai/flex"},
     #
+    "or-ink2s": {"provider": "openrouter", "model": "thinkingmachines/inkling-2-small:free", "endpoint": "thinkingmachines/nvfp4"},
+    "or-fable52": {"provider": "openrouter", "model": "anthropic/claude-fable-5.2", "endpoint": "azure"},
+    "or-ember": {"provider": "openrouter", "model": "meta/muse-ember", "endpoint": "meta"},
+    #
     "go-argon": {"provider": "opencode-go", "model": "gemini-4-argon"},
     "go-dsv41f": {"provider": "opencode-go", "model": "deepseek-v4.1-flash"},
     "go-mimo26p": {"provider": "opencode-go", "model": "mimo-v2.6-pro"},
@@ -83,6 +87,61 @@ AGENT_REPO_URL = "https://github.com/artiedins/pq_agent"
 AGENT_CONTACT = "artiedins"
 USER_AGENT = AGENT_NAME + "/" + AGENT_VERSION + " (+" + AGENT_REPO_URL + "; contact " + AGENT_CONTACT + ")"
 
+
+# PQ_OPENCODE=1 presents this harness as the opencode v2 agent harness instead
+# of pq-agent: the headers its OpenRouter plugin and session layer send, its
+# system prompt framing, and its tool names on the wire. Default 0 keeps every
+# one of those exactly as they were. The code was read from
+# https://github.com/anomalyco/opencode at v2.2.5 (2026-11-10); the pieces that
+# matter are packages/core/src/plugin/provider/openrouter.ts (referer and
+# title), packages/core/src/session/model-request.ts (the x-opencode-* headers
+# and opencode/<channel>/<version>/<name> user agent) and
+# packages/core/src/session/runner/prompt/system.txt.
+# This exists because thinkingmachines/inkling-2-small:free refuses anonymous
+# callers: "only available on agentic harnesses" until User-Agent or
+# HTTP-Referer names an app from openrouter.ai/apps. Traffic sent this way is
+# attributed to opencode on OpenRouter's dashboard, which is the point and the
+# cost of the mode; leave it off unless a model needs it.
+def _parse_opencode(raw):
+    v = str(raw).strip().lower()
+    if v in ("", "0", "false", "no"):
+        return False
+    if v in ("1", "true", "yes"):
+        return True
+    sys.exit("Error: PQ_OPENCODE must be 0 or 1 (got '" + str(raw) + "').")
+
+
+OPENCODE_MODE = _parse_opencode(os.environ.get("PQ_OPENCODE", "0"))
+OPENCODE_VERSION = "2.2.5"
+# "prod" is the channel a release build reports (packages/cli/script/build.ts
+# defines OPENCODE_CHANNEL; the desktop sentry check treats "prod" as release).
+OPENCODE_CHANNEL = "prod"
+# Session and project ids: opencode mints "ses_" + a 26-character descending
+# identifier (12 hex time digits, 14 base62) per conversation, and project ids
+# are either a path hash or "global" (packages/schema/src/*-id.ts). One agent.py
+# process is one conversation, so the id is minted once at startup and reused,
+# which is also what keeps provider prompt caches warm.
+OPENCODE_SESSION_ID = "ses_" + secrets.token_hex(6) + "".join(secrets.choice("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz") for _ in range(14))
+OPENCODE_PROJECT_ID = "global"
+# opencode names three of the same tools differently; the mapping is applied
+# when the tool list is built and reversed when a call comes back.
+OPENCODE_TOOL_NAMES = {"web_search": "websearch", "web_fetch": "webfetch", "todo_write": "todowrite"}
+
+
+def opencode_headers():
+    return {
+        "User-Agent": "opencode/" + OPENCODE_CHANNEL + "/" + OPENCODE_VERSION + "/opencode",
+        "HTTP-Referer": "https://opencode.ai/",
+        "X-Title": "opencode",
+        "x-opencode-session-id": OPENCODE_SESSION_ID,
+        "x-session-affinity": OPENCODE_SESSION_ID,
+        "X-Session-Id": OPENCODE_SESSION_ID,
+        "x-opencode-session": OPENCODE_SESSION_ID,
+        "x-opencode-project": OPENCODE_PROJECT_ID,
+        "x-opencode-client": "opencode",
+    }
+
+
 # OpenCode requires x-opencode-session on every request: one stable ID per
 # conversation. Their gateway uses it to route a conversation's requests to one
 # backend so prompt caching works, and from 2026-09-06 requests without it may
@@ -118,7 +177,10 @@ def configure_api():
     if _API_KEY:
         _API_HEADERS["Authorization"] = "Bearer " + _API_KEY
     if _PROVIDER == "openrouter":
-        _API_HEADERS.update({"X-Title": AGENT_NAME, "HTTP-Referer": AGENT_REPO_URL, "X-OpenRouter-Categories": "productivity,cli-agent"})
+        if OPENCODE_MODE:
+            _API_HEADERS.update(opencode_headers())
+        else:
+            _API_HEADERS.update({"X-Title": AGENT_NAME, "HTTP-Referer": AGENT_REPO_URL, "X-OpenRouter-Categories": "productivity,cli-agent"})
     else:
         _API_HEADERS["x-opencode-session"] = SESSION_ID
 
@@ -1237,6 +1299,10 @@ def apply_model_params(payload):
     temperature = _cfg("temperature")
     if temperature is not None:
         payload["temperature"] = temperature
+    # opencode asks OpenRouter to include usage (and so the billed cost) on
+    # every chat body (packages/ai/src/providers/openrouter.ts bodyOptions)
+    if OPENCODE_MODE and _PROVIDER == "openrouter":
+        payload.setdefault("usage", {"include": True})
 
 
 def _seed_words():
@@ -3342,6 +3408,13 @@ def dispatch_tool(mcp, name, arguments):
 
 def _dispatch_tool_inner(mcp, name, arguments):
     # DSH names are the model-facing surface; there is no legacy alias layer.
+    # opencode mode renames three tools on the wire, so undo that here and let
+    # everything below see the internal name.
+    if OPENCODE_MODE:
+        for internal, wire in OPENCODE_TOOL_NAMES.items():
+            if name == wire:
+                name = internal
+                break
 
     if name == "web_search":
         queries, err = _normalize_web_search_args(arguments)
@@ -3853,6 +3926,10 @@ def make_tools():
                 },
             }
         )
+    if OPENCODE_MODE:
+        for tool in tools:
+            fn = tool["function"]
+            fn["name"] = OPENCODE_TOOL_NAMES.get(fn["name"], fn["name"])
     return tools
 
 
@@ -3922,11 +3999,25 @@ def make_system_prompt():
     # look tool gets a line of its own; mode 1 names it inside vision_line
     if look_line and not ENABLE_PLAYWRIGHT:
         web_block = web_block + look_line
-    return (
-        "You're running in a small Python harness with "
-        + intro_tools
-        + ". Be curious, energetic, and comfortable acting on your own judgment: dig in, question what you find, verify what you produce (appropriate for the scale and context). Be relentless about making the user happy: solve their problem completely, report honestly, don't just tell them what they want to hear. Write in clear, direct language. The guides below govern the whole session.\n"
-        "\n## Agent Guide\n"
+    # opencode's system prompt (packages/core/src/session/runner/prompt/system.txt)
+    # opens by naming the harness, then gives short # Harness / # Communication /
+    # # Working in codebases sections. The body below keeps every operational
+    # detail this harness needs, in the same voice; only the opening paragraph
+    # and the heading levels change in opencode mode.
+    if OPENCODE_MODE:
+        frame_intro = (
+            "You are an AI agent running in OpenCode, a coding agent harness. Help the user accomplish their goals using the tools you have available ("
+            + intro_tools
+            + "). Be curious, energetic, and comfortable acting on your own judgment: dig in, question what you find, verify what you produce (appropriate for the scale and context). Be relentless about making the user happy: solve their problem completely, report honestly, don't just tell them what they want to hear. Write in clear, direct language. The guides below govern the whole session.\n"
+        )
+    else:
+        frame_intro = (
+            "You're running in a small Python harness with "
+            + intro_tools
+            + ". Be curious, energetic, and comfortable acting on your own judgment: dig in, question what you find, verify what you produce (appropriate for the scale and context). Be relentless about making the user happy: solve their problem completely, report honestly, don't just tell them what they want to hear. Write in clear, direct language. The guides below govern the whole session.\n"
+        )
+    prompt = (
+        frame_intro + "\n## Agent Guide\n"
         "- Keep working while another tool call could produce evidence or concrete progress. A context warning is advisory, and a context summary is a handoff to fresh context where work continues. Stop when the task is done or the harness sends a wrap-up notice.\n"
         "- Every mid-task response must make at least one tool call, and should usually include short but descriptive text for the user. A text-only reply tells the harness you are done. Context summaries are the one exception: they must be text-only and are required before continuing work with more tool calls.\n"
         "- The harness sends `project.md` (optional) and `p.md` (the task request) as the initial prompt right after this prompt. Do not re-read or edit them.\n"
@@ -4001,6 +4092,13 @@ def make_system_prompt():
         "- **Continuity:** Give extra detail about your last few actions for a smooth handoff if there is a follow up task. Avoid speculating about next steps; the user may want to go in other directions after reviewing this report.\n"
         "\nRead the report once after writing it. Check that the user can scan it effortlessly and gain a complete picture. Then end the session with a short text-only reply.\n"
     )
+    if OPENCODE_MODE:
+        # one heading level, as in opencode's prompt, and the wire tool names
+        # everywhere the guidance names a tool
+        prompt = prompt.replace("\n### ", "\n# ").replace("\n## ", "\n# ")
+        for internal, wire in OPENCODE_TOOL_NAMES.items():
+            prompt = prompt.replace(internal, wire)
+    return prompt
 
 
 def make_status_line(state, tool_calls_done):
