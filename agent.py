@@ -268,6 +268,10 @@ NAV_HISTORY = {}
 MCP_STATE = {"dirty": False, "last_used": 0.0}
 BROWSE_IDLE_HOPOFF_SEC = 300
 RUN_START = {"t": time.time()}
+VISION_RUN_ID = str(os.getpid()) + "-" + str(int(RUN_START["t"] * 1000))
+os.environ.setdefault("PQ_VISION_RUN_ID", VISION_RUN_ID)
+VISION_STATE_DIR = os.path.abspath(os.path.expanduser(os.environ.get("VISION_STATE_DIR") or os.path.join(SCRATCH_DIR, "vision")))
+os.environ.setdefault("VISION_STATE_DIR", VISION_STATE_DIR)
 
 # The vision skill belongs to the project, not the harness: it lives at
 # <workspace>/skills/vision_skill, so installing the harness in one directory and
@@ -355,8 +359,9 @@ def vision_setup():
 LOOK_TIMEOUT_SEC = 300
 
 
-def tool_look(image, question, model=None):
-    # One call instead of a remembered script path, flag set and model slug. The
+def tool_look(image=None, question="", model=None, thread=None):
+    # One call instead of a remembered script path, flag set and model slug, with
+    # optional multi-turn `thread` continuation stored under VISION_STATE_DIR. The
     # answer is the skill's own stdout, so cost, saved runs and the ledger stay
     # the skill's business. A failure returns the skill's stderr tail: it names
     # the real cause (missing key, a model no longer allowed, a bad image path).
@@ -365,22 +370,42 @@ def tool_look(image, question, model=None):
         return "Error: look is unavailable: " + (vision_why_not() or "the vision skill is not installed in this project")
     question = (question or "").strip()
     if not question:
-        return "Error: look requires 'question' (what to look for in the image)."
-    path = os.path.expanduser((image or "").strip())
-    if not path:
-        return "Error: look requires 'image' (a path to an image file)."
-    if not os.path.isabs(path):
-        path = os.path.join(WORKSPACE, path)
-    if not os.path.isfile(path):
-        return "Error: no such image: " + path
-    chosen = (model or "").strip() or vision["model"]
-    if not chosen:
+        return "Error: look requires 'question' (what to look for or ask in the conversation)."
+    thread = (thread or "").strip()
+    thread_exists = False
+    if thread:
+        tkey = re.sub(r"[^A-Za-z0-9._-]+", "_", thread).strip("._")[:60]
+        if not tkey:
+            return "Error: invalid 'thread' name; use letters, digits, dots, underscores, or hyphens."
+        thread_exists = os.path.isfile(os.path.join(VISION_STATE_DIR, "threads", tkey + ".json"))
+    raw_image = (image or "").strip()
+    path = ""
+    if raw_image:
+        path = os.path.expanduser(raw_image)
+        if not os.path.isabs(path):
+            path = os.path.join(WORKSPACE, path)
+        if not os.path.isfile(path):
+            return "Error: no such image: " + path
+    elif not thread_exists:
+        if thread:
+            return "Error: look requires 'image' when starting new thread '" + thread + "' (pass an image on turn 1, then omit 'image' on follow-up turns)."
+        return "Error: look requires 'image' (a path to an image file, or pass an existing 'thread' name to ask a follow-up)."
+    explicit_model = (model or "").strip()
+    chosen = explicit_model or ("" if thread_exists else vision["model"])
+    if not chosen and not thread_exists:
         return "Error: the skill's model list could not be read, so name a model; `" + vision["script"] + " models` lists the allowed slugs."
     # sys.executable is the interpreter run_agent.sh launched the harness with,
     # which is the one the skill's Pillow dependency is installed under. Pass
     # --effort low --max-tokens 2000 so quick look checks cost ~$0.001 and do
     # not exhaust their output allowance on high-effort reasoning tokens.
-    cmd = [sys.executable, vision["script"], "ask", "--effort", "low", "--max-tokens", "2000", "--model", chosen, "--image", path, "--prompt", question]
+    cmd = [sys.executable, vision["script"], "--state-dir", VISION_STATE_DIR, "ask", "--effort", "low", "--max-tokens", "2000"]
+    if thread:
+        cmd += ["--thread", thread]
+    if chosen:
+        cmd += ["--model", chosen]
+    if path:
+        cmd += ["--image", path]
+    cmd += ["--prompt", question]
     started = time.monotonic()
     try:
         proc = subprocess.run(cmd, cwd=WORKSPACE, capture_output=True, text=True, timeout=LOOK_TIMEOUT_SEC)
@@ -391,14 +416,18 @@ def tool_look(image, question, model=None):
         return "Error: could not run the vision skill: " + str(e)[:300]
     elapsed = time.monotonic() - started
     answer = (proc.stdout or "").strip()
+    stderr_text = (proc.stderr or "").strip()
     if proc.returncode != 0 or not answer:
-        tail = ((proc.stderr or "").strip() or answer or "no output")[-600:]
+        tail = (stderr_text or answer or "no output")[-600:]
         print(ts() + "  [tool call] look: FAILED exit=" + str(proc.returncode) + " | " + tail.replace("\n", " ")[:160])
         return "Error: vision.py ask failed (exit " + str(proc.returncode) + "): " + tail
-    print(ts() + "  [tool call] look: " + chosen + " " + str(int(elapsed * 1000)) + "ms chars=" + str(len(answer)) + " | " + question[:60].replace("\n", " "))
+    label = chosen or ("thread:" + thread)
+    print(ts() + "  [tool call] look: " + label + " " + str(int(elapsed * 1000)) + "ms chars=" + str(len(answer)) + " | " + question[:60].replace("\n", " "))
     text, cut = truncate_file_text(answer)
     if cut:
-        text += "\n[answer truncated for context; the full answer is saved in the skill's run record under vision_runs/]"
+        m = re.search(r"\brun=(\S+)", stderr_text)
+        saved_where = m.group(1) if m else os.path.join(VISION_STATE_DIR, "runs")
+        text += "\n[answer truncated for context; full answer saved at " + saved_where + "]"
     return text
 
 
@@ -2671,7 +2700,7 @@ BROWSE_READ_MAX_CHARS = 95000
 _BROWSE_SEARCH_ENGINES = [
     (
         "google",
-        '"https://www.google.com/search?hl=en&num=20&q=" + encodeURIComponent(q)',
+        '"https://www.google.com/search?hl=en&q=" + encodeURIComponent(q)',
         "div#search a h3",
         """() => {
   const out = [];
@@ -2775,29 +2804,73 @@ def _browse_search_js(queries):
     # silent fallback once hid a broken extractor for a whole release, see
     # mcp_server.js v2.4.1). Google leads because the shared profile is signed
     # in; Startpage is a proxy in front of Google, DuckDuckGo and Brave are the
-    # independent indexes when Google serves a consent or bot wall.
+    # independent indexes when Google serves a consent or bot wall. Known bot
+    # walls are cached in browse's session `state` for 15 minutes so a multi-query
+    # run does not burn 8s per query re-checking a walled engine.
     engines = []
     for name, url_expr, wait, extract in _BROWSE_SEARCH_ENGINES:
         engines.append("{ name: " + json.dumps(name) + ", url: (q) => " + url_expr + ", wait: " + json.dumps(wait) + ", extract: " + extract + " }")
     return (
         "const queries = " + json.dumps(queries) + ";\n"
         "const engines = [\n  " + ",\n  ".join(engines) + "\n];\n"
+        "const WALL_TTL_MS = 15 * 60 * 1000;\n"
+        "state.walledSearchEngines = state.walledSearchEngines || {};\n"
+        "const detectWall = async (t) => {\n"
+        "  const u = t.url() || '';\n"
+        "  if (/\\/sorry\\/|\\/challenge\\b|ipv[46]\\.google\\.com/i.test(u)) return true;\n"
+        "  return await t.evaluate(() => {\n"
+        "    if (document.querySelector('#captcha-form, iframe[src*=\"recaptcha\"], iframe[src*=\"turnstile\"], iframe[src*=\"hcaptcha\"]')) return true;\n"
+        "    const txt = ((document.body && document.body.innerText) || '').slice(0, 4000);\n"
+        "    return txt.length < 3500 && /detected unusual traffic|unusual traffic from your computer|verify you are human|complete the security check|please enable js and disable any ad blocker/i.test(txt);\n"
+        "  }).catch(() => false);\n"
+        "};\n"
         "const blocks = [];\n"
         "for (const q of queries) {\n"
         "  let block = null;\n"
         "  const tried = [];\n"
         "  for (const eng of engines) {\n"
+        "    const cached = state.walledSearchEngines[eng.name];\n"
+        "    if (cached && (Date.now() - cached.at) < WALL_TTL_MS) {\n"
+        "      tried.push(eng.name + ' (skipped: ' + cached.reason + ')');\n"
+        "      continue;\n"
+        "    }\n"
         "    let tab = null;\n"
         "    let results = null;\n"
         "    let failure = '';\n"
+        "    let walled = false;\n"
         "    try {\n"
         "      tab = await context.newPage();\n"
         "      const resp = await tab.goto(eng.url(q), { waitUntil: 'domcontentloaded', timeout: 15000 });\n"
         "      const status = resp ? resp.status() : 0;\n"
         "      if (status >= 400) failure = 'HTTP ' + status;\n"
-        "      if (eng.wait) await tab.waitForSelector(eng.wait, { timeout: 8000 }).catch(() => {});\n"
-        "      results = await tab.evaluate(eng.extract);\n"
-        "      if (!results || !results.length) failure = failure ? failure + ', no result cards' : 'no result cards';\n"
+        "      if (status === 429 || await detectWall(tab)) {\n"
+        "        walled = true;\n"
+        "      } else if (eng.wait) {\n"
+        "        let settled = false;\n"
+        "        let wallTimer = null;\n"
+        "        try {\n"
+        "          await Promise.race([\n"
+        "            tab.waitForSelector(eng.wait, { timeout: 8000 }).catch(() => {}),\n"
+        "            new Promise((resolve) => {\n"
+        "              wallTimer = setTimeout(async () => {\n"
+        "                if (!settled && await detectWall(tab)) { walled = true; resolve(); }\n"
+        "              }, 1200);\n"
+        "            }),\n"
+        "          ]);\n"
+        "        } finally {\n"
+        "          settled = true;\n"
+        "          if (wallTimer) clearTimeout(wallTimer);\n"
+        "        }\n"
+        "      }\n"
+        "      if (!walled) results = await tab.evaluate(eng.extract);\n"
+        "      if (!results || !results.length) {\n"
+        "        if (walled || await detectWall(tab)) {\n"
+        "          walled = true;\n"
+        "          failure = failure ? failure + ', bot wall' : 'bot wall';\n"
+        "        } else {\n"
+        "          failure = failure ? failure + ', no result cards' : 'no result cards';\n"
+        "        }\n"
+        "      }\n"
         "    } catch (e) {\n"
         "      failure = String((e && e.message) || e).slice(0, 160);\n"
         "    } finally {\n"
@@ -2805,10 +2878,13 @@ def _browse_search_js(queries):
         "        try { await Promise.race([tab.close(), new Promise((r) => setTimeout(r, 3000))]); } catch (e) {}\n"
         "      }\n"
         "    }\n"
+        "    if (walled) state.walledSearchEngines[eng.name] = { reason: failure || 'bot wall', at: Date.now() };\n"
         "    if (results && results.length) {\n"
+        "      delete state.walledSearchEngines[eng.name];\n"
         "      const top = results.slice(0, 10);\n"
         "      const lines = top.map((r, i) => (i + 1) + '. ' + r.title + '\\n   ' + r.url + (r.snippet ? '\\n   ' + r.snippet : ''));\n"
-        "      block = 'Search results for \"' + q + '\" (engine: ' + eng.name + ', showing ' + top.length + ' of ' + results.length + '):\\n' + lines.join('\\n');\n"
+        "      const failNote = tried.length ? '; failed: ' + tried.join(', ') : '';\n"
+        "      block = 'Search results for \"' + q + '\" (engine: ' + eng.name + ', showing ' + top.length + ' of ' + results.length + failNote + '):\\n' + lines.join('\\n');\n"
         "      break;\n"
         "    }\n"
         "    tried.push(eng.name + ' (' + (failure || 'no results') + ')');\n"
@@ -3315,7 +3391,7 @@ def _dispatch_tool_inner(mcp, name, arguments):
         return tool_write_todos(arguments.get("todos"))
 
     if name == "look":
-        return tool_look(arguments.get("image"), arguments.get("question"), arguments.get("model"))
+        return tool_look(arguments.get("image"), arguments.get("question"), arguments.get("model"), arguments.get("thread"))
 
     return "Unknown tool: " + name
 
@@ -3738,16 +3814,25 @@ def make_tools():
                 "type": "function",
                 "function": {
                     "name": "look",
-                    "description": "Look at an image with the project's vision skill and return the model's written answer: pass an image path and one focused question. Use it for what page text cannot settle, such as a chart's values, a product photo, a screenshot, a receipt, or a map. Each call is one paid OpenRouter request (the low-effort default costs roughly $0.001); ask one question per call, and for fine detail prepare a crop first with the skill's `prep` command through bash. Treat the answer as evidence rather than proof: verify consequential numbers and readings another way."
+                    "description": "Inspect an image or continue a multi-turn visual conversation with the project's vision skill. Pass `image` and `question` for a single check, or add `thread` (e.g. 'chart-check') to go back and forth across calls: follow-up calls on an existing thread can omit `image`, attach a new crop, or set `model` to escalate to a stronger model mid-conversation. Use it for what page text cannot settle, such as a chart's values, a product photo, a screenshot, a receipt, or a CAD render. Each call is one paid OpenRouter request (the low-effort default costs roughly $0.001); for fine detail prepare a crop first with the skill's `prep` command through bash. Scratch state stays outside the workspace, so record what you learn in normal notes and deliverables. Treat the answer as evidence rather than proof: verify consequential numbers and readings another way."
                     + look_default,
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "image": {"type": "string", "description": "Path to the image file, absolute or relative to " + WORKSPACE + ", e.g. /tmp/pq_browse_files/shot.png."},
-                            "question": {"type": "string", "description": "One focused question about the image, e.g. 'What is the axis label on the middle line?'"},
-                            "model": {"type": "string", "description": "Optional model slug from the skill's allow list; omit for the default."},
+                            "image": {
+                                "type": "string",
+                                "description": "Path to an image file, absolute or relative to "
+                                + WORKSPACE
+                                + ", e.g. /tmp/pq_browse_files/shot.png. Required on standalone calls and turn 1 of a new thread; omit on follow-up turns in an existing thread unless adding a new image or crop.",
+                            },
+                            "question": {"type": "string", "description": "Question or prompt for the vision model, e.g. 'What is the axis label on the middle line?'"},
+                            "model": {"type": "string", "description": "Optional model slug from the skill's allow list; omit for the default (or to keep an existing thread's model)."},
+                            "thread": {
+                                "type": "string",
+                                "description": "Optional conversation thread name (e.g. 'chart-check'). Reuse the same name across calls to ask follow-ups, challenge an answer, attach a crop, or switch models on the same visual history.",
+                            },
                         },
-                        "required": ["image", "question"],
+                        "required": ["question"],
                         "additionalProperties": False,
                     },
                 },
@@ -3772,9 +3857,9 @@ def make_system_prompt():
     look_line = ""
     if look_vision:
         look_line = (
-            "\n- `look` runs the project's vision skill on an image file: pass the path and one focused question"
+            "\n- `look` runs the project's vision skill on an image file: pass `image` and `question` for a single check, or add `thread` to hold a multi-turn conversation across calls"
             + (" (model " + look_vision["model"] + " by default)" if look_vision["model"] else "")
-            + ". Each call is a small paid request, so ask one question per image and check consequential readings another way.\n"
+            + ". Scratch state lives outside the workspace; integrate findings into your normal notes and check consequential readings another way.\n"
         )
     if ENABLE_PLAYWRIGHT:
         intro_tools = "browser, shell, and file tools"
@@ -3782,9 +3867,9 @@ def make_system_prompt():
         if look_vision:
             vision_line = (
                 "- To look at a page instead of reading it (a chart, a map, a product photo, a captcha-like image), save it inside browser_execute with files.path('shot.png') or screenshotWithLabels, "
-                "then call `look` with that path and one focused question"
-                + (" (model " + look_vision["model"] + " by default)" if look_vision["model"] else "")
-                + ". look runs the skill's `vision.py ask` underneath; go to the CLI through bash when you need a crop, a panel of models, or the cost report. "
+                "then call `look` with that path and `question` (add `thread` to ask follow-up questions or send detail crops in the same conversation"
+                + (", model " + look_vision["model"] + " by default" if look_vision["model"] else "")
+                + "). `look` runs the skill's `vision.py ask` underneath; go to the CLI through bash when you need `prep` crops, custom `--system` or `--effort` prompts, `--json`, `panel`, or `cost`, and write what you learn into normal notes rather than separate vision folders. "
                 "files.path() returns an absolute path under /tmp that both can read; captures work with the tab in the background and with the screen locked. A one-color image means the capture failed, so read the page as text instead of retrying.\n"
             )
         if BROWSE_ASSIST:
@@ -3998,6 +4083,31 @@ def _yaml_quote(text):
     return json.dumps(str(text), ensure_ascii=False)
 
 
+def _vision_run_stats():
+    ledger_path = os.path.join(VISION_STATE_DIR, "ledger.jsonl")
+    if not os.path.isfile(ledger_path):
+        return 0, 0.0
+    calls = 0
+    cost = 0.0
+    try:
+        with open(ledger_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                if rec.get("harness_run") != VISION_RUN_ID:
+                    continue
+                calls += 1
+                cost += float(rec.get("cost") or 0.0)
+    except OSError:
+        return 0, 0.0
+    return calls, round(cost, 6)
+
+
 def write_stats(state, start_time, outcome="completed", tool_calls_total=0, initial_mtimes=None):
     elapsed_minutes = (time.time() - start_time) / 60.0
     finished_at = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -4012,6 +4122,7 @@ def write_stats(state, start_time, outcome="completed", tool_calls_total=0, init
     os.makedirs(stats_dir, exist_ok=True)
     stats_path = os.path.join(stats_dir, "stats.yaml")
     ec = state["edit_counts"]
+    vision_calls, vision_cost = _vision_run_stats()
     with open(stats_path, "w", encoding="utf-8") as f:
         f.write("model_id: " + MODEL_ID + "\n")
         f.write("provider: " + _PROVIDER + "\n")
@@ -4020,6 +4131,8 @@ def write_stats(state, start_time, outcome="completed", tool_calls_total=0, init
         f.write("web_mode: " + web_mode_name + "\n")
         f.write("web_fallback_used: " + ("true" if WEB_FALLBACK_USED["used"] else "false") + "\n")
         f.write("tool_calls_total: " + str(tool_calls_total) + "\n")
+        f.write("vision_calls: " + str(vision_calls) + "\n")
+        f.write("vision_cost_usd: " + str(vision_cost) + "\n")
         f.write("final_context_tokens: " + str(state["last_post_tokens"]) + "\n")
         f.write("compaction_count: " + str(state["compaction_count"]) + "\n")
         f.write("elapsed_minutes: " + "{:.2f}".format(elapsed_minutes) + "\n")

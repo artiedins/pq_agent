@@ -397,14 +397,15 @@ class WebLite:
 
     def _search_one(self, q):
         # returns (results_or_None, note, failed, engine). Engines are tried in
-        # order and the first with parsed cards wins; when none does, the note
-        # names every engine and its reason, because a silent fallback once hid
-        # a broken parser for a whole release (mcp_server.js v2.4.1).
+        # order and the first with parsed cards wins; every engine that failed
+        # ahead of the winner is still returned in note so _format_block names
+        # it in the header (a silent fallback once hid a broken parser for a
+        # whole release, mcp_server.js v2.4.1).
         tried = []
         for name in self.ENGINE_ORDER:
             results, note, failed = self._search_engine(name, q)
             if results:
-                return results, "", False, name
+                return results, "; ".join(tried), False, name
             tried.append(name + " (" + (note or "no results") + ")")
         return None, "; ".join(tried), True, None
 
@@ -484,7 +485,8 @@ class WebLite:
             return 'No results found for "' + q + '" (' + str(note)[:120] + "). Try rephrasing."
         top = results[:10]
         lines = [str(i + 1) + ". " + r["title"] + "\n   " + r["url"] + ("\n   " + r["snippet"] if r["snippet"] else "") for i, r in enumerate(top)]
-        return 'Search results for "' + q + '" (engine: ' + engine + ", showing " + str(len(top)) + " of " + str(len(results)) + "):\n" + "\n".join(lines)
+        failed_suffix = ("; failed: " + str(note)[:220]) if note else ""
+        return 'Search results for "' + q + '" (engine: ' + engine + ", showing " + str(len(top)) + " of " + str(len(results)) + failed_suffix + "):\n" + "\n".join(lines)
 
     def fetch(self, url):
         # raw response body, no extraction. The header block carries status,
