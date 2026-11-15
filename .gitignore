@@ -1,10 +1,5 @@
-node_modules/
-package-lock.json
-.env
 *.pyc
+NOTES.md
 p.md
 previous_sessions/
 task_report/
-NOTES.md
-skills
-vision_runs/

@@ -479,7 +479,7 @@ class WebLite:
     def _format_block(self, q, outcome):
         results, note, failed, engine = outcome
         if results is None:
-            return 'Search results for "' + q + '":\n(search failed: ' + str(note)[:300] + " Try rephrasing, or fetch a known URL directly with web_fetch.)"
+            return 'Search results for "' + q + '":\n(search failed: ' + str(note)[:300] + " Try rephrasing, or fetch a known URL directly with webfetch.)"
         if not results:
             return 'No results found for "' + q + '" (' + str(note)[:120] + "). Try rephrasing."
         top = results[:10]
@@ -551,7 +551,7 @@ class WebLite:
             return "Error: HTTP " + str(resp.status) + " for " + url[:160] + " (final URL: " + resp.final_url + ")."
         content_type = (resp.content_type or "").split(";")[0].strip().lower()
         if content_type and content_type not in ("text/html", "application/xhtml+xml"):
-            return "Error: web_read extracts HTML pages; this URL served '" + content_type + "'. Use web_fetch for the raw body."
+            return "Error: web_read extracts HTML pages; this URL served '" + content_type + "'. Use webfetch for the raw body."
         try:
             soup = BeautifulSoup(resp.body, "html.parser")
             title = soup.title.get_text(strip=True) if soup.title else ""
@@ -593,8 +593,15 @@ class WebLite:
         if not body_text or not body_text.strip():
             low = resp.body.lower()
             if "enable javascript" in low or "noscript" in low:
-                header += "\nNote: page appears to require JavaScript; static extraction produced no text. " "Try the site's API with web_fetch."
+                header += "\nNote: page appears to require JavaScript; static extraction produced no text. Try the site's API with webfetch."
             return header + "\n\n(no extractable text)"
+        if resp.complete and est_tokens(body_text) > self.s.result_token_cap:
+            path, spill_err = self._spill(body_text, url)
+            if path:
+                _log("spilled read body (" + str(len(body_text)) + " chars) to " + path)
+                return header + "\n\n" + _truncate(body_text, self.s.result_token_cap, spill_path=path)
+            _log("read spill skipped: " + spill_err)
+            return header + "\n\n" + _truncate(body_text, self.s.result_token_cap) + "\n[" + spill_err + "]\n"
         return header + "\n\n" + _truncate(body_text, self.s.result_token_cap)
 
 

@@ -28,5 +28,13 @@
 2026_10_22,z-ai/glm-5.3,primeintellect,99.9098
 2026_10_22,z-ai/glm-5.3-flash,together,69.4274
 2026_10_27,openai/gpt-6.1-terra,openai/flex,99.7739
+2026_11_09,anthropic/claude-fable-5.2,azure,93.3333333333
 2026_11_07,beam-free,opencode-go,66.8513
 2026_11_07,iceman-contributor-free,opencode-go,21.4974
+2026_11_10,google/gemini-4-carbon,google-vertex/global,98.9616
+2026_11_10,thinkingmachines/inkling-2-small:free,thinkingmachines/nvfp4,85.2522
+2026_11_10,baidu/ernie-5.5-flash-preview,baidu,99.2414
+2026_11_10,baidu/ernie-light-dt-1.0-intl,baidu,98.5564
+2026_11_10,nex-agi/nex-n2.6,nex-agi/fp8,56.5534
+2026_11_10,particle-ai/particle-1,particle-ai/us,70.3608
+2026_11_10,ricursiveai/ripple-65b-preview,gmicloud/bf16,87.1122
