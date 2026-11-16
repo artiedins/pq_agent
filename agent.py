@@ -61,6 +61,8 @@ MODEL_REGISTRY = {
     "go-kimi31p": {"provider": "opencode-go", "model": "kimi-k3.1-pro"},
     "go-beam": {"provider": "opencode-go", "model": "beam-free"},
     "go-iceman": {"provider": "opencode-go", "model": "iceman-contributor-free"},
+    #
+    "mo-dsv41f": {"provider": "morphllm", "model": "morph-dsv41flash-1017"},
 }
 
 
@@ -74,6 +76,7 @@ def _cfg(key, default=None):
 
 
 _PROVIDER = _cfg("provider")
+
 
 # one key slot (PQ_API_KEY or inherited fd PQ_API_KEY_FD from run_agent.sh) for
 # every provider, popped out of os.environ and closed at startup so child
@@ -163,6 +166,7 @@ def configure_api():
     urls = {
         "openrouter": "https://openrouter.ai/api/v1/chat/completions",
         "opencode-go": "https://opencode.ai/zen/go/v1/chat/completions",
+        "morphllm": "https://api.morphllm.com/v1/chat/completions",
     }
     if _PROVIDER not in urls:
         sys.exit("Error: unknown provider '" + str(_PROVIDER) + "' for model '" + MODEL_ID + "'.")
@@ -179,6 +183,11 @@ def configure_api():
             _API_HEADERS.update(opencode_headers())
         else:
             _API_HEADERS.update({"X-Title": AGENT_NAME, "HTTP-Referer": AGENT_REPO_URL, "X-OpenRouter-Categories": "productivity,cli-agent"})
+    elif _PROVIDER == "morphllm":
+        # morphllm pins each conversation to the worker holding its cached
+        # prefix by header; without the pin a repeat prompt reused 0 of 6521
+        # prompt tokens, with it 6144 (cached input is 93% off on dsv41flash).
+        _API_HEADERS["x-session-id"] = SESSION_ID
     else:
         _API_HEADERS["x-opencode-session"] = SESSION_ID
 
@@ -1217,7 +1226,10 @@ def extract_compaction_summary(raw_msg):
 
 def apply_reasoning(payload):
     effort = _cfg("effort", "high")
-    if _PROVIDER == "opencode-go":
+    # morphllm accepts the OpenRouter reasoning object but documents a top-level
+    # reasoning_effort (low|high|xhigh|max, or 1-100) as the control, so it gets
+    # the same plain string as OpenCode Go.
+    if _PROVIDER in ("opencode-go", "morphllm"):
         payload["reasoning_effort"] = effort
     else:
         payload["reasoning"] = {"effort": effort}
@@ -2819,7 +2831,7 @@ def _browse_search_js(queries):
         "  const u = t.url() || '';\n"
         "  if (/\\/sorry\\/|\\/challenge\\b|ipv[46]\\.google\\.com/i.test(u)) return true;\n"
         "  return await t.evaluate(() => {\n"
-        "    if (document.querySelector('#captcha-form, iframe[src*=\"recaptcha\"], iframe[src*=\"turnstile\"], iframe[src*=\"hcaptcha\"]')) return true;\n"
+        '    if (document.querySelector(\'#captcha-form, iframe[src*="recaptcha"], iframe[src*="turnstile"], iframe[src*="hcaptcha"]\')) return true;\n'
         "    const txt = ((document.body && document.body.innerText) || '').slice(0, 4000);\n"
         "    return txt.length < 3500 && /detected unusual traffic|unusual traffic from your computer|verify you are human|complete the security check|please enable js and disable any ad blocker/i.test(txt);\n"
         "  }).catch(() => false);\n"

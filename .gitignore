@@ -1,3 +1,4 @@
+.env
 *.pyc
 NOTES.md
 p.md
