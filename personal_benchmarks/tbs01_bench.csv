@@ -38,3 +38,7 @@
 2026_11_10,nex-agi/nex-n2.6,nex-agi/fp8,20
 2026_11_10,particle-ai/particle-1,particle-ai/us,15
 2026_11_10,ricursiveai/ripple-65b-preview,gmicloud/bf16,0
+2026_11_14,google/gemini-4-hydrogen,google-vertex/global,49
+2026_11_07,qwen4-max,opencode-go,23
+2026_11_18,openai/gpt-6.2-astra,azure,74.8
+2026_11_18,openai/gpt-6.2-sol,azure,63.1

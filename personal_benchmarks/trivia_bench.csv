@@ -39,3 +39,7 @@
 2026_11_10,particle-ai/particle-1,particle-ai/us,28
 2026_11_10,ricursiveai/ripple-65b-preview,gmicloud/bf16,8
 2026_11_14,google/gemini-4-hydrogen,google-vertex/global,39
+2026_11_16,qwen4-max,opencode-go,27
+2026_11_18,openai/gpt-6.2-astra,azure,84
+2026_11_18,openai/gpt-6.2-sol,azure,65
+2026_11_18,google/gemini-4-neon,google-vertex/global,42

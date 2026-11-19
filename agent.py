@@ -22,13 +22,13 @@ import secrets
 import uuid
 import copy
 import math
+import http.client
+import http.server
 import importlib.util
 from email.utils import parsedate_to_datetime
 from flowmark import reformat_file
 
 MODEL_REGISTRY = {
-    "or-astra": {"provider": "openrouter", "model": "openai/gpt-6-astra", "endpoint": "openai/flex"},
-    "or-sol61": {"provider": "openrouter", "model": "openai/gpt-6.1-sol", "endpoint": "azure"},
     "or-opus55": {"provider": "openrouter", "model": "anthropic/claude-opus-5.5", "endpoint": "amazon-bedrock"},
     "or-argon": {"provider": "openrouter", "model": "google/gemini-4-argon", "endpoint": "google-vertex/global"},
     "or-gem38f": {"provider": "openrouter", "model": "google/gemini-3.8-flash", "endpoint": "google-vertex/global/flex"},
@@ -43,6 +43,7 @@ MODEL_REGISTRY = {
     "or-sonnet55": {"provider": "openrouter", "model": "anthropic/claude-sonnet-5.5", "endpoint": "amazon-bedrock"},
     "or-fable52": {"provider": "openrouter", "model": "anthropic/claude-fable-5.2", "endpoint": "azure"},
     "or-carbon": {"provider": "openrouter", "model": "google/gemini-4-carbon", "endpoint": "google-vertex/global"},
+    "or-neon": {"provider": "openrouter", "model": "google/gemini-4-neon", "endpoint": "google-vertex/global"},
     #
     "or-ink2s": {"provider": "openrouter", "model": "thinkingmachines/inkling-2-small:free", "endpoint": "thinkingmachines/nvfp4"},
     "or-ernie55": {"provider": "openrouter", "model": "baidu/ernie-5.5-flash-preview:free", "endpoint": "baidu"},
@@ -51,6 +52,8 @@ MODEL_REGISTRY = {
     "or-nex26": {"provider": "openrouter", "model": "nex-agi/nex-n2.6", "endpoint": "nex-agi/fp8"},
     "or-particle": {"provider": "openrouter", "model": "particle-ai/particle-1", "endpoint": "particle-ai/us"},
     "or-ripple": {"provider": "openrouter", "model": "ricursiveai/ripple-65b-preview", "endpoint": "gmicloud/bf16"},
+    "or-astra62": {"provider": "openrouter", "model": "openai/gpt-6.2-astra", "endpoint": "azure"},
+    "or-sol62": {"provider": "openrouter", "model": "openai/gpt-6.2-sol", "endpoint": "azure"},
     #
     "go-argon": {"provider": "opencode-go", "model": "gemini-4-argon"},
     "go-dsv41f": {"provider": "opencode-go", "model": "deepseek-v4.1-flash"},
@@ -61,6 +64,7 @@ MODEL_REGISTRY = {
     "go-kimi31p": {"provider": "opencode-go", "model": "kimi-k3.1-pro"},
     "go-beam": {"provider": "opencode-go", "model": "beam-free"},
     "go-iceman": {"provider": "opencode-go", "model": "iceman-contributor-free"},
+    "go-qwen4max": {"provider": "opencode-go", "model": "qwen4-max"},
     #
     "mo-dsv41f": {"provider": "morphllm", "model": "morph-dsv41flash-1017"},
 }
@@ -275,6 +279,8 @@ TOOL_STATS = {"counts": {}, "errors": {}}
 WEB_FALLBACK_USED = {"used": False}
 NAV_HISTORY = {}
 MCP_STATE = {"dirty": False, "last_used": 0.0}
+SEARCH_WALLS = {}
+BWRAP_RELAY_PROXY = {"server": None, "port": None, "upstream": None, "lock": threading.Lock(), "inflight": {}}
 BROWSE_IDLE_HOPOFF_SEC = 300
 RUN_START = {"t": time.time()}
 VISION_RUN_ID = str(os.getpid()) + "-" + str(int(RUN_START["t"] * 1000))
@@ -1627,6 +1633,9 @@ def mcp_recv(mcp, expected_id, timeout=60):
 
 
 def mcp_call(mcp, method, params, timeout=60):
+    if method == "tools/call" and isinstance(params, dict) and mcp.get("session") and "_meta" not in params:
+        params = dict(params)
+        params["_meta"] = {"ai.opencode/sessionID": mcp["session"]}
     return mcp_recv(mcp, mcp_send(mcp, method, params), timeout)
 
 
@@ -1674,11 +1683,155 @@ def _mcp_handshake(mcp):
     mcp_send(mcp, "notifications/initialized", {}, notify=True)
 
 
+def _in_bwrap_pid_ns():
+    if os.environ.get("PQ_HOST_PID"):
+        return True
+    try:
+        with open("/proc/1/comm", "r", encoding="utf-8") as f:
+            return f.read().strip() == "bwrap"
+    except OSError:
+        return False
+
+
+class _BwrapRelayServer(http.server.ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+
+def _ensure_bwrap_relay_proxy(upstream_port):
+    # Under bwrap --unshare-pid, `browse mcp` sends its sandbox PID (e.g. 4) in
+    # OpenCode-Browser-Client-Pid on every HTTP request to the host relay. The
+    # host relay's 5s sweep_clients() checks kill(pid, 0) in the host PID
+    # namespace, sees PID 4 dead/EPERM, and aborts in-flight calls ("process 4
+    # exited"). Forwarding through localhost rewrites Host for relay origin
+    # validation and replaces the sandbox PID with PQ_HOST_PID (the outer host
+    # bwrap PID, alive for the exact sandbox lifetime) or omits it if unset.
+    with BWRAP_RELAY_PROXY["lock"]:
+        if BWRAP_RELAY_PROXY["server"] is not None and BWRAP_RELAY_PROXY["upstream"] == upstream_port:
+            return BWRAP_RELAY_PROXY["port"]
+
+        inflight = BWRAP_RELAY_PROXY["inflight"]
+
+        class _Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, fmt, *args):
+                pass
+
+            def _forward(self):
+                self.close_connection = True
+                length = int(self.headers.get("Content-Length") or 0)
+                req_body = self.rfile.read(length) if length > 0 else b""
+                host_pid = (os.environ.get("PQ_HOST_PID") or "").strip()
+                valid_pid = host_pid if (host_pid.isdigit() and int(host_pid) > 0) else ""
+                fwd_headers = {}
+                call_key = ""
+                auth_hdr = ""
+                for k, v in self.headers.items():
+                    low = k.lower()
+                    if low in ("host", "connection", "transfer-encoding", "opencode-browser-client-pid"):
+                        continue
+                    if low == "opencode-browser-call":
+                        call_key = v.strip()
+                    elif low == "authorization":
+                        auth_hdr = v.strip()
+                    fwd_headers[k] = v
+                fwd_headers["Host"] = "127.0.0.1:" + str(upstream_port)
+                fwd_headers["Connection"] = "close"
+                if valid_pid:
+                    fwd_headers["OpenCode-Browser-Client-Pid"] = valid_pid
+
+                track = self.command == "POST" and self.path.rstrip("/") == "/tools/call" and bool(call_key and auth_hdr)
+                if track:
+                    inflight[call_key] = (upstream_port, auth_hdr)
+                conn = http.client.HTTPConnection("127.0.0.1", upstream_port, timeout=BROWSE_RECV_TIMEOUT + 60)
+                try:
+                    conn.request(self.command, self.path, body=req_body if length > 0 else None, headers=fwd_headers)
+                    resp = conn.getresponse()
+                    data = resp.read()
+                    status = resp.status
+                    resp_ct = resp.getheader("Content-Type") or "application/json"
+                except OSError as exc:
+                    data = json.dumps({"error": "host browse relay unreachable: " + str(exc)}).encode("utf-8")
+                    status = 502
+                    resp_ct = "application/json"
+                finally:
+                    if track:
+                        inflight.pop(call_key, None)
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                try:
+                    self.send_response(status)
+                    self.send_header("Content-Type", resp_ct)
+                    self.send_header("Cache-Control", "no-store")
+                    self.send_header("Content-Length", str(len(data)))
+                    self.send_header("Connection", "close")
+                    self.end_headers()
+                    if data:
+                        self.wfile.write(data)
+                except OSError:
+                    pass
+
+            do_GET = _forward
+            do_POST = _forward
+            do_DELETE = _forward
+
+        srv = _BwrapRelayServer(("127.0.0.1", 0), _Handler)
+        port = srv.server_address[1]
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        BWRAP_RELAY_PROXY["server"] = srv
+        BWRAP_RELAY_PROXY["port"] = port
+        BWRAP_RELAY_PROXY["upstream"] = upstream_port
+        return port
+
+
+def _cancel_bwrap_relay_calls():
+    with BWRAP_RELAY_PROXY["lock"]:
+        pending = list(BWRAP_RELAY_PROXY["inflight"].items())
+        BWRAP_RELAY_PROXY["inflight"].clear()
+    for call_key, (upstream_port, auth_hdr) in pending:
+        conn = http.client.HTTPConnection("127.0.0.1", upstream_port, timeout=3)
+        try:
+            payload = json.dumps({"call": call_key}).encode("utf-8")
+            conn.request(
+                "POST",
+                "/tools/cancel",
+                body=payload,
+                headers={
+                    "Host": "127.0.0.1:" + str(upstream_port),
+                    "Authorization": auth_hdr,
+                    "Content-Type": "application/json",
+                    "Content-Length": str(len(payload)),
+                    "Connection": "close",
+                },
+            )
+            conn.getresponse().read()
+        except Exception:
+            pass
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
 def _browse_child_env():
+    # browse 0.1.0 is a native binary that runs its own relay and watchdog, so
+    # 0.0.x's OPENCODE_BROWSER_MCP_DIRECT supervisor switch no longer exists.
+    # The update knobs survived the rewrite and keep the relay from rewriting
+    # the binary under a running harness.
     env = dict(os.environ)
-    env["OPENCODE_BROWSER_MCP_DIRECT"] = "1"
     env["OPENCODE_BROWSER_AUTO_UPDATE"] = "off"
     env["OPENCODE_BROWSER_UPDATE_CHECK"] = "0"
+    if _in_bwrap_pid_ns():
+        env["OPENCODE_BROWSER_AUTOSTART"] = "0"
+        try:
+            upstream_port = int(os.environ.get("OPENCODE_BROWSER_PORT") or 19988)
+        except ValueError:
+            upstream_port = 19988
+        env["OPENCODE_BROWSER_PORT"] = str(_ensure_bwrap_relay_proxy(upstream_port))
     try:
         os.makedirs(BROWSE_FILES_DIR, mode=0o700, exist_ok=True)
         env["TMPDIR"] = BROWSE_FILES_DIR
@@ -1717,7 +1870,11 @@ def start_mcp():
     proc = None
     try:
         proc = _spawn_mcp()
-        mcp = {"proc": proc, "id": 0}
+        # 0.1.0 has no server-side session: each execute may name a tab, and the
+        # tab is what keeps `page` and `state` alive between calls. Track the
+        # tab the harness opened here so web_read and browser_execute land on it,
+        # and send a per-run session id so tab ownership survives restart_mcp().
+        mcp = {"proc": proc, "id": 0, "tab": None, "session": os.urandom(16).hex()}
         _start_reader(mcp)
         _mcp_handshake(mcp)
         return mcp
@@ -1743,13 +1900,17 @@ def restart_mcp(mcp):
     except subprocess.TimeoutExpired:
         old.kill()
         old.wait()
+    _cancel_bwrap_relay_calls()
     mcp["proc"] = _spawn_mcp()
     mcp["id"] = 0
+    mcp["tab"] = None
     _start_reader(mcp)
     _mcp_handshake(mcp)
 
 
 def _browse_notice(struct):
+    # 0.1.0 stopped sending structuredContent, so this only fires if a future
+    # build brings it back; the live path is _unpack_execute_result.
     if not isinstance(struct, dict):
         return ""
     lines = []
@@ -1761,35 +1922,125 @@ def _browse_notice(struct):
     ch = after.get("challenge") or {}
     if isinstance(ch, dict) and ch:
         detail = ", ".join(str(ch[k]) for k in ("vendor", "kind", "status") if ch.get(k))
-        line = "[browse] bot challenge on " + str(ch.get("url") or "the page")
-        if detail:
-            line += " (" + detail + ")"
-        rec = ch.get("recommendation") or "continue"
-        if rec == "stop":
-            line += ": blocked. Do not retry or reload; reloading makes the block worse for the user's IP and accounts. Tell the user."
-        elif rec == "handoff":
-            if BROWSE_ASSIST:
-                line += (
-                    ": needs a person. Navigate `page` to the target URL first (not about:blank), then call "
-                    'await handoff("solve the security check on <origin>, then click Continue on the in-page browse card or the browse toolbar icon", { timeoutMs: '
-                    + str(HANDOFF_TIMEOUT_MS)
-                    + " }) and re-read the page."
-                )
-            else:
-                line += ": interactive challenge on an unattended run (PQ_BROWSE_ASSIST=0). Do not call handoff(); try an open API, plain HTTP, or another source, or record the block in task_report/report.md."
-        else:
-            line += ": non-interactive, usually clears itself. Repeat the read once if the content is missing."
-        lines.append(line)
+        lines.append(_format_challenge_text(detail, ch.get("recommendation") or "continue", ch.get("url") or "the page"))
     diag = struct.get("diagnostic")
     if diag:
         lines.append("[browse] diagnostic: " + str(diag)[:400])
     return "\n".join(lines)
 
 
-def call_playwright(mcp, name, arguments, cap=True, timeout=60):
-    if name != "session_delete":
-        MCP_STATE["dirty"] = True
-        MCP_STATE["last_used"] = time.monotonic()
+def _unpack_execute_result(result, internal_js=False, show_warnings=True):
+    # browse 0.1.0 renders execute output into content[0].text as sections
+    # joined by "\n\n": an optional "tab: <id>" line, the returned value, then
+    # optional "Warnings:", "Page:"/"Challenge:" and "Console:" sections. The
+    # relay can add further "Warning: ..." blocks in content[1:] (for example
+    # when the user has typed in the tab while an agent held it).
+    #
+    # Each section is split back out so web tools see only the page text and
+    # browser_execute still sees warnings, console output and challenge notices.
+    content_blocks = [b["text"] for b in result.get("content", []) if b.get("type") == "text"]
+    raw_first = content_blocks[0] if content_blocks else ""
+    relay_warnings = []
+    for block in content_blocks[1:]:
+        s = block.strip()
+        if s:
+            relay_warnings.append(s[9:].strip() if s.startswith("Warning: ") else s)
+
+    m_tab = re.match(r"^tab: (\d+)(?: \(also used: [^\n]*\))?(?:\n\n|\Z)", raw_first)
+    if m_tab:
+        tab_id = int(m_tab.group(1))
+        body = raw_first[m_tab.end() :]
+    else:
+        tab_id = None
+        body = raw_first
+
+    # The builders in this file write their own "Console:" text when they have
+    # something to show (read JS prints page console errors); browse's own
+    # Console section is only stripped for those calls.
+    console_text = ""
+    if not internal_js:
+        m_con = re.search(r"(?:^|\n\n)Console:\n([\s\S]*)\Z", body)
+        if m_con:
+            console_text = m_con.group(1)
+            body = body[: m_con.start()]
+
+    challenge_line = ""
+    m_after = re.search(r"(?:^|\n\n)((?:Page: [^\n]+(?:\nChallenge: [^\n]+)?)|(?:Challenge: [^\n]+))\Z", body)
+    if m_after:
+        for line in m_after.group(1).splitlines():
+            if line.startswith("Challenge: "):
+                challenge_line = line[11:].strip()
+        body = body[: m_after.start()]
+
+    script_warnings = []
+    m_warn = re.search(r"(?:^|\n\n)Warnings:\n((?:- [^\n]+(?:\n|\Z))+)\Z", body)
+    if m_warn:
+        for line in m_warn.group(1).splitlines():
+            if line.startswith("- "):
+                script_warnings.append(line[2:].strip())
+        body = body[: m_warn.start()]
+
+    is_err = bool(result.get("isError"))
+    if is_err and not body.lstrip().startswith("Error:"):
+        body = "Error: " + body
+
+    if console_text:
+        body = body + "\n\nConsole:\n" + console_text if body else "Console:\n" + console_text
+
+    notices = []
+    legacy = _browse_notice(result.get("structuredContent"))
+    if legacy:
+        notices.append(legacy)
+    if show_warnings:
+        for w in relay_warnings + script_warnings:
+            if "could not be represented as JSON value" in w:
+                continue
+            if is_err and w.startswith("Unhandled promise rejection:") and body[:80] in w:
+                continue
+            notices.append("[browse] warning: " + w)
+    if challenge_line:
+        low = challenge_line.lower()
+        is_interactive = "interactive" in low and "non-interactive" not in low
+        rec = "stop" if ("block" in low or "stop" in low) else ("handoff" if ("handoff" in low or is_interactive or "person" in low) else "continue")
+        notices.append(_format_challenge_text(challenge_line, rec=rec))
+    if notices:
+        joined = "\n".join(notices)
+        body = body + "\n\n" + joined if body else joined
+    return body, tab_id
+
+
+def _format_challenge_text(detail, rec="continue", url_label="the page"):
+    line = "[browse] bot challenge on " + str(url_label or "the page")
+    if detail:
+        line += " (" + str(detail) + ")"
+    if rec == "stop":
+        line += ": blocked. Do not retry or reload; reloading makes the block worse for the user's IP and accounts. Tell the user."
+    elif rec == "handoff":
+        if BROWSE_ASSIST:
+            line += (
+                ": needs a person. Navigate `page` to the target URL first (not about:blank), then call "
+                'await handoff("solve the security check on <origin>, then click Continue on the in-page browse card or the browse toolbar icon", { timeoutMs: '
+                + str(HANDOFF_TIMEOUT_MS)
+                + " }) and re-read the page."
+            )
+        else:
+            line += ": interactive challenge on an unattended run (PQ_BROWSE_ASSIST=0). Do not call handoff(); try an open API, plain HTTP, or another source, or record the block in task_report/report.md."
+    else:
+        line += ": non-interactive, usually clears itself. Repeat the read once if the content is missing."
+    return line
+
+
+def _browse_close_tabs(mcp, timeout=15):
+    # 0.1.0 replaced session_delete with `tabs close`. idleMinutes 0 closes every
+    # agent tab and hands lent tabs back to the user; it succeeds with no tabs
+    # open, which keeps idle and exit cleanup from needing a state check.
+    mcp_call(mcp, "tools/call", {"name": "tabs", "arguments": {"action": "close", "idleMinutes": 0}}, timeout=timeout)
+    mcp["tab"] = None
+
+
+def call_playwright(mcp, name, arguments, cap=True, timeout=60, use_shared_tab=False, internal_js=False, show_warnings=True):
+    MCP_STATE["dirty"] = True
+    MCP_STATE["last_used"] = time.monotonic()
     for attempt in range(5):
         if attempt > 0:
             delay = backoff_delay(attempt)
@@ -1803,15 +2054,30 @@ def call_playwright(mcp, name, arguments, cap=True, timeout=60):
                 print(ts() + "  [mcp restart failed] attempt " + str(attempt) + "/4: " + str(e)[:120])
                 continue
         try:
-            result = mcp_call(mcp, "tools/call", {"name": name, "arguments": arguments}, timeout=timeout)
-            text = "\n".join(b["text"] for b in result.get("content", []) if b.get("type") == "text")
-            if result.get("isError"):
-                if "newer than CLI build" in text:
+            call_args = dict(arguments)
+            if name == "execute" and use_shared_tab and mcp.get("tab") is not None and "tab" not in call_args:
+                call_args["tab"] = mcp["tab"]
+            result = mcp_call(mcp, "tools/call", {"name": name, "arguments": call_args}, timeout=timeout)
+            if name == "execute":
+                text, tab_id = _unpack_execute_result(result, internal_js=internal_js, show_warnings=show_warnings)
+                if (result.get("isError") or text.lstrip().startswith("Error:")) and "tab" in call_args and ("is gone" in text or "isn't a browse tab" in text):
+                    # the user closed the tab, or a reload replaced it: drop the
+                    # handle and rerun once so the call still runs on a fresh tab
+                    mcp["tab"] = None
+                    retry_args = {k: v for k, v in call_args.items() if k != "tab"}
+                    result = mcp_call(mcp, "tools/call", {"name": name, "arguments": retry_args}, timeout=timeout)
+                    text, tab_id = _unpack_execute_result(result, internal_js=internal_js, show_warnings=show_warnings)
+                if result.get("isError") and "newer than CLI build" in text:
                     raise McpTransportError("browse binary changed under a running relay: " + text[:160])
-                text = "Error: " + text
-            notice = _browse_notice(result.get("structuredContent"))
-            if notice:
-                text = text + "\n\n" + notice if text else notice
+                if use_shared_tab and not result.get("isError"):
+                    mcp["tab"] = tab_id
+            else:
+                text = "\n".join(b["text"] for b in result.get("content", []) if b.get("type") == "text")
+                if result.get("isError"):
+                    if "newer than CLI build" in text:
+                        raise McpTransportError("browse binary changed under a running relay: " + text[:160])
+                    if not text.lstrip().startswith("Error:"):
+                        text = "Error: " + text
             if cap:
                 text = truncate_playwright_text(text)
             if attempt > 0:
@@ -1833,12 +2099,12 @@ def _maybe_hopoff_idle_browser(mcp):
     if idle_s < BROWSE_IDLE_HOPOFF_SEC:
         return
     try:
-        mcp_call(mcp, "tools/call", {"name": "session_delete", "arguments": {}}, timeout=15)
+        _browse_close_tabs(mcp, timeout=15)
         MCP_STATE["dirty"] = False
-        print(ts() + "  [browse] idle " + str(int(idle_s)) + "s: closed session tab group (reopens automatically on next web call)")
+        print(ts() + "  [browse] idle " + str(int(idle_s)) + "s: closed agent tabs (reopens automatically on next web call)")
     except Exception as e:
         MCP_STATE["last_used"] = time.monotonic()
-        print(ts() + "  [browse] idle session_delete skipped: " + str(e)[:120])
+        print(ts() + "  [browse] idle tab cleanup skipped: " + str(e)[:120])
 
 
 def _note_repeat(key):
@@ -2695,14 +2961,18 @@ def _normalize_web_search_args(arguments):
 
 # Page code for the browse backend (PQ_PLAYWRIGHT=1 with the browse CLI).
 # Everything below is JavaScript sent to browse's execute tool, so it lives in
-# this file as strings and follows browse 0.0.15's rules (cli/src/execute):
-# - the code is wrapped as `{ ... }` inside an async function, and only a code
-#   body that is exactly one expression is auto-returned. Every builder here is
-#   multi-statement and ends with an explicit `return`.
-# - a returned string reaches the model verbatim; objects get JSON- or
-#   util.inspect-capped (4000 chars per string), so all formatting happens here.
-# - the realm has page/context/browser and Playwright, nothing from Node: no
-#   URL class assumptions, no fetch outside the page.
+# this file as strings and follows browse 0.1.0's execute sandbox:
+# - the code is an async function body, and only a body that is exactly one
+#   expression is auto-returned. Every builder here is multi-statement and ends
+#   with an explicit `return`.
+# - a returned string reaches the model verbatim; objects are cut at 4,000
+#   characters per string, so all formatting happens here.
+# - the realm has page/context/browser, the browse globals (snapshot, ref,
+#   ariaSnapshot, handoff, files, screenshotWithLabels, ...) and Playwright,
+#   nothing from Node: no URL class assumptions, no fetch outside the page.
+# - 0.1.0 keeps `page` and `state` alive per tab, not per session: browser_execute
+#   and web_read pass the tracked tab id on every call (see call_playwright), and
+#   an execute with no tab starts tabless until page.goto() opens one.
 # - result text over 100,000 chars is cut by browse itself, so the builders cut
 #   first with a marker that says what was dropped.
 
@@ -2809,16 +3079,16 @@ _BROWSE_SEARCH_ENGINES = [
 ]
 
 
-def _browse_search_js(queries):
+def _browse_search_js(queries, walled=None):
     # One execute call for the whole batch: a fresh tab per query and per
     # engine, the waterfall stops at the first engine that returns cards, and
     # every failure is named in the output instead of silently advancing (a
     # silent fallback once hid a broken extractor for a whole release, see
     # mcp_server.js v2.4.1). Google leads because the shared profile is signed
     # in; Startpage is a proxy in front of Google, DuckDuckGo and Brave are the
-    # independent indexes when Google serves a consent or bot wall. Known bot
-    # walls are cached in browse's session `state` for 15 minutes so a multi-query
-    # run does not burn 8s per query re-checking a walled engine.
+    # independent indexes when Google serves a consent or bot wall. Since 0.1.0
+    # stores `state` per tab and search runs tabless, Python persists known bot
+    # walls in SEARCH_WALLS for 15 minutes across calls.
     engines = []
     for name, url_expr, wait, extract in _BROWSE_SEARCH_ENGINES:
         engines.append("{ name: " + json.dumps(name) + ", url: (q) => " + url_expr + ", wait: " + json.dumps(wait) + ", extract: " + extract + " }")
@@ -2826,7 +3096,7 @@ def _browse_search_js(queries):
         "const queries = " + json.dumps(queries) + ";\n"
         "const engines = [\n  " + ",\n  ".join(engines) + "\n];\n"
         "const WALL_TTL_MS = 15 * 60 * 1000;\n"
-        "state.walledSearchEngines = state.walledSearchEngines || {};\n"
+        "const walledEngines = " + json.dumps(walled or {}) + ";\n"
         "const detectWall = async (t) => {\n"
         "  const u = t.url() || '';\n"
         "  if (/\\/sorry\\/|\\/challenge\\b|ipv[46]\\.google\\.com/i.test(u)) return true;\n"
@@ -2841,7 +3111,7 @@ def _browse_search_js(queries):
         "  let block = null;\n"
         "  const tried = [];\n"
         "  for (const eng of engines) {\n"
-        "    const cached = state.walledSearchEngines[eng.name];\n"
+        "    const cached = walledEngines[eng.name];\n"
         "    if (cached && (Date.now() - cached.at) < WALL_TTL_MS) {\n"
         "      tried.push(eng.name + ' (skipped: ' + cached.reason + ')');\n"
         "      continue;\n"
@@ -2885,14 +3155,18 @@ def _browse_search_js(queries):
         "      }\n"
         "    } catch (e) {\n"
         "      failure = String((e && e.message) || e).slice(0, 160);\n"
+        "      if (tab && !walled && await detectWall(tab)) {\n"
+        "        walled = true;\n"
+        "        failure = failure ? failure + ', bot wall' : 'bot wall';\n"
+        "      }\n"
         "    } finally {\n"
         "      if (tab) {\n"
         "        try { await Promise.race([tab.close(), new Promise((r) => setTimeout(r, 3000))]); } catch (e) {}\n"
         "      }\n"
         "    }\n"
-        "    if (walled) state.walledSearchEngines[eng.name] = { reason: failure || 'bot wall', at: Date.now() };\n"
+        "    if (walled) walledEngines[eng.name] = { reason: failure || 'bot wall', at: Date.now() };\n"
         "    if (results && results.length) {\n"
-        "      delete state.walledSearchEngines[eng.name];\n"
+        "      delete walledEngines[eng.name];\n"
         "      const top = results.slice(0, 10);\n"
         "      const lines = top.map((r, i) => (i + 1) + '. ' + r.title + '\\n   ' + r.url + (r.snippet ? '\\n   ' + r.snippet : ''));\n"
         "      const failNote = tried.length ? '; failed: ' + tried.join(', ') : '';\n"
@@ -2904,7 +3178,7 @@ def _browse_search_js(queries):
         "  if (!block) block = 'No results for \"' + q + '\" (tried: ' + tried.join('; ') + '). Try rephrasing, or open a known URL directly with web_read.';\n"
         "  blocks.push(block);\n"
         "}\n"
-        "return blocks.join('\\n\\n');"
+        "return blocks.join('\\n\\n') + '\\n__SEARCH_WALLS__:' + JSON.stringify(walledEngines);"
     )
 
 
@@ -2933,6 +3207,7 @@ def _browse_read_js(url, selector=None, find=None):
             "try {\n"
             "  resp = await page.goto(target, { waitUntil: 'domcontentloaded', timeout: 15000 });\n"
             "} catch (e) {\n"
+            "  if (/is gone|isn't a browse tab/i.test(String((e && e.message) || e))) throw e;\n"
             "  try { resp = await page.goto(target, { waitUntil: 'load', timeout: 30000 }); }\n"
             "  catch (e2) { return 'Error: navigation to ' + target + ' failed: ' + String((e2 && e2.message) || e2).slice(0, 300); }\n"
             "}\n"
@@ -2942,11 +3217,17 @@ def _browse_read_js(url, selector=None, find=None):
         parts.append("let head = 'Current URL: ' + page.url() + '\\n\\n';\n")
     if find:
         # find is the acting read: browse's compact snapshot keeps the matching
-        # controls with their [ref=eN] ids, so a click is the very next call
+        # controls with their [ref=eN] ids, so a click is the very next call.
+        # 0.1.0 scopes a snapshot with `within`, not `selector`.
+        snap_opts = "{ find: " + json.dumps(find) + (", within: " + json.dumps(selector) if selector else "") + " }"
         parts.append(
             "let body = '';\n"
-            "try { body = await snapshot({ find: " + json.dumps(find) + " }); }\n"
-            "catch (e) { body = 'Error: find ' + " + json.dumps(find) + " + ' failed: ' + String((e && e.message) || e).slice(0, 200); }\n"
+            "try { body = await snapshot(" + snap_opts + "); }\n"
+            "catch (e) {\n"
+            "  const msg = String((e && e.message) || e);\n"
+            "  if (/no tab is open yet|page has no tab yet/i.test(msg)) return 'Error: no page is open in the shared tab yet; pass a url to web_read first.';\n"
+            "  body = 'Error: find ' + " + json.dumps(find) + " + ' failed: ' + msg.slice(0, 200);\n"
+            "}\n"
         )
     else:
         # a selector that matches nothing costs one count() instead of a
@@ -2968,7 +3249,7 @@ def _browse_read_js(url, selector=None, find=None):
             "  catch (e) { body = ''; }\n"
             "  body = (body || '').trim();\n"
             "  if (!body) {\n"
-            "    body = await ariaSnapshot(scope).catch(() => '');\n"
+            "    body = await ariaSnapshot({ within: scope }).catch(() => '');\n"
             "    body = body ? '[ariaSnapshot; this scope has no plain text]\\n' + body : 'No readable text in ' + scope + ' on ' + page.url() + '.';\n"
             "  } else {\n"
             "    const index = await page.evaluate((sel) => {\n"
@@ -3012,36 +3293,78 @@ def _browse_read_js(url, selector=None, find=None):
 
 def _browse_fetch_js(url):
     # Fresh tab so a fetch never navigates the page the model is reading.
-    # resp.text() returns the raw body for JSON/XML/HTML (no markdown, no
-    # accessibility tree). Chrome renders some types instead of returning
-    # bytes, so a rendered <pre>/body text is the fallback, and the status line
-    # is kept because a 403 challenge page and a 200 JSON body must not look
-    # alike in context.
+    # browse 0.1.0 stubs Response.headers() to {} and throws on Response.text(),
+    # and its eval wire format truncates serialized strings around 100 KB (which
+    # breaks JSON.parse inside prelude.js if a single evaluate returns 90 KB of
+    # quote-heavy JSON). Read document.contentType and extract the raw HTML/XML/
+    # pre text in 45 KB slices up to BROWSE_FETCH_MAX_CHARS.
+    chunk_chars = 45000
     return (
         "const target = " + json.dumps(url) + ";\n"
+        "const maxChars = " + str(BROWSE_FETCH_MAX_CHARS) + ";\n"
+        "const step = " + str(chunk_chars) + ";\n"
         "const tab = await context.newPage();\n"
-        "let head = '';\n"
+        "let finalUrl = target;\n"
+        "let status = 'unavailable';\n"
+        "let ctype = 'unknown';\n"
         "let body = null;\n"
+        "let totalLen = 0;\n"
         "let note = '';\n"
         "try {\n"
         "  let resp = null;\n"
         "  try { resp = await tab.goto(target, { waitUntil: 'domcontentloaded', timeout: 30000 }); }\n"
         "  catch (e) { note = 'navigation error: ' + String((e && e.message) || e).slice(0, 200); }\n"
+        "  try { finalUrl = tab.url(); } catch (e) {}\n"
         "  if (resp) {\n"
-        "    head = 'Requested URL: ' + target + '\\nFinal URL: ' + tab.url() + '\\nHTTP status: ' + resp.status() + '\\nContent type: ' + ((resp.headers() || {})['content-type'] || 'unknown') + '\\n\\n';\n"
-        "    try { body = await resp.text(); }\n"
-        "    catch (e) { note = 'response body unreadable: ' + String((e && e.message) || e).slice(0, 200); }\n"
+        "    status = String(resp.status());\n"
+        "    const hdrCt = (resp.headers() || {})['content-type'];\n"
+        "    if (hdrCt) ctype = hdrCt;\n"
         "  }\n"
-        "  if (body === null || body === '') {\n"
-        "    const rendered = await tab.evaluate(() => { const pre = document.querySelector('pre'); return pre ? pre.textContent : (document.body ? document.body.innerText : ''); }).catch(() => '');\n"
-        "    if (rendered) { body = rendered; if (!head) head = 'Requested URL: ' + target + '\\nFinal URL: ' + tab.url() + '\\nHTTP status: unavailable\\n\\n'; }\n"
+        "  const readSlice = (off, lim) => tab.evaluate(([o, n]) => {\n"
+        "    const ct = String(document.contentType || '').trim();\n"
+        "    const low = ct.toLowerCase();\n"
+        "    let raw = '';\n"
+        "    const xmlSrc = document.getElementById('webkit-xml-viewer-source-xml');\n"
+        "    if (xmlSrc) {\n"
+        "      raw = xmlSrc.innerHTML || '';\n"
+        "    } else if (low.includes('html')) {\n"
+        "      raw = (document.doctype ? '<!DOCTYPE ' + document.doctype.name + '>\\n' : '') + (document.documentElement ? document.documentElement.outerHTML : '');\n"
+        "    } else if (low.includes('xml')) {\n"
+        "      raw = new XMLSerializer().serializeToString(document);\n"
+        "    } else {\n"
+        "      const pre = document.querySelector('pre');\n"
+        "      raw = pre ? pre.textContent : (document.body ? document.body.innerText : (document.documentElement ? document.documentElement.textContent : ''));\n"
+        "    }\n"
+        "    raw = String(raw || '');\n"
+        "    return { ct, total: raw.length, chunk: raw.slice(o, o + n) };\n"
+        "  }, [off, lim]);\n"
+        "  try {\n"
+        "    const first = await readSlice(0, Math.min(step, maxChars));\n"
+        "    if (first && typeof first === 'object') {\n"
+        "      if (ctype === 'unknown' && first.ct) ctype = first.ct;\n"
+        "      totalLen = Number(first.total) || 0;\n"
+        "      let acc = String(first.chunk || '');\n"
+        "      let off = acc.length;\n"
+        "      const goal = Math.min(totalLen, maxChars);\n"
+        "      while (off < goal) {\n"
+        "        const next = await readSlice(off, Math.min(step, goal - off));\n"
+        "        const piece = next && typeof next.chunk === 'string' ? next.chunk : '';\n"
+        "        if (!piece) break;\n"
+        "        acc += piece;\n"
+        "        off += piece.length;\n"
+        "      }\n"
+        "      body = acc;\n"
+        "    }\n"
+        "  } catch (e) {\n"
+        "    if (!note) note = 'response body unreadable: ' + String((e && e.message) || e).slice(0, 200);\n"
         "  }\n"
         "} finally {\n"
         "  try { await Promise.race([tab.close(), new Promise((r) => setTimeout(r, 3000))]); } catch (e) {}\n"
         "}\n"
-        "if (body === null || body === '') return 'Error: no response body for ' + target + (note ? ' (' + note + ')' : '') + '.';\n"
-        "if (body.length > " + str(BROWSE_FETCH_MAX_CHARS) + ") {\n"
-        "  body = body.slice(0, " + str(BROWSE_FETCH_MAX_CHARS) + ") + '\\n[browser cut the body at " + str(BROWSE_FETCH_MAX_CHARS) + " chars of ' + body.length + ']';\n"
+        "if (!body) return 'Error: no response body for ' + target + (note ? ' (' + note + ')' : '') + '.';\n"
+        "const head = 'Requested URL: ' + target + '\\nFinal URL: ' + finalUrl + '\\nHTTP status: ' + status + '\\nContent type: ' + ctype + '\\n\\n';\n"
+        "if (totalLen > maxChars) {\n"
+        "  body = body + '\\n[browser cut the body at ' + maxChars + ' chars of ' + totalLen + ']';\n"
         "}\n"
         "return head + body;"
     )
@@ -3052,7 +3375,7 @@ def _browse_execute_timeout(explicit_ms, text):
     # also has to wait: a 15-minute handoff needs a receive timeout above both
     # the operator wait and the script budget so the pipe stays open.
     secs = max(1, int(explicit_ms)) / 1000.0
-    if isinstance(text, str) and re.search(r"\bhandoff\s*\(", text):
+    if isinstance(text, str) and re.search(r"\b(?:handoff|demonstrate)\s*\(", text):
         secs = max(secs, HANDOFF_SCRIPT_BUDGET_MS / 1000.0 + 30)
     else:
         secs = max(secs, 60)
@@ -3154,19 +3477,36 @@ def tool_search_web(mcp, queries):
         text = WEB_LITE.search(queries)
         print(ts() + "[tool call] websearch: " + (", ".join(queries))[:80] + " | " + str(len(text)) + " chars")
         return notice + text
+    now_ms = int(time.time() * 1000)
+    active_walls = {k: v for k, v in SEARCH_WALLS.items() if isinstance(v, dict) and (now_ms - int(v.get("at") or 0)) < 15 * 60 * 1000}
+    SEARCH_WALLS.clear()
+    SEARCH_WALLS.update(active_walls)
     timeout_ms = min(240000, 45000 + 45000 * len(queries))
     try:
         text = call_playwright(
             mcp,
             "execute",
-            {"code": _browse_search_js(queries), "timeoutMs": timeout_ms},
+            {"code": _browse_search_js(queries, SEARCH_WALLS), "timeoutMs": timeout_ms},
             timeout=int(timeout_ms / 1000) + 60,
+            use_shared_tab=False,
+            internal_js=True,
+            show_warnings=False,
         )
     except Exception as e:
         alt = _search_over_http(queries, "failed after its retries (" + str(e)[:120] + ")")
         if alt is None:
             raise
         return notice + alt
+    body, sep, walls_raw = text.rpartition("\n__SEARCH_WALLS__:")
+    if sep:
+        text = body
+        try:
+            parsed_walls = json.loads(walls_raw)
+            if isinstance(parsed_walls, dict):
+                SEARCH_WALLS.clear()
+                SEARCH_WALLS.update(parsed_walls)
+        except ValueError:
+            pass
     if text.lstrip().startswith("Error:") or text.count('No results for "') == len(queries):
         reason = "reported an error" if text.lstrip().startswith("Error:") else "came back empty on every engine"
         alt = _search_over_http(queries, reason)
@@ -3177,10 +3517,21 @@ def tool_search_web(mcp, queries):
 
 
 def tool_web_read(mcp, url=None, selector=None, find=None):
+    if not ENABLE_WEB_LITE and not url and mcp is not None and mcp.get("tab") is None:
+        return "Error: no page is open in the shared tab yet; pass a url to web_read first."
     timeout_ms = 45000 if url else 30000
     code = _browse_read_js(url, selector, find)
     try:
-        text = call_playwright(mcp, "execute", {"code": code, "timeoutMs": timeout_ms}, cap=False, timeout=int(timeout_ms / 1000) + 60)
+        text = call_playwright(
+            mcp,
+            "execute",
+            {"code": code, "timeoutMs": timeout_ms},
+            cap=False,
+            timeout=int(timeout_ms / 1000) + 60,
+            use_shared_tab=True,
+            internal_js=True,
+            show_warnings=True,
+        )
     except Exception as e:
         if url and not find:
             alt = _read_over_http(url, selector, "failed after its retries (" + str(e)[:120] + ")")
@@ -3223,10 +3574,10 @@ def tool_browser_execute(mcp, code, timeout_ms=None, adopt_tab=False, reset_sess
     # Raw browse execute: stateful JS in the shared Chrome profile.
     if not isinstance(code, str) or not code.strip():
         return "Error: browser_execute requires 'code' (JavaScript run inside the browser session)."
-    handoff = re.search(r"\bhandoff\s*\(", code) is not None
+    handoff = re.search(r"\b(?:handoff|demonstrate)\s*\(", code) is not None
     if handoff and not BROWSE_ASSIST:
         return (
-            "Error: interactive browser handoff() is disabled in this session (PQ_BROWSE_ASSIST=0). "
+            "Error: interactive browser handoff()/demonstrate() is disabled in this session (PQ_BROWSE_ASSIST=0). "
             "Do not wait on a human at the browser monitor; use an automated route (open API, session cookies, alternate source) "
             "or report what blocked automated completion."
         )
@@ -3243,22 +3594,50 @@ def tool_browser_execute(mcp, code, timeout_ms=None, adopt_tab=False, reset_sess
     if handoff:
         timeout_ms = max(timeout_ms, HANDOFF_SCRIPT_BUDGET_MS)
     if reset_session:
+        # 0.1.0 has no session_reset: close the tracked tab and open a fresh one,
+        # so the code below starts on about:blank instead of failing with
+        # "page has no tab yet" the way a bare close would leave it.
+        old_tab = mcp.get("tab")
+        mcp["tab"] = None
+        if old_tab is not None:
+            try:
+                mcp_call(mcp, "tools/call", {"name": "tabs", "arguments": {"action": "close", "tab": old_tab}}, timeout=30)
+            except Exception as e:
+                print(ts() + "  [browse] resetSession tab close skipped: " + str(e)[:120])
         try:
-            mcp_call(mcp, "tools/call", {"name": "session_reset", "arguments": {}}, timeout=90)
+            res = mcp_call(mcp, "tools/call", {"name": "tabs", "arguments": {"action": "new"}}, timeout=30)
+            raw = "\n".join(b["text"] for b in res.get("content", []) if b.get("type") == "text")
+            parsed = json.loads(raw) if raw.strip().startswith("{") else {}
+            if isinstance(parsed.get("tab"), int):
+                mcp["tab"] = parsed["tab"]
+                print(ts() + "  [browse] resetSession: closed " + str(old_tab) + ", opened tab " + str(parsed["tab"]))
         except Exception as e:
-            print(ts() + "  [browse] session_reset failed: " + str(e)[:120])
+            print(ts() + "  [browse] resetSession new tab failed: " + str(e)[:120])
     if adopt_tab:
         try:
-            text = mcp_call(mcp, "tools/call", {"name": "session_adopt", "arguments": {}}, timeout=90)
-            adopted = "\n".join(b["text"] for b in text.get("content", []) if b.get("type") == "text")
-            print(ts() + "  [browse] session_adopt: " + adopted[:120])
+            res = mcp_call(mcp, "tools/call", {"name": "tabs", "arguments": {"action": "list"}}, timeout=30)
+            raw = "\n".join(b["text"] for b in res.get("content", []) if b.get("type") == "text")
+            parsed = json.loads(raw) if raw.strip().startswith("{") else {}
+            tabs = [t for t in (parsed.get("tabs") or []) if isinstance(t, dict) and isinstance(t.get("tab"), int)]
+            chosen = next((t for t in reversed(tabs) if t.get("lent")), tabs[-1] if tabs else None)
+            if chosen:
+                mcp["tab"] = chosen["tab"]
+                print(ts() + "  [browse] adopted tab " + str(chosen["tab"]) + " (" + str(chosen.get("url") or "")[:80] + ")")
         except Exception as e:
-            print(ts() + "  [browse] session_adopt failed: " + str(e)[:120])
+            print(ts() + "  [browse] adoptTab failed: " + str(e)[:120])
     recv = _browse_execute_timeout(timeout_ms, code)
     if handoff:
         _print_handoff_banner(code)
     try:
-        text = call_playwright(mcp, "execute", {"code": code, "timeoutMs": timeout_ms}, timeout=recv)
+        text = call_playwright(
+            mcp,
+            "execute",
+            {"code": code, "timeoutMs": timeout_ms},
+            timeout=recv,
+            use_shared_tab=True,
+            internal_js=False,
+            show_warnings=True,
+        )
     finally:
         if handoff:
             print(ts() + "  >>> BROWSER ASSIST RESUMED <<<", flush=True)
@@ -3274,7 +3653,16 @@ def tool_web_fetch(mcp, url):
         print(ts() + "[tool call] webfetch: " + url[:100] + " | " + str(len(text)) + " chars")
         return notice + text
     try:
-        text = call_playwright(mcp, "execute", {"code": _browse_fetch_js(url), "timeoutMs": 60000}, cap=False, timeout=120)
+        text = call_playwright(
+            mcp,
+            "execute",
+            {"code": _browse_fetch_js(url), "timeoutMs": 60000},
+            cap=False,
+            timeout=120,
+            use_shared_tab=False,
+            internal_js=True,
+            show_warnings=False,
+        )
     except Exception as e:
         alt = _fetch_over_http(url, "failed after its retries (" + str(e)[:120] + ")")
         if alt is None:
@@ -3456,7 +3844,7 @@ def make_tools():
                 "type": "function",
                 "function": {
                     "name": "web_read",
-                    "description": "Open a URL in the shared Chrome tab and return the page as text: the main region (or article, or body) as plain prose, then an index of its links as 'text -> url'. Omit url to read the page the browser is already on; a url navigates that same shared tab, so page state an earlier browser_execute built up is gone. Pass selector for one CSS region ('main', 'table', '#specs'), or find to get browse's compact semantic outline of the matching elements with [ref=e12] ids, which is the read to use before clicking through browser_execute with ref('e12'). A long read is cut at about 5,000 tokens, keeping the top two thirds and the bottom third, and the full page text is spilled to a temp file outside the workspace whose path is returned. find matches on browse's compact tree, which collapses whole sections into groups, so 'no lines matched' can mean the group is collapsed: read the page text before concluding the page lacks something. Prose only: for the accessibility tree of a region, call await ariaSnapshot(selector) inside browser_execute.",
+                    "description": "Open a URL in the shared Chrome tab and return the page as text: the main region (or article, or body) as plain prose, then an index of its links as 'text -> url'. Omit url to read the page the browser is already on; a url navigates that same shared tab, so page state an earlier browser_execute built up is gone. Pass selector for one CSS region ('main', 'table', '#specs'), or find to get browse's compact semantic outline of the matching elements with [ref=e12] ids, which is the read to use before clicking through browser_execute with ref('e12'). A long read is cut at about 5,000 tokens, keeping the top two thirds and the bottom third, and the full page text is spilled to a temp file outside the workspace whose path is returned. find matches on browse's compact tree, which collapses whole sections into groups, so 'no lines matched' can mean the group is collapsed: read the page text before concluding the page lacks something. Prose only: for the accessibility tree of a region, call await ariaSnapshot({ within: selector }) inside browser_execute.",
                     "parameters": {
                         "type": "object",
                         "properties": {
@@ -3520,11 +3908,11 @@ def make_tools():
                     "name": "browser_execute",
                     "description": "Run JavaScript in the shared Chrome session: the escape hatch for what the other web tools cannot do (click through a flow, fill a form, read a value out of the DOM"
                     + (", save a screenshot for vision_skill)" if vision_setup() else ", save a screenshot)")
-                    + ". The code runs inside an async function with page and context (Playwright's Page and BrowserContext, so the usual Playwright API works), browser, state (a plain object that keeps values between calls), snapshot(options) (the compact inspect-before-acting read, with [ref=eN] ids for ref()), ref(id), ariaSnapshot(target?, options) (Playwright's full YAML tree), fillInput, screenshotWithLabels({ path }), "
+                    + ". The code runs inside an async function with page and context (Playwright's Page and BrowserContext, so the usual Playwright API works), browser, state (a plain object that keeps values between calls), snapshot(options) (the compact inspect-before-acting read, with [ref=eN] ids for ref()), ref(id), ariaSnapshot(options) (Playwright's full YAML tree, e.g. ariaSnapshot({ within: selector })), fillInput, screenshotWithLabels({ path }), "
                     + be_globals
                     + ". It is not Node: no process, no require, no fetch outside the page (use page.goto or page.evaluate). Returning a string sends exactly that string back to you; a body that is a single expression is returned automatically, anything longer needs an explicit return, and a returned object is cut at 4,000 characters per string, so format the answer yourself. The page survives between calls: navigate once, then click across several calls, and page.url() says where the tab is. Two traps that each cost a retry: any navigation invalidates snapshot refs, so call snapshot() after the last goto in the same call, and fillInput(await ref(id), text) needs a handle, with pressSequentially preferred where bot protection is likely because fill does not fire trusted keys."
                     + be_handoff
-                    + "adoptTab: true adopts the tab the user shared from the browse toolbar button. resetSession: true recovers a wedged tab before running.",
+                    + "adoptTab: true continues in the tab the user lent by clicking the browse toolbar button. resetSession: true closes the shared tab before running, for a wedged page.",
                     "parameters": {
                         "type": "object",
                         "properties": {
@@ -3533,8 +3921,8 @@ def make_tools():
                                 "type": "integer",
                                 "description": be_timeout_desc,
                             },
-                            "adoptTab": {"type": "boolean", "description": "Adopt the tab the user shared from the browse toolbar button before running."},
-                            "resetSession": {"type": "boolean", "description": "Recover a wedged session tab (re-resolve the page) before running."},
+                            "adoptTab": {"type": "boolean", "description": "Continue in the tab the user lent by clicking the browse toolbar button, instead of the tracked agent tab."},
+                            "resetSession": {"type": "boolean", "description": "Close the shared tab before running, for a wedged page. The next call opens a fresh one."},
                         },
                         "required": ["code"],
                         "additionalProperties": False,
@@ -4650,16 +5038,17 @@ def main():
         PROCS.clear()
         if mcp is not None and MCP_STATE["dirty"]:
             try:
-                mcp_call(mcp, "tools/call", {"name": "session_delete", "arguments": {}}, timeout=20)
+                _browse_close_tabs(mcp, timeout=20)
                 MCP_STATE["dirty"] = False
             except Exception as e:
-                print(ts() + "  [browse] session_delete on exit failed: " + str(e)[:120])
+                print(ts() + "  [browse] tabs close on exit failed: " + str(e)[:120])
         try:
             if mcp is not None:
                 mcp["proc"].stdin.close()
                 mcp["proc"].terminate()
         except Exception:
             pass
+        _cancel_bwrap_relay_calls()
         try:
             if WEB_LITE is not None:
                 WEB_LITE.close()

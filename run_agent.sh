@@ -55,6 +55,26 @@ with socket.create_connection(("127.0.0.1", port), timeout=0.5):
 PY
 }
 
+relay_matches_host() {
+    python3 - "$BROWSE_PORT" "$1" "$BROWSE_FILES_DIR" <<'PY' >/dev/null 2>&1
+import http.client, json, sys
+port, want_ver, want_roots = int(sys.argv[1]), sys.argv[2], sys.argv[3]
+conn = http.client.HTTPConnection("127.0.0.1", port, timeout=0.5)
+conn.request("GET", "/version", headers={"Host": f"127.0.0.1:{port}"})
+resp = conn.getresponse()
+data = json.loads(resp.read().decode("utf-8"))
+conn.close()
+if resp.status != 200 or data.get("version") != want_ver:
+    sys.exit(1)
+pid = int(data.get("pid") or 0)
+if pid <= 0:
+    sys.exit(1)
+env_bytes = open(f"/proc/{pid}/environ", "rb").read().split(b"\0")
+if (f"OPENCODE_BROWSER_FILE_ROOTS={want_roots}").encode("utf-8") not in env_bytes:
+    sys.exit(1)
+PY
+}
+
 # Ensure a single persistent host-owned `browse serve` daemon is running outside
 # any agent's bwrap PID namespace. That lets HOME_DAEMON and multiple concurrent
 # harness runs across different working directories share Chrome in parallel
@@ -79,27 +99,31 @@ ensure_host_browse_relay() {
     (
         flock -w 10 8 || exit 0
         local ver_file="$BROWSE_FILES_DIR/.relay.version"
-        local running_ver=""
-        [ -f "$ver_file" ] && running_ver="$(cat "$ver_file" 2>/dev/null || true)"
 
-        if relay_port_ready && [ -n "$browse_ver" ] && [ "$running_ver" = "$browse_ver" ]; then
+        if [ -n "$browse_ver" ] && relay_matches_host "$browse_ver"; then
+            printf '%s\n' "$browse_ver" >"$ver_file"
             echo "browse relay: reusing shared host relay on 127.0.0.1:$BROWSE_PORT ($browse_ver)"
             exit 0
         fi
 
-        # Only stop an existing relay if it is unresponsive or from a different browse version.
+        # Stop an existing relay only if it is unresponsive, missing file-root lockdown, or from another version.
         for pid in $(pgrep -f "browse serve" 2>/dev/null || true); do
             [ "$pid" = "$$" ] && continue
             if [ "$(cat "/proc/$pid/comm" 2>/dev/null || true)" = "browse" ]; then
                 kill "$pid" 2>/dev/null || true
             fi
         done
-        sleep 0.3
+        local release_wait=0
+        while [ "$release_wait" -lt 15 ] && relay_port_ready; do
+            sleep 0.2
+            release_wait=$((release_wait + 1))
+        done
 
         nohup env \
             HOME="$HOME" \
             PATH="$PATH" \
             TMPDIR="$BROWSE_FILES_DIR" \
+            OPENCODE_BROWSER_PORT="$BROWSE_PORT" \
             OPENCODE_BROWSER_FILE_ROOTS="$BROWSE_FILES_DIR" \
             OPENCODE_BROWSER_AUTO_UPDATE="off" \
             OPENCODE_BROWSER_UPDATE_CHECK="0" \
@@ -126,10 +150,11 @@ if [ "${USE_BWRAP:-1}" = "0" ]; then
     fi
     if [ "$WANT_BROWSE" = 1 ]; then
         ensure_host_browse_relay
+        export OPENCODE_BROWSER_PORT="$BROWSE_PORT"
+        export OPENCODE_BROWSER_AUTOSTART="0"
         export OPENCODE_BROWSER_FILE_ROOTS="$BROWSE_FILES_DIR"
         export OPENCODE_BROWSER_AUTO_UPDATE="off"
         export OPENCODE_BROWSER_UPDATE_CHECK="0"
-        export OPENCODE_BROWSER_MCP_DIRECT="1"
     fi
     echo "agent dir  : $AGENT_DIR"
     echo "project dir: $PROJECT_DIR"
@@ -167,10 +192,12 @@ fi
 BROWSE_ARGS=()
 if [ "$WANT_BROWSE" = 1 ]; then
     ensure_host_browse_relay
-    ENV_ARGS+=(--setenv OPENCODE_BROWSER_FILE_ROOTS "$BROWSE_FILES_DIR"
+    ENV_ARGS+=(--setenv PQ_HOST_PID "$$"
+               --setenv OPENCODE_BROWSER_PORT "$BROWSE_PORT"
+               --setenv OPENCODE_BROWSER_AUTOSTART "0"
+               --setenv OPENCODE_BROWSER_FILE_ROOTS "$BROWSE_FILES_DIR"
                --setenv OPENCODE_BROWSER_AUTO_UPDATE "off"
-               --setenv OPENCODE_BROWSER_UPDATE_CHECK "0"
-               --setenv OPENCODE_BROWSER_MCP_DIRECT "1")
+               --setenv OPENCODE_BROWSER_UPDATE_CHECK "0")
 
     BROWSE_ARGS+=(--ro-bind-try "$BROWSE_BIN" /tmp/.local/bin/browse
                   --bind "$BROWSE_FILES_DIR" "$BROWSE_FILES_DIR"
