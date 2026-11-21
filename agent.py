@@ -42,7 +42,7 @@ MODEL_REGISTRY = {
     "or-hydrogen": {"provider": "openrouter", "model": "google/gemini-4-hydrogen", "endpoint": "google-vertex/global"},
     "or-sonnet55": {"provider": "openrouter", "model": "anthropic/claude-sonnet-5.5", "endpoint": "amazon-bedrock"},
     "or-fable52": {"provider": "openrouter", "model": "anthropic/claude-fable-5.2", "endpoint": "azure"},
-    "or-carbon": {"provider": "openrouter", "model": "google/gemini-4-carbon", "endpoint": "google-vertex/global"},
+    "or-carbon": {"provider": "openrouter", "model": "google/gemini-4-carbon", "endpoint": "google-ai-studio/flex"},
     "or-neon": {"provider": "openrouter", "model": "google/gemini-4-neon", "endpoint": "google-ai-studio/flex"},
     #
     "or-ink2s": {"provider": "openrouter", "model": "thinkingmachines/inkling-2-small:free", "endpoint": "thinkingmachines/nvfp4"},
