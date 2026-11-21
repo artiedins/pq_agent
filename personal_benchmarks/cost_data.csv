@@ -42,3 +42,4 @@
 2026_11_07,qwen4-max,opencode-go,3.27
 2026_11_18,openai/gpt-6.2-astra,azure,4.0
 2026_11_18,openai/gpt-6.2-sol,azure,1.01
+2026_11_18,google/gemini-4-neon,google-vertex/global,6.44
